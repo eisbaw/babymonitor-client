@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["babymonitor-core", "babymonitor-cli"]
+
+# Shared dependency versions live here so the two crates stay in lockstep.
+# Kept intentionally minimal for the scaffold; real deps (reqwest, tokio, hmac,
+# sha2, aes, ...) are added by the tasks that need them (see TASK-0007/0012/0013).
+[workspace.dependencies]
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.74"

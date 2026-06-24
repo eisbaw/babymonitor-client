@@ -1,0 +1,29 @@
+# APK / app binaries
+*.apk
+*.xapk
+*.apks
+*.aab
+
+# Extraction & decompilation output (large, regenerable)
+extracted/
+decompiled/
+decompiled_csharp/
+analysis/
+reports/
+
+# Secrets, credentials, captures, PII
+secrets/
+*.har
+*.pcap
+*.pcapng
+*.keystore
+
+# Rust
+target/
+
+# Editor / OS
+.direnv/
+result
+result-*
+*.swp
+.DS_Store

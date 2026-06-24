@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Git pre-push hook (TASK-0011, AC #4): block a push that would leak secrets or
+# ship a red build. Install with `just install-hooks` (symlinks this into
+# .git/hooks/). Runs everything under nix-shell so tools resolve.
+#
+# Two gates, cheapest first:
+#   1. secret-scan  — must be clean (no Tuya creds/tokens/emails/GPS).
+#   2. e2e          — build/test/lint/fmt-check/stub-grep/offline must be green.
+set -uo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT" || exit 2
+
+run() {
+  if command -v nix-shell >/dev/null 2>&1; then
+    nix-shell --run "$1"
+  else
+    bash -c "$1"
+  fi
+}
+
+echo "pre-push: secret-scan…"
+if ! run "just secret-scan"; then
+  echo "pre-push: BLOCKED — secret-scan failed. Move secrets to secrets/ (gitignored)." >&2
+  exit 1
+fi
+
+echo "pre-push: e2e…"
+if ! run "just e2e"; then
+  echo "pre-push: BLOCKED — just e2e is not green." >&2
+  exit 1
+fi
+
+echo "pre-push: OK"

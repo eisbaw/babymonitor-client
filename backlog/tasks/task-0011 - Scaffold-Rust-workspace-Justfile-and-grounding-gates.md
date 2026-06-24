@@ -1,11 +1,11 @@
 ---
 id: TASK-0011
 title: 'Scaffold Rust workspace, Justfile, and grounding gates'
-status: In Progress
+status: Done
 assignee:
   - '@orchestrator'
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-24 23:09'
+updated_date: '2026-06-24 23:16'
 labels:
   - phase5
   - rust
@@ -25,13 +25,13 @@ WHY (skill phase 5/6): create the babymonitor/ cargo workspace (babymonitor-core
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 babymonitor/ workspace builds; Justfile has build/test/lint/fmt/fmt-check/e2e/run/showcase; just e2e is green on the empty skeleton
-- [ ] #2 just check-evidence implemented (lint over re/*.md: fails a section with a protocol claim lacking a confidence label or evidence citation) and is green or filing gaps
-- [ ] #3 just showcase runs the (currently trivial) CLI without panic
-- [ ] #4 just secret-scan exists, scans tracked files + git diff + backlog/tasks/*.md for Tuya appKey/appSecret/token/email/GPS/known IDs, and FAILS on a planted fake secret (prove the check bites); wired into a pre-commit/pre-push path
-- [ ] #5 check-evidence ships WITH a fixtures test: a planted bad re/ fragment (adjective claim, no citation) it MUST flag, and a good fragment it MUST pass; claim lexicon pinned (endpoint|HMAC|sign|token|magic|offset|packet|frame|handshake|port|AES|key)
-- [ ] #6 check-evidence also asserts re/p2p_protocol.md (when present) contains exactly one literal verdict token {recoverable-statically|partially|needs-live-capture}
-- [ ] #7 just e2e includes a stub-grep gate failing on todo!(/unimplemented!(/unreachable!( outside #[cfg(test)]; and just e2e runs green with no network access (proving live tests are #[ignore]d)
+- [x] #1 babymonitor/ workspace builds; Justfile has build/test/lint/fmt/fmt-check/e2e/run/showcase; just e2e is green on the empty skeleton
+- [x] #2 just check-evidence implemented (lint over re/*.md: fails a section with a protocol claim lacking a confidence label or evidence citation) and is green or filing gaps
+- [x] #3 just showcase runs the (currently trivial) CLI without panic
+- [x] #4 just secret-scan exists, scans tracked files + git diff + backlog/tasks/*.md for Tuya appKey/appSecret/token/email/GPS/known IDs, and FAILS on a planted fake secret (prove the check bites); wired into a pre-commit/pre-push path
+- [x] #5 check-evidence ships WITH a fixtures test: a planted bad re/ fragment (adjective claim, no citation) it MUST flag, and a good fragment it MUST pass; claim lexicon pinned (endpoint|HMAC|sign|token|magic|offset|packet|frame|handshake|port|AES|key)
+- [x] #6 check-evidence also asserts re/p2p_protocol.md (when present) contains exactly one literal verdict token {recoverable-statically|partially|needs-live-capture}
+- [x] #7 just e2e includes a stub-grep gate failing on todo!(/unimplemented!(/unreachable!( outside #[cfg(test)]; and just e2e runs green with no network access (proving live tests are #[ignore]d)
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -59,4 +59,25 @@ WHY (skill phase 5/6): create the babymonitor/ cargo workspace (babymonitor-core
 - FIX: untracked .claude/scheduled_tasks.lock contained a harness sessionId — git rm --cached + gitignored (.claude/*.lock).
 - ERE bug fixed: [:space:] mis-nested; correct is [[:space:]]. grep -i needed for camelCase appKey/appSecret. Guarded by self-test.
 - pre-push hook (re/scripts/pre-push) runs secret-scan + e2e; install via just install-hooks (symlink).
+
+REVIEW GATE (cycle 1): GO from both reviewers. qa-test-runner re-ran: just e2e GREEN x2 (2 tests pass, clippy -D warnings clean, fmt-check clean, stub-grep+assert-offline ok), check-evidence GREEN (6 baseline-waived/TASK-0018), secret-scan proven RED on planted secret then GREEN, showcase no panic, gates-selftest GREEN, stub-grep bites on prod todo!() and correctly ignores #[cfg(test)]. mped-architect: architecture clean (core/cli split, fail-fast NotImplemented vs todo!, no AI-credit commits). 3 latent P1 gate gaps -> filed TASK-0019, gated before claim tasks 5/7/10.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Scaffolded the babymonitor cargo workspace and the grounding gates TESTING.md depends on.
+
+What landed:
+- babymonitor/ workspace: babymonitor-core (lib, thiserror) + babymonitor-cli (clap bin). CLI: --version, --help, no-op info subcommand (human + --json). Core returns typed Error::NotImplemented, never todo!(). Cargo.lock committed.
+- Justfile (grouped, nix-shell-driven): build/test/lint/fmt/fmt-check/run/showcase + e2e + grounding gates + install-hooks. e2e = build+test+lint(clippy -D warnings)+fmt-check+stub-grep+assert-offline.
+- re/scripts/check_evidence.py: heading-subtree lint; claim lexicon (endpoint|HMAC|sign|token|magic|offset|packet|frame|handshake|port|AES|key) requires a confidence LABEL {confirmed|likely|speculative} + an evidence citation; p2p_protocol.md verdict gate (exactly one of {recoverable-statically|partially|needs-live-capture}); self-test proves it bites (good/bad/verdict/ratchet). prd.md excluded as requirements doc.
+- re/scripts/secret_scan.sh: worktree (tracked+untracked-non-ignored) + git diff + backlog tasks; Tuya appKey/appSecret, bearer/JWT/session tokens, emails, GPS. Self-test plants fakes (incl untracked file) and bites; secret-scan:allow marker exempts the scanners own fixtures. pre-push hook wires secret-scan+e2e.
+- re/scripts/stub_grep.sh: brace-balanced #[cfg(test)] exclusion; fails on todo!/unimplemented!/unreachable! in prod code.
+
+Gate results (all green): just e2e (also green under CARGO_NET_OFFLINE=true), just check-evidence (6 pre-existing gaps baseline-WAIVED via TASK-0018, new gaps still fail), just secret-scan, just showcase, just gates-selftest. Each gate demonstrated RED on bad input then GREEN on clean tree.
+
+Follow-ups: TASK-0018 (bring milestone2_findings.md / review_gate_findings.md into canonical confidence vocabulary, then empty the baseline waiver).
+
+Limitations: e2e is offline only once nix pre-caches crates (a cold checkout would need cargo vendor — out of scope, noted). The .claude/scheduled_tasks.lock harness leak was fixed by untracking + gitignore.
+<!-- SECTION:FINAL_SUMMARY:END -->

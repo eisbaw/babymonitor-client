@@ -4,7 +4,7 @@ title: Map Tuya cloud auth + device-binding API
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:36'
-updated_date: '2026-06-24 22:46'
+updated_date: '2026-06-24 23:16'
 labels:
   - phase4
   - re
@@ -15,6 +15,7 @@ dependencies:
   - TASK-0003
   - TASK-0005
   - TASK-0011
+  - TASK-0019
 priority: high
 ---
 

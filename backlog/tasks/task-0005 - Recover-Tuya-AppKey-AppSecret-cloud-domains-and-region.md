@@ -4,7 +4,7 @@ title: 'Recover Tuya AppKey/AppSecret, cloud domains and region'
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:35'
-updated_date: '2026-06-24 22:46'
+updated_date: '2026-06-24 23:16'
 labels:
   - phase3
   - re
@@ -15,6 +15,7 @@ dependencies:
   - TASK-0001
   - TASK-0003
   - TASK-0004
+  - TASK-0019
 priority: high
 ---
 

@@ -1,9 +1,11 @@
 ---
 id: TASK-0002
 title: 'Decode manifest, permissions, and app components (apktool)'
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@reverser'
 created_date: '2026-06-24 22:35'
+updated_date: '2026-06-24 23:19'
 labels:
   - phase2
   - re
@@ -26,3 +28,12 @@ WHY (skill phase 2): AndroidManifest + resources reveal services/activities/rece
 - [ ] #1 decompiled/apktool produced from base APK; re/manifest_analysis.md lists permissions, all services/activities/receivers, intent-filters, deep-link schemes, and flags anything network/pairing-relevant
 - [ ] #2 Tuya/RN service entry points (push, P2P, camera foreground service) identified with class names
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. apktool d base apk -> decompiled/apktool (decode manifest+resources).
+2. Parse AndroidManifest.xml: permissions, services/activities/receivers, intent-filters, deep-link schemes.
+3. Identify Tuya/RN service entry points (push, P2P, camera foreground service) by class name.
+4. Write re/manifest_analysis.md with AndroidManifest.xml line citations.
+<!-- SECTION:PLAN:END -->

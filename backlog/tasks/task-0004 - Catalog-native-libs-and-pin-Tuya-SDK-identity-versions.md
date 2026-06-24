@@ -1,10 +1,11 @@
 ---
 id: TASK-0004
 title: Catalog native libs and pin Tuya SDK identity/versions
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@reverser'
 created_date: '2026-06-24 22:35'
-updated_date: '2026-06-24 22:45'
+updated_date: '2026-06-24 23:19'
 labels:
   - phase3
   - re
@@ -28,3 +29,14 @@ WHY (skill phase 2/3): the .so set is the ground truth of the stack. Need each T
 - [ ] #2 Exported-symbol dumps saved to analysis/ for the P2P/camera/codec libs; obvious crypto (OpenSSL 1.1, libthing_security) and their algorithms noted
 - [ ] #3 CORRECTION: native libs are in extracted/xapk/config.arm64_v8a.apk (NOT the base APK). Analyze that split. Cross-check at least one lib (e.g. libThingP2PSDK) SONAME/version against a public Tuya SDK release, or record the mismatch
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. unzip config.arm64_v8a.apk lib/arm64-v8a/*.so to decompiled/nativelibs.
+2. For each .so: size, SONAME (readelf -d), version strings (strings|grep), role.
+3. Pin Tuya P2P/Camera/VideoCodec/AudioEngine/SmartLink versions; note crypto libs.
+4. nm -D / readelf dumps for P2P/camera/codec libs -> re/symbols/.
+5. Cross-check libThingP2PSDK SONAME/version vs public Tuya release.
+6. Write re/native_libs.md.
+<!-- SECTION:PLAN:END -->

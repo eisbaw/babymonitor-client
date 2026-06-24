@@ -1,9 +1,11 @@
 ---
 id: TASK-0001
 title: Decompile all DEX with jadx into searchable Java
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@reverser'
 created_date: '2026-06-24 22:34'
+updated_date: '2026-06-24 23:19'
 labels:
   - phase2
   - re
@@ -27,3 +29,13 @@ WHY: 14 multidex files (~190MB) hold the Java/Kotlin half of this Tuya-reskin ap
 - [ ] #2 Package-level map produced: com.tuya/com.thingclips namespaces, Philips packages, React Native bridge packages — counts + where the Tuya camera/P2P/auth code lives
 - [ ] #3 decompiled/ stays gitignored; only the summary md is committed
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. jadx -Xmx4g decompile all classes*.dex from base apk into decompiled/jadx; capture stdout/stderr to a log for failure accounting.
+2. Tally package-level counts (com.tuya/com.thingclips, com.philips, RN bridge) via find/rg over decompiled/jadx.
+3. Locate camera/P2P/auth code packages with evidence paths.
+4. Write re/decompile_dex.md with command, coverage, package map, citations.
+5. Verify check-evidence + secret-scan green; commit re doc only.
+<!-- SECTION:PLAN:END -->

@@ -1,0 +1,33 @@
+
+Dynamic section at offset 0x19bac0 contains 30 entries:
+  Tag        Type                         Name/Value
+ 0x0000000000000001 (NEEDED)             Shared library: [libThingAvLogSDK.so]
+ 0x0000000000000001 (NEEDED)             Shared library: [liblog.so]
+ 0x0000000000000001 (NEEDED)             Shared library: [libm.so]
+ 0x0000000000000001 (NEEDED)             Shared library: [libstdc++.so]
+ 0x0000000000000001 (NEEDED)             Shared library: [libdl.so]
+ 0x0000000000000001 (NEEDED)             Shared library: [libc.so]
+ 0x000000000000000e (SONAME)             Library soname: [libThingAudioEngineSDK.so]
+ 0x0000000000000019 (INIT_ARRAY)         0x19a560
+ 0x000000000000001b (INIT_ARRAYSZ)       64 (bytes)
+ 0x000000000000001a (FINI_ARRAY)         0x19a5a0
+ 0x000000000000001c (FINI_ARRAYSZ)       16 (bytes)
+ 0x0000000000000004 (HASH)               0x228
+ 0x0000000000000005 (STRTAB)             0x162f8
+ 0x0000000000000006 (SYMTAB)             0x5018
+ 0x000000000000000a (STRSZ)              148087 (bytes)
+ 0x000000000000000b (SYMENT)             24 (bytes)
+ 0x0000000000000003 (PLTGOT)             0x19fce0
+ 0x0000000000000002 (PLTRELSZ)           42984 (bytes)
+ 0x0000000000000014 (PLTREL)             RELA
+ 0x0000000000000017 (JMPREL)             0x49ef0
+ 0x0000000000000007 (RELA)               0x3bcb8
+ 0x0000000000000008 (RELASZ)             57912 (bytes)
+ 0x0000000000000009 (RELAENT)            24 (bytes)
+ 0x0000000000000018 (BIND_NOW)           
+ 0x000000006ffffffb (FLAGS_1)            Flags: NOW
+ 0x000000006ffffffe (VERNEED)            0x3bc58
+ 0x000000006fffffff (VERNEEDNUM)         3
+ 0x000000006ffffff0 (VERSYM)             0x3a570
+ 0x000000006ffffff9 (RELACOUNT)          1455
+ 0x0000000000000000 (NULL)               0x0

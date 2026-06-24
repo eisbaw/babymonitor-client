@@ -27,6 +27,11 @@ fixtures/
 # Rust
 target/
 
+# Claude Code harness runtime state (session locks contain a sessionId/pid —
+# local runtime artifacts, never project source; must not be tracked).
+.claude/scheduled_tasks.lock
+.claude/*.lock
+
 # Editor / OS
 .direnv/
 result

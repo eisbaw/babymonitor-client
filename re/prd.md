@@ -56,6 +56,22 @@ starting with the hardest and most valuable parts: the **live video/audio stream
 
 - Defeating DRM or any paywall (there is none expected; this is local device access).
 - Redistributing Philips firmware or copyrighted assets.
+- **No public redistribution of Philips' recovered Tuya appKey/appSecret/sign-key** (their developer
+  credentials; publishing them violates Tuya's developer ToS and is the highest-liability artifact).
+- **No attacking Tuya cloud infrastructure**; live calls are rate-limited and single-shot.
+
+## Authorized scope
+
+This is authorized self-use: the user owns the SCD921/923 camera and the Tuya account, and wants a
+software second-screen because the official app will not run on their phone. All live testing uses the
+user's own account and device only.
+
+## Streaming hypothesis (updated post-review)
+
+Two candidate transports — to be decided by triage before deep effort (see `re/review_gate_findings.md`):
+1. **WebRTC-over-MQTT** signaled via Tuya cloud (may bypass `libThingP2PSDK` entirely; cheaper if viable).
+2. **Tuya P2P** (`libThingP2PSDK`, TUTK/IOTC lineage); AV framing likely static-recoverable, per-session
+   key exchange likely needs one live pcap.
 
 ## Working agreements
 

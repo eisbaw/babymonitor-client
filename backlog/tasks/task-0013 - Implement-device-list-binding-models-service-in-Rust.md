@@ -4,6 +4,7 @@ title: Implement device list/binding models + service in Rust
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:37'
+updated_date: '2026-06-24 22:46'
 labels:
   - phase5
   - rust
@@ -26,4 +27,6 @@ WHY: lets the client discover the SCD921 under the Tuya account - prerequisite f
 <!-- AC:BEGIN -->
 - [ ] #1 core::device lists devices and exposes the camera entry (id, p2p creds handles, online state); fixture test deserializes a real/representative device-list JSON (stored in secrets/) without error
 - [ ] #2 Model mismatches found vs real shape are fixed; honest notes on any field whose meaning is still unknown
+- [ ] #3 PROVE THE CHECK BITES: a negative test asserts the parser REJECTS/surfaces an error on a malformed device entry (missing camera P2P-credential handle / wrong type); the camera entry asserts required (non-Option) invariants (device id, p2p creds handle) so it is not a permissive serde sponge
+- [ ] #4 ANONYMIZE: any device-list JSON quoted in re/*.md, notes, or summaries has uid/homeId/localKey/gwId/email/GPS/IP replaced with synthetic placeholders; a sanitized committable fixture is produced and tests run against it; localKey + P2P creds treated as secrets
 <!-- AC:END -->

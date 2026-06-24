@@ -45,9 +45,11 @@ Every protocol/auth/pairing claim in an `re/*.md` doc carries:
 1. **Live end-to-end (gold oracle, `#[ignore]`, manual):** `babymonitor-cli` logs into the user's
    Tuya account, lists devices and finds the SCD921, and — once P2P lands — renders ≥1 decoded
    video frame + plays audio from the real camera. Documented setup; creds from `secrets/`.
-2. **Differential against a known-good impl:** Tuya cloud request signing (HMAC) produces the same
-   signature as a reference implementation (e.g. tinytuya / Tuya SDK) for identical fixed inputs.
-   This bites without any network.
+2. **Differential against a known-good impl:** Tuya **mobile-app SDK** request signing produces the
+   same signature as an INDEPENDENT reference for identical fixed inputs. The reference is
+   `nalajcie/tuya-sign-hacking` (mobile sign: `key = [cert_sha256]_[bmp_token]_[appSecret]`) or a
+   live-captured request — NOT tinytuya (which implements the different OpenAPI/local scheme). Using
+   our own decompiled reading as the oracle is circular and forbidden. This bites without any network.
 3. **Fixture deserialization:** captured/real JSON responses (stored in `secrets/`, gitignored)
    deserialize into the typed models without error; structure asserted, not content.
 4. **Unit/property:** crypto helpers (HMAC, AES, padding), framing parsers, and state machines have

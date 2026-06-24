@@ -4,6 +4,7 @@ title: Map Tuya cloud auth + device-binding API
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:36'
+updated_date: '2026-06-24 22:46'
 labels:
   - phase4
   - re
@@ -13,6 +14,7 @@ dependencies:
   - TASK-0001
   - TASK-0003
   - TASK-0005
+  - TASK-0011
 priority: high
 ---
 
@@ -28,4 +30,7 @@ WHY (skill phase 3/4): model the request/response contract for account login, to
 <!-- AC:BEGIN -->
 - [ ] #1 re/tuya_cloud_auth.md: endpoints, the HMAC request-signing scheme (param canonicalization, headers, nonce/time), token model, refresh, and the device-list/binding response shape — each with evidence+confidence
 - [ ] #2 A signing test vector (fixed inputs -> expected signature) is captured for the later Rust differential test; PII-free
+- [ ] #3 CORRECTION (F1): model the Tuya MOBILE-APP SDK sign (a.m/api gateway), explicitly distinguished from OpenAPI; cross-ref nalajcie/tuya-sign-hacking as a named source. Document the [cert_sha256]_[bmp_token]_[appSecret] key derivation
+- [ ] #4 Datacenter/region selection modeled as RUNTIME-from-login-response (F5), not static from assets/thing_domains_v1
+- [ ] #5 The signing test vector's expected output is produced by an INDEPENDENT reference (nalajcie tooling or a live-captured request), NOT hand-derived from our own decompilation (avoids a circular/self-confirming test); synthetic/PII-free inputs only
 <!-- AC:END -->

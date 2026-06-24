@@ -4,6 +4,7 @@ title: 'REVIEW GATE: Wave-1 code + analysis (mped-architect + qa-test-runner)'
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:37'
+updated_date: '2026-06-24 22:47'
 labels:
   - phase-gate
   - review
@@ -28,4 +29,6 @@ WAVE-1 GATE (read-only). Run mped-architect (architecture/honesty) and qa-test-r
 <!-- AC:BEGIN -->
 - [ ] #1 re/review_wave1_gate.md records both reviews; just e2e and just showcase results pasted; every issue filed as a task
 - [ ] #2 Go/No-go for Wave 2 stated, keyed off the task-10 P2P feasibility verdict
+- [ ] #3 just secret-scan green over committed files + backlog/tasks/*.md; just e2e run with network disabled stays green (live tests are #[ignore]d)
+- [ ] #4 All P0/P1 fix-tasks from task 6 and this gate are closed or consciously deferred with reason before Go for Wave 2
 <!-- AC:END -->

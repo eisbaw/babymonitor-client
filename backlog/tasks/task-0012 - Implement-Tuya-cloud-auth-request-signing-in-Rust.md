@@ -4,6 +4,7 @@ title: Implement Tuya cloud auth + request signing in Rust
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:37'
+updated_date: '2026-06-24 22:46'
 labels:
   - phase5
   - rust
@@ -27,4 +28,6 @@ WHY: the first genuinely buildable+testable slice. Implement Tuya HMAC request s
 <!-- AC:BEGIN -->
 - [ ] #1 core::auth signs requests; a differential unit test reproduces the captured signing vector from task 7 byte-for-byte (this gate bites with no network)
 - [ ] #2 Token store persists to ~/.local/share/babymonitor/; refresh-before-expiry covered by a unit test; no unflagged stubs
+- [ ] #3 If task 5 verdict is not 'recoverable-statically', the byte-for-byte differential (AC#1) may be unsatisfiable purely statically: implement+unit-test the sign ALGORITHM, and obtain the expected vector from the user's gated live run instead; record the blocker, do NOT fake a vector
+- [ ] #4 Any live auth calls are rate-limited and single-shot; no retry loops against Tuya auth (no account lockout / infra hammering)
 <!-- AC:END -->

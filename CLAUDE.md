@@ -16,6 +16,12 @@ stream + pairing/auth first.
 - **Honesty over confidence.** Never fabricate protocol/wire-format details. Each claim states a
   confidence level and cites evidence (`file:line`, or `lib.so` + offset). If something can't be
   determined statically, say so and note what evidence would unblock it.
+- **Never leak secrets through any channel.** A recovered Tuya appKey/appSecret/sign-key, any token,
+  or a real account identifier (uid/homeId/email/GPS/localKey/device id) must NEVER be written into a
+  task field, an `re/*.md` file, or a subagent's returned summary. Reference its `secrets/` location
+  only. Anonymize device/JSON data before it enters any committed file. `just secret-scan` must pass.
+- **Corrected technical targets live in `re/review_gate_findings.md`** — read it: the signing scheme
+  is Tuya's mobile-app SDK sign (not OpenAPI/tinytuya), and a WebRTC-over-MQTT path may replace P2P.
 - **NEVER implement workarounds.** Fix the root cause or state clearly that you cannot.
 - **Backlog is the single source of truth.** No ad-hoc work. Every tangent/discovery becomes a
   new backlog task — do not chase it inline.

@@ -4,6 +4,7 @@ title: Triage libThingP2PSDK/Camera/codec native libs
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:36'
+updated_date: '2026-06-24 22:46'
 labels:
   - phase3
   - re
@@ -11,7 +12,9 @@ labels:
   - p2p
 dependencies:
   - TASK-0004
-priority: high
+  - TASK-0011
+  - TASK-0017
+priority: medium
 ---
 
 ## Description
@@ -26,4 +29,6 @@ WHY (skill phase 3): before deep diving, map the P2P/camera/codec libs - exporte
 <!-- AC:BEGIN -->
 - [ ] #1 re/p2p_triage.md: exported functions of libThingP2PSDK/CameraSDK, candidate session-init + send/recv entry points, protocol magic strings, and a mapping to any known public Tuya/IOTC P2P documentation with confidence
 - [ ] #2 Lists the concrete next-dive targets (function offsets) for the deep spike task
+- [ ] #3 JS-FIRST: pass the JS bundle (bridge method names, P2P channel orchestration, signaling) BEFORE native decompilation; only dive into .so for what JS does not reveal
+- [ ] #4 Cross-reference named public sources: tuya/tuya-iotos-android-iot-p2p-demo (channel API surface) and WyzeCam tutk.py (IOTC/TUTK AV framing) — raises confidence toward 'confirmed'
 <!-- AC:END -->

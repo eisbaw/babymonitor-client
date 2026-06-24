@@ -4,6 +4,7 @@ title: 'End-to-end acceptance harness: gated live login+device-list'
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:37'
+updated_date: '2026-06-24 22:47'
 labels:
   - phase7
   - test
@@ -26,4 +27,5 @@ UX/E2E TASK (skill phase 7). Wire the gold-oracle acceptance signal from TESTING
 <!-- AC:BEGIN -->
 - [ ] #1 babymonitor-cli supports auth login + devices list with human and --json output; showcase includes the read-only commands
 - [ ] #2 An #[ignore]d live e2e test exists with documented setup (creds from secrets/); README snippet explains how the user runs it against the real camera
+- [ ] #3 Live calls rate-limited/single-shot; just e2e (offline) excludes the live test; README documents authorized scope = user's own account + device only
 <!-- AC:END -->

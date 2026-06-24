@@ -4,6 +4,7 @@ title: Map device pairing + WiFi provisioning (SmartLink/AP/QR)
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:36'
+updated_date: '2026-06-24 22:46'
 labels:
   - phase5
   - re
@@ -13,7 +14,7 @@ dependencies:
   - TASK-0001
   - TASK-0003
   - TASK-0005
-priority: high
+priority: medium
 ---
 
 ## Description
@@ -28,4 +29,5 @@ WHY: to add a camera the app provisions WiFi (Tuya EZ/AP SmartLink via libThingS
 <!-- AC:BEGIN -->
 - [ ] #1 re/pairing_flow.md documents: pairing-token request, EZ vs AP SmartLink packet/UDP scheme, the QR payload format, and the bind-confirm polling — evidence+confidence; honestly flags any part only in native code
 - [ ] #2 Identifies which steps are mandatory for an already-paired camera (our case) vs first-time setup, so the Rust client can target the minimal path first
+- [ ] #3 SCOPE NARROWING (already-paired camera): Wave-1 only confirms how an already-bound device appears in device-list and whether re-binding needs anything; defer full EZ/AP SmartLink packet + QR-payload reconstruction to a later wave as its own task
 <!-- AC:END -->

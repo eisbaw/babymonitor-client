@@ -17,6 +17,12 @@ secrets/
 *.pcap
 *.pcapng
 *.keystore
+# Defensive: catch secret artifacts a subagent might write outside secrets/
+tuya_appkey.json
+*appsecret*
+*.token
+token_store*
+fixtures/
 
 # Rust
 target/

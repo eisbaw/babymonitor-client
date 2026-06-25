@@ -148,8 +148,8 @@ Build and run (from the repo root, inside the nix shell):
 ```sh
 nix-shell --run 'just build'                      # compile the workspace
 nix-shell --run 'just e2e'                         # build + test + clippy -D + fmt-check + stub-grep + offline checks
-nix-shell --run 'just run -- auth login'           # shows the honest token-pending state
-nix-shell --run 'just run -- devices list'         # works against a synthetic fixture
+nix-shell --run 'just run auth login'           # shows the honest token-pending state
+nix-shell --run 'just run devices list'         # works against a synthetic fixture
 nix-shell --run 'just showcase'                    # run every read-only CLI command (regression tripwire)
 ```
 

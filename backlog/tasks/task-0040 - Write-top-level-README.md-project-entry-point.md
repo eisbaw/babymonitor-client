@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@architect'
 created_date: '2026-06-25 09:39'
-updated_date: '2026-06-25 09:43'
+updated_date: '2026-06-25 09:47'
 labels:
   - phase9
   - docs
@@ -36,4 +36,6 @@ Consolidate the project into a top-level README.md (repo root, OUT of check-evid
 
 <!-- SECTION:NOTES:BEGIN -->
 Wrote top-level README.md (repo root). Covers all 5 points, each with re/*.md citations: (1) reskinned Tuya IPC SCD921/923 [milestone2_findings.md]; (2) WebRTC-over-MQTT video [streaming_mode.md/webrtc_session.md/p2p_triage.md] + MD5 mobile sign 5/6 ingredients [tuya_sign_static.md, review_gate_findings.md F1]; (3) runtime bmp_token blocker -- Ghidra-confirmed runtime JNI byte[] SDK-config (doCommandNative param_6), unblocked by ONE accepted live sign vector OR a one-time runtime-config dump (both excluded by static-only) [bmp_token_whitebox.md §9, tuya_sign_static.md]; (4) Rust client complete+token-injectable but CANNOT login/stream, with build/run [babymonitor/README.md]; (5) static-only methodology jadx + Ghidra-primary/r2-cross-check + grounding gates [prd.md, TESTING.md]. Includes Status line, Scope/authorized-use, repo-layout map, LICENSE pointer (MIT in Cargo, no root LICENSE file yet). NO secret values -- creds referenced by secrets/ location only. Gates GREEN: check-evidence (17 docs; README is OUT of its re/*.md scope -- re_dir=re/, non-recursive *.md glob), secret-scan (tracked+diff+backlog), e2e (build/test 97+ pass/clippy/fmt/stub-grep/assert-offline/bmp-decode).
+
+Cycle-28 review: both GO. README honest+accurate (citations resolve to CURRENT docs not superseded; no overclaim — 'cannot log in/stream' stated repeatedly; no secrets). Orchestrator fixed P1 (the 'just run -- ...' examples had a redundant -- that broke clap; corrected to 'just run auth login', verified it now emits the documented token-pending output). P2s non-blocking (0032/0033 task-id anchor sidestepped by doc-citation; no top-level LICENSE — self-disclosed in README).
 <!-- SECTION:NOTES:END -->

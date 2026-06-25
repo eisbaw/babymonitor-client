@@ -108,3 +108,13 @@ install-hooks:
     @ln -sf ../../re/scripts/pre-push "$(git rev-parse --git-dir)/hooks/pre-push"
     @chmod +x re/scripts/pre-push
     @echo "installed pre-push hook -> re/scripts/pre-push"
+
+# Regenerate the gitignored jadx Java tree so re/*.md `decompiled/jadx/...:line`
+# citations resolve locally. Heap must go via JADX_OPTS (see re/decompile_dex.md).
+[group('grounding')]
+decompile:
+    @test -f extracted/xapk/com.philips.ph.babymonitorplus.apk || \
+        { echo "missing extracted/xapk/com.philips.ph.babymonitorplus.apk (acquire the APK first)"; exit 1; }
+    JADX_OPTS="-Xmx12g" jadx --no-debug-info \
+        --output-dir decompiled/jadx \
+        extracted/xapk/com.philips.ph.babymonitorplus.apk

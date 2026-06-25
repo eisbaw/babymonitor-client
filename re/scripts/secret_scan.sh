@@ -87,18 +87,27 @@ scan_stream() {
   for entry in "${PATTERNS[@]}"; do
     local rule="${entry%%|*}"
     local pat="${entry#*|}"
-    # grep -E, case as written; -n for line numbers within the stream.
+    # grep -aEn: -a forces TEXT mode so a stray NUL byte from an adjacent binary
+    # blob in the concatenated stream cannot silently flip grep into "binary file
+    # matches" mode and suppress the per-line output (which would let a real
+    # secret next to a binary file go UNREPORTED). -n adds line numbers.
     while IFS= read -r match; do
       [ -z "$match" ] && continue
       if is_allowed "$match"; then
         continue
       fi
-      # Redact the matched value region for safe printing: keep first 6 chars.
-      local safe
-      safe="$(printf '%s' "$match" | cut -c1-72)"
-      printf 'SECRET[%s] (%s): %s\n' "$label" "$rule" "$safe" >&2
+      # Redact for safe printing (P1-3): NEVER echo the secret value region into
+      # hook/CI logs. Keep only a short fixed-length prefix (enough to locate the
+      # line) then mask the rest as [REDACTED N chars]. The previous `cut -c1-72`
+      # printed up to 72 chars — long enough to leak a whole appKey/token.
+      local prefix_len=5
+      local total prefix
+      total="${#match}"
+      prefix="${match:0:prefix_len}"
+      printf 'SECRET[%s] (%s): %s…[REDACTED %d chars]\n' \
+        "$label" "$rule" "$prefix" "$((total - prefix_len > 0 ? total - prefix_len : 0))" >&2
       HITS=$((HITS + 1))
-    done < <(grep -nEhi -- "$pat" "$content_file" 2>/dev/null)
+    done < <(grep -anEhi -- "$pat" "$content_file" 2>/dev/null)
   done
 }
 
@@ -116,7 +125,7 @@ scan_worktree() {
     [ -f "$f" ] || continue
     # Skip clearly-binary files.
     case "$f" in
-      *.so|*.dex|*.png|*.jpg|*.jpeg|*.gif|*.bmp|*.ico|*.zip|*.gz|*.xapk|*.apk) continue;;
+      *.so|*.dex|*.png|*.jpg|*.jpeg|*.gif|*.bmp|*.ico|*.zip|*.gz|*.xapk|*.apk|*.pyc|*/__pycache__/*) continue;;
     esac
     # prefix each line with the path for context
     sed "s#^#${f}:#" "$f" 2>/dev/null
@@ -175,6 +184,30 @@ selftest() {
     fails=$((fails + 1))
   else
     echo "selftest: planted fake secrets flagged ($HITS hits) — gate bites" >&2
+  fi
+
+  # 1b) Redaction MUST NOT echo the full secret value (P1-3). Plant a secret with
+  #     a known, distinctive value substring, capture the scanner's stderr, and
+  #     assert that substring is absent from the output. A redactor that prints
+  #     the value is a leak channel into hook/CI logs.
+  local redact="$td/redact.txt"
+  local planted_val="supersecretvalue9988776655zzzz"
+  printf 'appSecret = "%s"\n' "$planted_val" > "$redact"
+  # Capture stderr in a subshell. Derive the hit count from the captured SECRET[
+  # lines (NOT the global HITS, which a command-substitution subshell cannot
+  # mutate in the parent).
+  local out hit_lines
+  out="$(scan_stream "selftest-redact" "$redact" 2>&1)"
+  hit_lines="$(printf '%s\n' "$out" | grep -c 'SECRET\[' || true)"
+  if printf '%s' "$out" | grep -qF -- "$planted_val"; then
+    echo "SELFTEST FAIL: redaction leaked the full secret value into output:" >&2
+    echo "  $out" >&2
+    fails=$((fails + 1))
+  elif [ "$hit_lines" -lt 1 ]; then
+    echo "SELFTEST FAIL: redaction test planted secret was not detected at all" >&2
+    fails=$((fails + 1))
+  else
+    echo "selftest: redaction masks the value — full secret NOT printed (output: $out)" >&2
   fi
 
   # 2) Clean file MUST pass (allowlisted owner email + harmless prose).

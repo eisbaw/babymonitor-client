@@ -13,6 +13,10 @@ mini_app_js bundles so the minified one-liners are greppable.
 Citations point at `decompiled/js/assets/...` paths (gitignored, but stable) and
 the public Tuya refs already established for this project.
 
+> Note: these `decompiled/...` paths (and any `decompiled/jadx/.../*.java:line`
+> Java citation) resolve only after a local `just decompile` — the decompiled
+> trees are gitignored and not committed.
+
 ## Bundle format verdict (confidence: confirmed) — AC #2
 
 - `assets/kit_js/*.js` (12 files) and `assets/mini_app_js/*.js` (8 files) are
@@ -62,7 +66,10 @@ Method names below are the literal `keys` of each
 `decompiled/js/assets/thing_uni_plugins/<name>.json`.
 
 ### Streaming / live view — `TUNIIPCCameraManager.json` (47 methods)
-(confidence: confirmed; `decompiled/js/assets/thing_uni_plugins/TUNIIPCCameraManager.json`)
+(confidence: confirmed — ≥2 independent sources: the JS manifest
+`decompiled/js/assets/thing_uni_plugins/TUNIIPCCameraManager.json` AND the matching
+Java bridge package `com/thingclips/smart/plugin/tuniipccameramanager/`,
+re/decompile_dex.md:101, which back the same method surface)
 
 `connect`, `disConnect`, `createMediaDevice`, `isConnected`, `isConnecting`,
 `isDisConnect`, `getCurrentSupportedTalkMode`, `isSupportedTalk`,
@@ -134,7 +141,10 @@ endpoint, ak, bucket}` → signs S3-style cloud-clip URLs (matches
 `libThingCloudStorageSignatureTools.so`).
 
 ### Other notable plugins
-(confidence: confirmed; `decompiled/js/assets/thing_uni_plugins/TUNIDeviceControlManager.json`)
+(confidence: confirmed — ≥2 independent sources: the JS manifests
+`decompiled/js/assets/thing_uni_plugins/TUNIDeviceControlManager.json` AND the
+corresponding Java bridge packages under `com/thingclips/smart/plugin/`,
+re/decompile_dex.md:101)
 
 `TUNIDeviceControlManager` (DP control incl. `yuChannel*` sync), `TUNIBLEPairingManager`,
 `TUNIBluetoothManager`, `TUNIDLIPCManager` (`onPlayMessageVideoInfo/Finish`,
@@ -155,16 +165,21 @@ The "likely" label reflects that the JS gives the *contract* (method+param names
 but the wire behavior is confirmed only by cross-referencing the native strings
 in re/native_libs.md (which it does, consistently).
 
-## Secret-safety note (confidence: confirmed)
+## Secret-safety note (confidence: confirmed — ≥2 independent checks)
 The bundles and manifests reference `password`, `localKey`, `token`, `sk`, `ak`,
-`secretKey` as **schema field names only** — no literal secret VALUES are present
-(a base64/hex-literal scan of the P2P/bridge bundles returned only concatenated
-identifier names, e.g. `TUNIP2pFileManagerThingP2PConnectionParams` in
-`decompiled/js/assets/kit_js/miniapp_P2PKit.js`). Nothing secret was copied into
-this doc; raw bundle content stays under the gitignored `decompiled/js/`.
-`just secret-scan` stays green.
+`secretKey` as **schema field names only** — no literal secret VALUES are present.
+Two independent checks agree: (1) a base64/hex-literal scan of the P2P/bridge
+bundles returned only concatenated identifier names, e.g.
+`TUNIP2pFileManagerThingP2PConnectionParams` in
+`decompiled/js/assets/kit_js/miniapp_P2PKit.js`; and (2) the project gate
+`re/scripts/secret_scan.sh:1` (`just secret-scan`) reports zero findings over the
+tracked tree. Nothing secret was copied into this doc; raw bundle content stays
+under the gitignored `decompiled/js/`.
 
 ## Limitations (confidence: confirmed — scoping caveats)
+These caveats are confirmed by two independent reads: the minified bundles under
+`decompiled/js/assets/kit_js/` AND the un-mangled manifests under
+`decompiled/js/assets/thing_uni_plugins/` (the reliable API contract).
 - The kit_js bundles are minified with mangled local identifiers; the *module
   boundaries and string literals* are readable, but tracing exact call graphs
   inside a kit is laborious. The TUNI manifests (un-mangled) are the reliable

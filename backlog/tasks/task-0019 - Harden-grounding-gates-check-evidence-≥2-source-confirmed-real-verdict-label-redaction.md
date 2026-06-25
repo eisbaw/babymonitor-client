@@ -3,10 +3,11 @@ id: TASK-0019
 title: >-
   Harden grounding gates (check-evidence ≥2-source confirmed, real verdict
   label, redaction)
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-06-24 23:16'
-updated_date: '2026-06-25 00:30'
+updated_date: '2026-06-25 00:31'
 labels:
   - phase5
   - rust
@@ -36,6 +37,16 @@ FROM cycle-1 review of TASK-0011 (re/review_gate_findings has context). Three pr
 - [ ] #3 just e2e + just gates-selftest green after changes; no regression to existing self-tests
 - [ ] #4 check-evidence flags a section whose confidence label is confirmed but which has only ONE citation; self-test proves it (confirmed+1 citation -> FLAG, confirmed+2 distinct citations -> PASS)
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. P1-1: check_evidence.py confirmed=>require >=2 distinct citation tokens (path-citation counts; named-refs count; need 2 distinct). Add count_citations(). Self-test confirmed+1=>FLAG, confirmed+2=>PASS.
+2. P1-2: replace VERDICT_RE with labelled-form anchored multiline regex. Update zero/one/many selftests + negative prose test.
+3. P1-3: secret_scan.sh redact to short prefix (first 5 chars)+[REDACTED N chars]; selftest asserts full planted value not in output.
+4. Cycle-2 doc nits in decompile_dex.md: scope confirmed headers to presence; footnote resendOffer=>WebRTC to native dynsym; downgrade 302 to likely; add just-decompile note in each re/ analysis doc.
+5. Run gates-selftest (show RED-on-bad), e2e.
+<!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
 

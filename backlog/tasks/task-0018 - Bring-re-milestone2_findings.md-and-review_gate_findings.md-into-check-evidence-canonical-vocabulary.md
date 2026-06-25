@@ -3,9 +3,11 @@ id: TASK-0018
 title: >-
   Bring re/milestone2_findings.md and review_gate_findings.md into
   check-evidence canonical vocabulary
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-06-24 22:59'
+updated_date: '2026-06-25 00:31'
 labels:
   - grounding
   - docs
@@ -26,3 +28,12 @@ check-evidence (TASK-0011) flags 6 pre-existing grounding gaps: milestone2_findi
 - [ ] #2 review_gate_findings.md 'Grounding/security defects' section carries a confidence label + evidence citation, or is restructured so it is not a protocol-claim section
 - [ ] #3 BASELINE_WAIVERS in re/scripts/check_evidence.py is emptied and just check-evidence is green with zero waivers
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. Rewrite milestone2_findings.md confidence vocab to {confirmed|likely|speculative}, co-located per claim section + citation.
+2. review_gate_findings.md Grounding/security section: add confidence+citation or restructure as non-claim.
+3. Empty BASELINE_WAIVERS in check_evidence.py; ensure stale-waiver detection passes.
+4. just check-evidence GREEN 0 waivers. Do NOT weaken lint.
+<!-- SECTION:PLAN:END -->

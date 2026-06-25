@@ -11,6 +11,11 @@ Citation convention: `lib*.so` (+ a representative string) identifies the
 evidence; offsets are not used here because identity comes from symbol names and
 embedded strings, not code addresses.
 
+> Note: any `decompiled/...` or `decompiled/jadx/.../*.java:line` citation in this
+> doc resolves only after a local `just decompile` — those trees are gitignored
+> and not committed. The `re/symbols/` dumps referenced here, by contrast, ARE
+> committed.
+
 ## Headline (confidence: confirmed)
 This is **Tuya's "ipc-tymedia-sdk"** IPC camera media stack. Two independent
 proofs: (1) the `Java_com_thingclips_smart_*` JNI symbol prefixes across every
@@ -118,6 +123,10 @@ task-10 triage should confirm which the SCD921 firmware negotiates (the `skill`
 field in `connect_v2` likely encodes capability).
 
 ## Limitations (confidence: confirmed — these are scoping caveats, not claims)
+These caveats are grounded in two independent committed artifacts: the dynamic
+section dump `re/symbols/libThingP2PSDK.dynamic.txt:1` AND the exported-symbol dump
+`re/symbols/libThingP2PSDK.dynsym.txt:1` (plus the sibling per-lib dumps), both
+derived from `lib/arm64-v8a/libThingP2PSDK.so` in `config.arm64_v8a.apk`.
 - Most SDK version literals are `printf("%s")`-substituted from a data string the
   loader fills at runtime; the `3.10.0`/`1.2.0.4`/`1.2.7` tokens are the best
   static read but are labelled `likely`, not `confirmed`.

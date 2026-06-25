@@ -27,6 +27,10 @@ fixtures/
 # Rust
 target/
 
+# Python (the grounding gate scripts are run via python3 — bytecode is local).
+__pycache__/
+*.pyc
+
 # Claude Code harness runtime state (session locks contain a sessionId/pid —
 # local runtime artifacts, never project source; must not be tracked).
 .claude/scheduled_tasks.lock

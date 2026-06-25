@@ -54,7 +54,15 @@ named public references that change the implementation targets.
 - `assets/thing_domains_v1` gives candidate domains; the actual datacenter is chosen by country/region
   and returned at login. Task 7 must model datacenter selection as runtime-from-login-response.
 
-## Grounding / security defects fixed in the backlog
+## Grounding / security defects fixed in the backlog (confidence: confirmed — process record, not a protocol claim)
+
+**Confidence: confirmed (process/decision record).** This section is NOT a
+protocol/wire-format claim — it logs backlog decisions taken at the Wave-1 review
+gate. The label is `confirmed` because each item is a verifiable fact about the
+backlog/scripts, not a hypothesis about the device. Evidence is the tracked
+artifacts themselves: `re/scripts/check_evidence.py:1` (the grounding lint),
+`re/scripts/secret_scan.sh:1` (the secret/PII gate), and `re/scripts/stub_grep.sh:1`
+(the stub tripwire), all wired into the `Justfile` gate recipes.
 
 - **APK source bug:** native libs live in `config.arm64_v8a.apk`, not the base APK. Tasks 4/5 corrected.
 - **Scaffold-first:** task 11 (workspace + Justfile + `check-evidence` + `secret-scan` + stub-grep)

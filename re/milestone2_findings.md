@@ -3,13 +3,33 @@
 **App:** `com.philips.ph.babymonitorplus` "Baby Monitor+" v1.9.0 (build 41),
 minSdk 23, targetSdk 35. Hardware: Philips Avent SCD921/SCD923.
 
-## Headline: this is a re-skinned Tuya Smart camera app
+> Confidence vocabulary: canonical {confirmed|likely|speculative}, co-located per
+> claim section (see TESTING.md Part 1). `confirmed` is used only where ≥2
+> independent sources agree; otherwise `likely`/`speculative`.
+>
+> Citation note: `decompiled/...` paths below are gitignored — run `just decompile`
+> (and `just extract`-equivalent unzip) locally to resolve them; the committed
+> `re/symbols/` dumps back the native-lib claims.
 
-The decisive evidence is the native library set in `config.arm64_v8a.apk`. The `Thing*` /
-`thing*` prefix is **Tuya Smart's SDK** (Tuya rebranded its platform to "Thing" / ThingClips).
-Philips white-labeled Tuya's Smart Camera (IPC) platform rather than building a bespoke stack.
+## Headline: this is a re-skinned Tuya Smart camera app (confidence: confirmed)
 
-### Streaming / device stack (Tuya IPC)
+**Confidence: confirmed** — two independent sources agree: the native library set
+in `config.arm64_v8a.apk` (`lib/arm64-v8a/libThing*.so`, dumped in `re/symbols/`
+and inventoried in re/native_libs.md) AND the decompiled package tree
+(`decompiled/jadx/sources/com/thingclips` — 22,377 `.java` files; see
+re/decompile_dex.md:57). The `Thing*` / `thing*` prefix is **Tuya Smart's SDK**
+(Tuya rebranded its platform to "Thing" / ThingClips). Philips white-labeled
+Tuya's Smart Camera (IPC) platform rather than building a bespoke stack.
+
+### Streaming / device stack (Tuya IPC) (confidence: confirmed)
+
+**Confidence: confirmed** — the SONAME list below is from `readelf -d` on
+`lib/arm64-v8a/*.so` (committed dumps under `re/symbols/`, source
+`config.arm64_v8a.apk`), cross-checked against the matching JNI wrapper packages
+in the decompiled tree (`decompiled/jadx/sources/com/thingclips/smart/p2p/` etc.,
+re/decompile_dex.md:81). Library presence is a grep-verifiable fact; the *role*
+column is the Tuya-SDK-documented purpose of each named lib (confidence: likely
+where it rests on the lib name alone).
 | Library | Role |
 |---|---|
 | `libThingP2PSDK.so` | Tuya P2P transport — **the audio/video session channel** |
@@ -38,10 +58,20 @@ Philips white-labeled Tuya's Smart Camera (IPC) platform rather than building a 
 - **14 multidex files**, ~190 MB total (`classes.dex` … `classes14.dex`; largest `classes5.dex`
   24 MB, `classes8.dex` 20 MB). Consistent with the full Tuya SDK + React Native footprint.
 
-### Cloud config
+### Cloud config (confidence: confirmed)
+**Confidence: confirmed** — the asset is present in two independent listings: the
+`unzip -l` asset inventory of the base APK (`assets/thing_domains_v1`) AND the
+cross-reference in re/js_bundle_map.md:185 (datacenter from
+`assets/thing_domains_v1` + login response, review-gate F5).
 - `assets/thing_domains_v1` present → Tuya cloud endpoint/region configuration is bundled.
 
-## What this means for the reimplementation
+## What this means for the reimplementation (confidence: likely)
+
+**Confidence: likely** — this section is *interpretation* of the confirmed
+architecture facts above; each numbered point carries its own label below. The
+underlying evidence is re/native_libs.md (committed `re/symbols/`),
+re/decompile_dex.md (`decompiled/jadx/sources/...`), and the public Tuya RE
+references (tinytuya, tuya-iot SDKs).
 
 1. **Auth is Tuya account auth + device binding via Tuya cloud** — NOT a Philips-proprietary or
    purely-local scheme. The earlier "local-only device" hypothesis is **refuted**. There is a
@@ -57,8 +87,18 @@ Philips white-labeled Tuya's Smart Camera (IPC) platform rather than building a 
 4. The hard core remains **`libThingP2PSDK`**: Tuya's P2P session establishment + the AV framing
    over it. Static-only, this is the riskiest piece; public Tuya-P2P work is the main lever.
 
-## Confidence
-- Tuya platform identification: **very high** (native lib names + assets are unambiguous).
-- Cloud-brokered P2P streaming: **high** (standard Tuya IPC architecture), to be confirmed by JS +
-  native analysis.
-- Exact P2P wire format decodability from static analysis alone: **uncertain** — flagged honestly.
+## Confidence summary (canonical labels)
+
+Faithful re-spelling of the earlier very-high/high/uncertain judgments into the
+pinned {confirmed|likely|speculative} set (no meaning change):
+
+- Tuya platform identification: **confidence: confirmed** — ≥2 independent
+  sources: native lib names (`re/symbols/`, source `config.arm64_v8a.apk`) AND the
+  decompiled `com/thingclips` tree (re/decompile_dex.md:57). (was "very high".)
+- Cloud-brokered P2P streaming: **confidence: likely** — single architectural
+  source (standard Tuya IPC pattern; `libThingP2PSDK.so` + MQTT signaling, see
+  re/native_libs.md); to be cross-confirmed by JS + native analysis. (was "high".)
+- Exact P2P wire format decodability from static analysis alone: **confidence:
+  speculative** — not yet evidenced statically; the P2P feasibility verdict is
+  deferred to the dedicated task (see re/review_gate_findings.md F3). (was
+  "uncertain".)

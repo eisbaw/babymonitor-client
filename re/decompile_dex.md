@@ -73,7 +73,17 @@ class names (`IThingP2P`, `ThingApiSignManager`, `ThingP2PSdk`) but obfuscated
 public interfaces are the reliable read; the `pqdbppq`-style impls need
 cross-referencing.
 
-## Where the camera / P2P / auth / streaming code lives (confidence: confirmed)
+## Where the camera / P2P / auth / streaming code lives (confidence: confirmed — for symbol/method PRESENCE only)
+
+> **Scope of the `confirmed` label:** it covers ONLY the *presence* of the named
+> classes/methods/packages in the decompiled tree (a grep-verifiable fact with
+> the `:line` citations below). Any *interpretation* of what a symbol does for the
+> protocol (e.g. "this method means WebRTC") is a separate, individually-labelled
+> claim and does NOT inherit this `confirmed` label.
+
+> **Citation note:** the `decompiled/jadx/sources/...:line` citations in this doc
+> resolve only after a local `just decompile` — the jadx tree is gitignored and
+> not in the repo. Run it to follow any Java `:line` reference here.
 
 Locations are directories under `decompiled/jadx/sources/`.
 
@@ -81,13 +91,19 @@ Locations are directories under `decompiled/jadx/sources/`.
 - `com/thingclips/smart/p2p/` (23 files) — JNI wrapper for `libThingP2PSDK.so`.
   - `com/thingclips/smart/p2p/api/IThingP2P.java` — the P2P API surface:
     `connect(devId/remoteId, mode, timeout, cb)`, `recvData(...)`,
-    **`resendOffer(String)`** and `addSessionStateChangeCallback(...)`
-    (`resendOffer` = WebRTC SDP offer re-send → confirms WebRTC path).
+    **`resendOffer(String)`** and `addSessionStateChangeCallback(...)`.
+    - `resendOffer` = WebRTC SDP-offer re-send → WebRTC path (confidence:
+      confirmed — this inference is ≥2-source: the Java method name here PLUS the
+      native dynsym cross-ref in re/native_libs.md, not the method name alone).
   - `com/thingclips/smart/p2p/utils/IMqttServiceUtils.java` — the **P2P↔MQTT
     signaling bridge**: `sendMessage(...)`, `send302MessageThroughMqtt(...)`,
-    `registerMqtt302(...)`, `isMqttConnected()`. The "302" is Tuya's
-    camera-signaling message code carried over MQTT. This is the Java side of the
-    WebRTC-over-MQTT transport identified natively in re/native_libs.md.
+    `registerMqtt302(...)`, `isMqttConnected()`. The "302" is **likely** Tuya's
+    camera-signaling message code carried over MQTT (confidence: likely — this is
+    inferred from the Java method NAMES `send302MessageThroughMqtt` /
+    `registerMqtt302` only; the 302 value itself is not decoded statically here,
+    so it is single-source until a payload/constant cross-ref confirms it). This
+    is the Java side of the WebRTC-over-MQTT transport identified natively in
+    re/native_libs.md.
   - `com/thingclips/smart/p2p/ThingP2PSdk.java` — the SDK entrypoint.
 - `com/thingclips/smart/p2pfiletrans/` — `libThingP2PFileTransSDK.so` JNI (album).
 - `com/thingclips/smart/camera/ipccamerasdk/` — IPC camera AV glue (`monitor/`,
@@ -104,9 +120,13 @@ Locations are directories under `decompiled/jadx/sources/`.
   TUNI manifest in re/js_bundle_map.md.
 
 ### Cloud auth + request signing (forward to task 7)
-(confidence: confirmed for class/method presence;
+(confidence: confirmed for class/method presence — ≥2 independent sources: the
+decompiled signer
 `decompiled/jadx/sources/com/thingclips/sdk/network/ThingApiSignManager.java:69`
-(`generateSignature`), `:524` (`swapSignString`))
+(`generateSignature`), `:524` (`swapSignString`), AND the public mobile-sign
+write-up `nalajcie/tuya-sign-hacking` (review-gate F1) which documents the same
+swap/MD5 sign shape. NOTE: presence/shape is confirmed; the signing *key
+derivation* remains task-5 work, not confirmed here.)
 
 - **`com/thingclips/sdk/network/ThingApiSignManager.java`** — the cloud-API
   request signer. Methods: `generateSignature(params, ThingApiParams)`,

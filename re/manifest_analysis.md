@@ -8,6 +8,10 @@ citations below refer to `decompiled/apktool/AndroidManifest.xml` (884 lines tot
 Method: `apktool d -f -o decompiled/apktool <base.apk>` (exit 0; full resource +
 manifest decode). Component tallies via `grep -cE` over the decoded manifest.
 
+> Note: the `decompiled/apktool/...:line` citations (and any `decompiled/jadx/`
+> Java `:line` reference) resolve only after a local `just decompile` — those
+> trees are gitignored and not committed.
+
 ## Component tallies (confidence: confirmed)
 
 | Component | Count | Evidence |

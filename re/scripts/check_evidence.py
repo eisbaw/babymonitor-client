@@ -34,9 +34,19 @@ THE RULE (pinned; documented here so it is auditable, not a black box):
             | assets/… path  |  *.js / *.ts path  |  http(s):// URL
             | a named public ref of the form `owner/repo`
 
-  5. p2p_protocol.md gate: WHEN re/p2p_protocol.md exists it MUST contain exactly
-     one literal verdict token from {recoverable-statically, partially,
-     needs-live-capture}. Zero or many → fail.
+  4b. CONFIRMED REQUIRES TWO INDEPENDENT SOURCES (TESTING.md:28-29: "`confirmed`
+      asserted from a single source is BAD"). When a claim section's confidence
+      label is `confirmed`, it must contain >= 2 DISTINCT citation tokens (e.g. a
+      path-citation AND a named ref, or two distinct named refs, or two distinct
+      paths). Exactly one citation under a `confirmed` label is a FINDING — the
+      author must add the second source or downgrade to `likely`. Sections
+      labelled only `likely`/`speculative` still need just one citation.
+
+  5. p2p_protocol.md gate: WHEN re/p2p_protocol.md exists it MUST contain a
+     LABELLED verdict line of the form `Verdict: <token>` (token one of
+     {recoverable-statically, partially, needs-live-capture}). Bare prose
+     mentioning "partially" does NOT satisfy the gate; the verdict must be an
+     explicit, machine-checkable label. Zero or many labelled verdicts → fail.
 
 Exit status: 0 = all clean; 1 = at least one finding. Findings are printed with
 file:line so a human can jump straight to the offending section.
@@ -112,20 +122,36 @@ CITATION_RE = re.compile(
 # Waivers are reported, never silently dropped. This is a ratchet, NOT a mute:
 # any NEW claim section without grounding still fails. Remove entries (not the
 # mechanism) as TASK-0018 fixes each doc; the goal is an empty list.
-BASELINE_WAIVERS: set[tuple[str, str]] = {
-    ("milestone2_findings.md",
-     "Milestone 2 Findings — Extraction & Architecture Identification"),
-    ("milestone2_findings.md",
-     "Headline: this is a re-skinned Tuya Smart camera app"),
-    ("milestone2_findings.md", "Streaming / device stack (Tuya IPC)"),
-    ("milestone2_findings.md", "Cloud config"),
-    ("milestone2_findings.md", "What this means for the reimplementation"),
-    ("review_gate_findings.md",
-     "Grounding / security defects fixed in the backlog"),
-}
+# EMPTY as of TASK-0018: milestone2_findings.md and review_gate_findings.md were
+# rewritten into the canonical {confirmed|likely|speculative} vocabulary with
+# co-located labels + citations, so they now pass the lint on their own merits.
+# The ratchet MECHANISM is retained (a future pre-existing-debt case can be added
+# here, reported-never-muted), but the goal state — zero waivers — is reached.
+BASELINE_WAIVERS: set[tuple[str, str]] = set()
 
 VERDICT_TOKENS = ["recoverable-statically", "partially", "needs-live-capture"]
-VERDICT_RE = re.compile(r"\b(" + "|".join(VERDICT_TOKENS) + r")\b")
+# The verdict must be a LABELLED line, not bare prose. Anchored to start-of-line
+# (multiline), an optional bold wrapper, the literal word "Verdict", a ':' or '='
+# separator, and then exactly one of the canonical tokens. This rejects prose
+# like "the framing is partially recoverable" (TASK-0019 P1-2) — only an explicit
+# `Verdict: partially` style label counts.
+VERDICT_RE = re.compile(
+    r"^\s*(?:\*\*)?Verdict(?:\*\*)?\s*[:=]\s*\**\s*"
+    r"(recoverable-statically|partially|needs-live-capture)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# A confidence label is "confirmed" when the matched label text contains the word
+# "confirmed". Used to trigger the >=2-citation requirement (rule 4b).
+CONFIRMED_RE = re.compile(
+    r"(?:"
+    r"confidence\s*[:=]\s*\**confirmed"
+    r"|\*\*confirmed\*\*"
+    r"|\((?:[^)]*\b)?(?:confidence\s*[:=]?\s*)?confirmed\b"
+    r"|[:\-]\s*\**confirmed\**\s*(?:$|[.,;)\n])"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 FENCE_RE = re.compile(r"^```")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
@@ -205,6 +231,28 @@ def has_citation(sec: Section) -> bool:
     return bool(CITATION_RE.search(txt) or NAMED_REF_RE.search(txt))
 
 
+def is_confirmed(sec: Section) -> bool:
+    return bool(CONFIRMED_RE.search(section_text(sec)))
+
+
+def distinct_citations(sec: Section) -> set[str]:
+    """Returns the set of DISTINCT citation tokens in a section's subtree.
+
+    A "citation token" is any path/lib/URL/JS-bundle citation matched by
+    CITATION_RE OR any named public reference matched by NAMED_REF_RE. The set is
+    de-duplicated case-insensitively so the same reference written twice counts
+    once — `confirmed` demands two *independent* sources, not one source repeated
+    (TESTING.md:28-29). Used to enforce rule 4b.
+    """
+    txt = section_text(sec)
+    tokens: set[str] = set()
+    for m in CITATION_RE.finditer(txt):
+        tokens.add(m.group(0).casefold())
+    for m in NAMED_REF_RE.finditer(txt):
+        tokens.add(m.group(0).casefold())
+    return tokens
+
+
 @dataclass
 class Finding:
     file: str
@@ -228,8 +276,16 @@ def lint_doc(path: Path) -> list[Finding]:
         missing: list[str] = []
         if not has_confidence(sec):
             missing.append("confidence label {confirmed|likely|speculative}")
-        if not has_citation(sec):
+        cites = distinct_citations(sec)
+        if not cites:
             missing.append("evidence citation")
+        elif is_confirmed(sec) and len(cites) < 2:
+            # Rule 4b: a `confirmed` label needs >= 2 independent sources.
+            missing.append(
+                "second independent citation (confidence=confirmed needs >=2 "
+                f"distinct sources, found {len(cites)}; add a source or "
+                "downgrade to 'likely')"
+            )
         if missing:
             findings.append(
                 Finding(str(path), sec.start_line, sec.title, missing)
@@ -372,7 +428,8 @@ def selftest() -> int:
             )
             failures += 1
 
-    # Verdict-gate self-test: zero / one / many.
+    # Verdict-gate self-test: zero / one / many + the negative prose case
+    # (P1-2: a labelled `Verdict: <token>` is required; bare prose must NOT count).
     with tempfile.TemporaryDirectory() as td:
         tdir = Path(td)
         zero = tdir / "p2p_protocol.md"
@@ -381,16 +438,77 @@ def selftest() -> int:
             print("SELFTEST FAIL: zero-verdict p2p doc not flagged", file=sys.stderr)
             failures += 1
         one = tdir / "p2p_protocol.md"
-        one.write_text("# P2P\nVerdict: partially recoverable.\n", encoding="utf-8")
+        one.write_text(
+            "# P2P\nVerdict: partially\n\nThe framing is partially recoverable; "
+            "the session key needs-live-capture in prose only.\n",
+            encoding="utf-8",
+        )
+        # Exactly ONE labelled verdict, despite extra bare-prose token mentions.
         if lint_p2p(one):
-            print("SELFTEST FAIL: single-verdict p2p doc flagged", file=sys.stderr)
+            print(
+                "SELFTEST FAIL: single LABELLED-verdict p2p doc flagged "
+                "(bare-prose tokens must not be counted)",
+                file=sys.stderr,
+            )
             failures += 1
         many = tdir / "p2p_protocol.md"
         many.write_text(
-            "# P2P\nMaybe partially, maybe needs-live-capture.\n", encoding="utf-8"
+            "# P2P\nVerdict: partially\n\n## Audio\nVerdict: needs-live-capture\n",
+            encoding="utf-8",
         )
         if not lint_p2p(many):
-            print("SELFTEST FAIL: multi-verdict p2p doc not flagged", file=sys.stderr)
+            print("SELFTEST FAIL: multi-LABELLED-verdict p2p doc not flagged", file=sys.stderr)
+            failures += 1
+        # NEGATIVE: a doc with the bare word "partially" in prose but NO labelled
+        # `Verdict:` line must FAIL (it has zero labelled verdicts).
+        prose = tdir / "p2p_protocol.md"
+        prose.write_text(
+            "# P2P\nThe framing is partially recoverable from static analysis, "
+            "but the per-session key likely needs a live capture.\n",
+            encoding="utf-8",
+        )
+        if not lint_p2p(prose):
+            print(
+                "SELFTEST FAIL: bare-prose 'partially' (no labelled Verdict line) "
+                "was accepted — the verdict gate does not require a label.",
+                file=sys.stderr,
+            )
+            failures += 1
+
+    # Confirmed-needs-two-sources self-test (P1-1 / rule 4b): a `confirmed`
+    # section with ONE citation must FLAG; with TWO distinct citations must PASS.
+    with tempfile.TemporaryDirectory() as td:
+        tdir = Path(td)
+        one_cite = tdir / "confirmed_one.md"
+        one_cite.write_text(
+            "## Sign key derivation\n\n"
+            "The cloud sign uses an HMAC over the request (confidence: confirmed); "
+            "see decompiled/jadx/com/tuya/Sign.java:128.\n",
+            encoding="utf-8",
+        )
+        f1 = lint_doc(one_cite)
+        if not f1:
+            print(
+                "SELFTEST FAIL: confirmed section with ONE citation was not "
+                "flagged — the >=2-source rule does not bite.",
+                file=sys.stderr,
+            )
+            failures += 1
+        two_cite = tdir / "confirmed_two.md"
+        two_cite.write_text(
+            "## Sign key derivation\n\n"
+            "The cloud sign uses an HMAC over the request (confidence: confirmed); "
+            "see decompiled/jadx/com/tuya/Sign.java:128 and cross-checked against "
+            "github.com/nalajcie/tuya-sign-hacking.\n",
+            encoding="utf-8",
+        )
+        f2 = lint_doc(two_cite)
+        if f2:
+            print(
+                "SELFTEST FAIL: confirmed section with TWO distinct citations was "
+                "flagged: " + "; ".join(f.render() for f in f2),
+                file=sys.stderr,
+            )
             failures += 1
 
     # Ratchet self-test: with a waiver in place for one bad section, a SECOND,

@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-06-25 02:38'
-updated_date: '2026-06-25 02:56'
+updated_date: '2026-06-25 03:00'
 labels:
   - review-followup
   - wave1
@@ -45,6 +45,8 @@ AUDIT FINDING F1 (TASK-0006), severity P0/blocking. re/js_bundle_map.md ~:45 des
 GOTCHA: the false claim sat in the `## kit_js bundles (confidence: confirmed)` section. The shape-only check-evidence lint could not catch it (TASK-0021). Fix drops the "73 ice hits" claim from the PlayNetKit table row + adds a confirmed CORRECTION block with >=2 non-.md sources (JS .pretty greps AND libThingP2PSDK.so + P2PMQTTServiceManager.java native/Java WebRTC evidence). F2 folded in: role text softened to "play-mode UI/orchestration only; transport-agnostic" and the correction states the JS bridge only names connect/createMediaDevice with {deviceId}-only params.
 GOTCHA: the new block uses libThingP2PSDK.so (matches lib*.so) + a .java path as the two confirmed sources; re/symbols/*.dynsym.txt is .txt and does NOT count as a citation token under check-evidence, so it is decoration not a source.
 Re-verified on the live decompile tree: rg -lc RTCPeerConnection|createOffer|ice-ufrag over kit_js/*.pretty = ZERO (exit 1); rg -io for ice-substrings yields only slice/connectMatterDevice/onScanDeviceInfo etc.
+
+Cycle-10 review: both GO. Corrections true, greps re-verified zero WebRTC primitives in JS, no new contradiction. P2 citation nits -> TASK-0028.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

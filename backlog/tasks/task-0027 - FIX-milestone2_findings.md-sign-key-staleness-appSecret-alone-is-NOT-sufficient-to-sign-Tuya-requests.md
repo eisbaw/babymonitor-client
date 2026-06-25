@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-06-25 02:46'
-updated_date: '2026-06-25 02:56'
+updated_date: '2026-06-25 03:00'
 labels:
   - review-followup
   - wave1
@@ -46,6 +46,8 @@ Minor: the matrix in re/review_wave1_analysis.md already uses 'F5' for an unrela
 Corrected milestone2 "What this means" point #3: appKey/appSecret framed as SUFFICIENT to sign -> now states they are NECESSARY but NOT sufficient. Forward-points to re/tuya_sign.md Verdict: needs-runtime-hook. Names the two extra ingredients (app-cert SHA-256 runtime input; decoded t_s.bmp token) + the native keyed routine (libthing_security.so cmd 1), none statically reproducible.
 GOTCHA: no secret VALUES written (per CLAUDE.md hard rule) — only location/method. The point sits under `## What this means (confidence: likely)`; the edit adds sign/key/HMAC/token lexicon words but the section already has likely + a real non-.md citation (assets/*config*.json, libthing_security.so), so check-evidence stays GREEN with no new confirmed claim.
 SCOPE: did NOT edit re/review_wave1_analysis.md — the optional F5-label disambiguation was skipped to avoid scope creep, as the contract permits.
+
+Cycle-10 review: both GO. Corrections true, greps re-verified zero WebRTC primitives in JS, no new contradiction. P2 citation nits -> TASK-0028.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

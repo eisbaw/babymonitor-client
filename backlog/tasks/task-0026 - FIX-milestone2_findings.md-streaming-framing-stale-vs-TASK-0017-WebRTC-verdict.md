@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-06-25 02:39'
-updated_date: '2026-06-25 02:56'
+updated_date: '2026-06-25 03:00'
 labels:
   - review-followup
   - wave1
@@ -41,6 +41,8 @@ AUDIT FINDING F3 (TASK-0006), severity P1/deferrable. re/milestone2_findings.md 
 <!-- SECTION:NOTES:BEGIN -->
 Added a one-line forward-pointer at milestone2 point #4 (the libThingP2PSDK "hard core / riskiest piece" framing) covering points 1+4, pointing to re/streaming_mode.md WebRTC-over-MQTT-preferred / PPCS-fallback / chosen-by-p2pType verdict.
 GOTCHA: kept the surrounding `confidence: likely` label and substance untouched (the pointer is explicitly marked navigation-only). check-evidence still GREEN because the section already carries likely + a real citation; the pointer adds no new confirmed claim.
+
+Cycle-10 review: both GO. Corrections true, greps re-verified zero WebRTC primitives in JS, no new contradiction. P2 citation nits -> TASK-0028.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

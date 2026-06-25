@@ -4,14 +4,9 @@ title: 'SPIKE: libThingP2PSDK session + AV framing feasibility'
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:36'
-updated_date: '2026-06-25 06:22'
+updated_date: '2026-06-25 07:14'
 labels:
-  - phase4
-  - re
-  - wave1
-  - p2p
-  - spike
-  - risk
+  - wave2
 dependencies:
   - TASK-0009
   - TASK-0017

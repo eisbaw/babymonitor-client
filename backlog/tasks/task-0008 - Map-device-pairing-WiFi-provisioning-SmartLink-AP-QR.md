@@ -4,12 +4,9 @@ title: Map device pairing + WiFi provisioning (SmartLink/AP/QR)
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:36'
-updated_date: '2026-06-25 00:23'
+updated_date: '2026-06-25 07:14'
 labels:
-  - phase5
-  - re
-  - wave1
-  - pairing
+  - wave2
 dependencies:
   - TASK-0001
   - TASK-0003

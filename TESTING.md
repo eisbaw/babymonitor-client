@@ -101,3 +101,30 @@ decompile, so a `.md` path does not count as a citation token and does not count
 - For code: `just e2e` green; new logic has a test that can fail; no unflagged stubs.
 - For analysis: claims carry confidence + evidence; `just check-evidence` green; contradictions recorded.
 - Honest limitations written in the task's notes. Tangents filed as new tasks, not chased inline.
+
+---
+
+## Wave-1 lessons (for the Wave-2 re-plan)
+
+What Wave-1 (static RE) taught, to fold into Wave-2 planning:
+
+1. **The auth dead-end is the central constraint.** The Tuya signer is fully characterized
+   (MD5(cert_sha256_"_"_bmp_token_"_"_appSecret); cert/appKey/appSecret recovered; the imath+matrix
+   bmp_token decode ported byte-exact via Ghidra). BUT (TASK-0033, reviewer-confirmed) the decode
+   keys off a **runtime JNI byte[] SDK-config** (doCommandNative param_6) — so the production token is
+   **not computable under pure static analysis**. A working login needs the runtime config blob OR one
+   live sign vector. **No oracle exists statically** — a self-derived signer is unverifiable.
+   Wave-2 must sequence the auth DECISION first; everything (device list, stream) is gated on it.
+2. **Streams are understood, unbuilt.** WebRTC-over-MQTT (302 signaling, DTLS-SRTP, H.264/Opus) is the
+   confirmed transport; the Rust impl (webrtc-rs + rumqttc) is Wave-2 and ultimately needs auth for the
+   device's p2p creds + a live device returning p2pType=4.
+3. **The grounding gates work and caught real defects** — but the recurring failure mode was
+   **verdict-overturn lag**: when a later spike overturned an earlier verdict, the entry/sibling docs
+   kept asserting the old model (recurred 4×, each caught by the review gate, never the lint). Wave-2
+   should implement the **verdict-overturn grep-guard** (TASK-0021): after a new verdict token is set,
+   fail unless every old-token hit in re/ is history/SUPERSEDED with a forward-pointer.
+4. **Two-tool corroboration matters.** radare2 alone mischaracterized fcn.11658 (called it white-box;
+   it's AES) and miscounted xrefs/cmd-numbers; Ghidra's decompiler corrected these. Use Ghidra C as the
+   primary source for any further deep native logic; cross-check vs r2.
+5. **Honesty discipline held:** the client is token-pending (cannot log in) and says so everywhere —
+   no fake login, secrets gitignored + redacted, #[ignore]d live tests that go red on faked success.

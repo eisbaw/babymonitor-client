@@ -1,10 +1,11 @@
 ---
 id: TASK-0016
 title: 'RE-PLAN: plan Wave 2 from Wave-1 knowledge (not feature code)'
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@orchestrator'
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 05:21'
+updated_date: '2026-06-25 07:15'
 labels:
   - phase-gate
   - replan
@@ -60,4 +61,6 @@ WHAT WAVE-2 NEEDS (dependency order):
 UNCONFIRMED / needs-live to resolve in Wave-2: CameraInfoBean.id vs DeviceBean.dev_id equivalence; which of category/categoryCode the wire populates; the `ipc` category literal (only `sp` grounded).
 
 forward-carried from TASK-0014 review P2: babymonitor-cli hand-assembles JSON object braces around serde-escaped values (main.rs ~:347/382/414) — values are safe+tested, but a Wave-2 hardening pass should switch to a #[derive(Serialize)] view struct so structure is machine-guaranteed.
+
+Executed as a focused terminal re-plan (deep phase2 fan-out deferred to a fresh Wave-2 session per 'plan only as deep as context supports'). Wave-2 backlog created: the WebRTC stream deliverable, the auth-unblock DECISION (gates everything — reviewer-confirmed static dead-end on the runtime-config bmp_token), and a Wave-2 deep-replan task; deferred 8/10/32 relabeled wave2. TESTING.md updated with Wave-1 lessons.
 <!-- SECTION:NOTES:END -->

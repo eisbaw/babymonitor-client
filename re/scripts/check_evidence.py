@@ -64,11 +64,16 @@ THE RULE (pinned; documented here so it is auditable, not a black box):
      lag": when a later spike OVERTURNED an earlier verdict, the old verdict token
      survived as a CURRENT claim in sibling docs. SUPERSEDED_VERDICTS is a small,
      data-driven table of (old_token, superseded_by); lint_verdicts() greps re/*.md
-     and FAILS on any hit of an old token that is NOT inside a forward-pointer frame
-     (SUPERSEDED/REFUTED/CORRECTED/RETRACTED/HISTORICAL/OVERTURNED/erratum, a
-     strikethrough `~~…~~`, or an option-set `{a|token|b}` menu). This is the
-     mechanical guard that would have caught all four recurrences. Maintain the
-     table: add a row whenever a spike overturns a verdict.
+     and FAILS on any hit of an old token that is NOT inside a STRONG supersession
+     frame. A frame is: a STRONG BANNER (SUPERSEDED/REFUTED/CORRECTED/RETRACTED/
+     OVERTURNED/erratum) in the window or enclosing heading; a strikethrough
+     `~~…~~`; an option-set `{a|token|b}` menu; a SOFT history word (historical/
+     stale/obsolete/…) IN THE ENCLOSING HEADING; or a SOFT word PAIRED WITH a
+     forward-pointer (→/see/per/a `.md`/`TASK-NNNN`/`§N` target). A bare free-
+     floating soft word no longer frames (TASK-0038 — it was an exploitable false
+     negative: an unrelated nearby "history"/"stale" let a current stale verdict
+     pass). This is the mechanical guard that would have caught all four
+     recurrences. Maintain the table: add a row whenever a spike overturns a verdict.
 
 KNOWN LIMITATION — SHAPE, NOT CONTENT (TASK-0021 AC #1; documented + accepted).
   This lint validates the SHAPE of a citation (it matches a path:line / symbol /
@@ -179,10 +184,18 @@ CITATION_RE = re.compile(
     r")"
 )
 
-# Trailing line hint on a citation: `:NN` or `~:NN` (with optional whitespace).
-# Stripped when de-duplicating citation tokens so a path cited bare and again with
-# a hint counts once (see distinct_citations).
-LINE_HINT_RE = re.compile(r"\s*~?:\d+$")
+# Trailing positional hint on a citation, stripped when de-duplicating citation
+# tokens so the SAME artifact cited two ways counts once (see distinct_citations).
+# Two hint forms:
+#   - a line hint  `:NN` / `~:NN`        (jadx line, approximate — TASK-0024)
+#   - an offset    `@0xHEX`              (native `.so` byte offset — `lib*.so@0x11658`)
+# Both are POSITIONAL DECORATION, not part of the artifact identity: `lib.so@0x11658`
+# and `lib.so` are one source. The offset is stripped EXPLICITLY here (TASK-0038) so
+# `_artifact_key` collapses `.so@0xHEX` deterministically — previously it collapsed
+# only by a CITATION_RE alternation accident (the `.so\b` source-path alternative
+# matched first and dropped the `@0xHEX`), which a future regex edit could silently
+# break. `_artifact_key` also re-applies the offset strip defensively.
+LINE_HINT_RE = re.compile(r"(?:\s*~?:\d+|@0x[0-9A-Fa-f]+)$")
 
 # SAME-ARTIFACT COLLAPSE (TASK-0020 #2). Two readelf/nm dumps of the SAME native
 # library — e.g. `re/symbols/libThingP2PSDK.dynsym.txt` (the symbol table) and
@@ -203,20 +216,33 @@ _SO_DUMP_RE = re.compile(
     r"(?:^|/)(lib[\w.-]*?)\.(?:" + "|".join(SO_VIEW_SUFFIXES) + r")\.txt$",
     re.IGNORECASE,
 )
-# `<path>/libbase.so` (optionally @0xHEX, already stripped before this is applied).
-_SO_BIN_RE = re.compile(r"(?:^|/)(lib[\w.-]*?)\.so$", re.IGNORECASE)
+# `<path>/libbase.so`, optionally with an `@0xHEX` offset. The offset is matched and
+# discarded HERE so the regex is self-sufficient (TASK-0038) — it no longer relies on
+# the caller having pre-stripped `@0xHEX`. `_artifact_key` also strips it before this
+# applies (belt and suspenders), so `lib.so@0x11658` and `lib.so` yield one key even
+# if a future caller forgets to normalise.
+_SO_BIN_RE = re.compile(r"(?:^|/)(lib[\w.-]*?)\.so(?:@0x[0-9A-Fa-f]+)?$", re.IGNORECASE)
+# Explicit offset strip, re-applied inside _artifact_key (defence in depth).
+_SO_OFFSET_RE = re.compile(r"@0x[0-9A-Fa-f]+$", re.IGNORECASE)
 
 
 def _artifact_key(token: str) -> str:
     """Collapse a citation token to its underlying ARTIFACT identity.
 
-    For a native lib — whether cited as the `.so` binary or as one of its
+    For a native lib — whether cited as the `.so` binary (optionally with an
+    `@0xHEX` byte offset, e.g. `libthing_security.so@0x11658`) or as one of its
     readelf/nm DUMP views (`lib*.dynsym.txt`, `lib*.dynamic.txt`, …) — the key is
-    the library base name (e.g. `libthingp2psdk`). Every view of one `.so` thus
-    maps to the SAME key and counts as ONE source for the >=2-source `confirmed`
-    rule. All other tokens (source paths, named refs, URLs) are returned
-    unchanged. Input is assumed already casefolded and line-hint-stripped.
+    the library base name (e.g. `libthingp2psdk`). Every view/offset of one `.so`
+    thus maps to the SAME key and counts as ONE source for the >=2-source
+    `confirmed` rule. All other tokens (source paths, named refs, URLs) are
+    returned unchanged. Input is assumed already casefolded.
+
+    The `@0xHEX` offset is a POSITIONAL pointer into the binary, not a separate
+    artifact, so it is stripped here (TASK-0038) — explicitly, not by relying on a
+    CITATION_RE alternation accident — before the base name is extracted.
     """
+    # Strip an `@0xHEX` byte offset so `.so@0xHEX` keys identically to `.so`.
+    token = _SO_OFFSET_RE.sub("", token)
     m = _SO_DUMP_RE.search(token)
     if m:
         return "so:" + m.group(1).casefold()
@@ -234,11 +260,36 @@ def _artifact_key(token: str) -> str:
 # checklist failed to prevent 4 recurrences, so this is now a MECHANICAL gate.
 #
 # THE RULE: for each known-superseded verdict token, grep re/*.md. Every hit must
-# sit inside a forward-pointer FRAME — a SUPERSEDED / REFUTED / CORRECTED /
-# RETRACTED / HISTORICAL / OVERTURNED / erratum context that points at the
-# authoritative new verdict — OR be an option-set enumeration (`{a | token | b}`),
-# i.e. listing the token as a menu value, not asserting it. An un-framed hit is a
-# FINDING: the doc still asserts a refuted verdict as current.
+# sit inside a STRONG supersession FRAME that genuinely points the reader away from
+# the dead token toward the live verdict — NOT merely near an incidental "soft"
+# word. A hit is framed iff ANY of:
+#   - a STRONG BANNER word (SUPERSEDED / REFUTED / CORRECTED / RETRACTED /
+#     OVERTURNED / erratum) appears within ±FRAME_WINDOW lines or in the enclosing
+#     section heading — these words ASSERT an overturn, they don't merely allude to
+#     age; OR
+#   - the hit line is inside a `~~strikethrough~~` (crossed-out history); OR
+#   - the hit sits inside a `{a | token | b}` option-set enumeration (a menu value,
+#     not a current assertion); OR
+#   - a SOFT history word (historical / stale / obsolete / deprecated / conservative
+#     / …) appears IN THE ENCLOSING SECTION HEADING — marking a whole section as
+#     history (e.g. `## 3. [HISTORICAL — WRONG] …`) is a deliberate, section-anchored
+#     act, robust to line drift (TASK-0020 #3); OR
+#   - a SOFT history word CO-OCCURS with an explicit FORWARD-POINTER (`→`/`->`/`see`/
+#     `per`/`superseded by`, or a `.md`/`TASK-NNNN`/`§N` target reference) within the
+#     window — "kept as history → see X". The forward-pointer is what makes it a real
+#     supersession note rather than incidental prose.
+# An un-framed hit is a FINDING: the doc still asserts a refuted verdict as current.
+#
+# WHY THE TIGHTENING (TASK-0038). The earlier rule let ANY soft word (history,
+# stale, conservative, deprecated, obsolete) frame a hit by mere ±3-line proximity,
+# with NO requirement the word refer to the verdict. Both review reviewers built
+# adversarial docs where an UNRELATED nearby soft word ("we reviewed the commit
+# history…", "a stale cache entry") let a genuinely-CURRENT stale verdict PASS — an
+# exploitable false negative. Free-floating soft words therefore no longer frame on
+# their own; they must be section-heading-anchored OR paired with a forward-pointer.
+# (All 24 real-tree hits carry a strong banner / strikethrough / option-set, or — in
+# exactly one case — a [HISTORICAL — WRONG] heading, so this tightening leaves the
+# real tree green; verified by re/scripts/check_evidence.py --selftest.)
 #
 # Data-driven: SUPERSEDED_VERDICTS is the small maintained table of
 # (old_token, superseded_by, pattern). Add a row when a spike overturns a verdict;
@@ -249,23 +300,50 @@ def _artifact_key(token: str) -> str:
 # four historical recurrences (TASK-0006/F5, TASK-0023's three docs, TASK-0033's
 # three docs).
 
-# Words that, appearing near a superseded-token hit, count as a forward-pointer
-# frame (case-insensitive, whole-word where sensible). Strikethrough `~~…~~` and a
-# brace-enclosed option set are handled separately in _is_framed().
-FRAME_WORDS = [
+# STRONG BANNER words: each ASSERTS that a verdict was overturned. Whole-word,
+# case-insensitive. A banner anywhere in the ±window OR in the enclosing heading
+# frames the hit on its own (it is an unambiguous supersession signal).
+STRONG_BANNER_WORDS = [
     "superseded", "supersede", "supersedes", "superseding",
     "refuted", "refute", "refutes",
-    "corrected", "correct by", "correction",
+    "corrected", "correction",
     "retracted", "retract",
-    "historical", "history",
     "overturned", "overturn", "overturns",
     "erratum", "errata",
-    "deprecated", "obsolete", "stale",
-    "pre-disassembly", "conservative",  # the documented "kept as history" framings
-    "no longer", "was wrong", "now wrong", "outdated",
 ]
-FRAME_RE = re.compile(r"(?:" + "|".join(re.escape(w) for w in FRAME_WORDS) + r")",
-                      re.IGNORECASE)
+STRONG_BANNER_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(w) for w in STRONG_BANNER_WORDS) + r")\b",
+    re.IGNORECASE,
+)
+
+# SOFT history words: they connote age/staleness but do NOT, by themselves, assert
+# that THIS token was overturned. They frame a hit ONLY when they are in the
+# enclosing SECTION HEADING (a deliberate section-level history mark) or when they
+# CO-OCCUR with a forward-pointer (see FORWARD_PTR_RE). A bare soft word in body
+# prose near the hit does NOT frame it (TASK-0038 — the false-negative hole).
+SOFT_HISTORY_WORDS = [
+    "historical", "history",
+    "deprecated", "obsolete", "stale", "outdated",
+    "pre-disassembly", "conservative",
+    "no longer", "was wrong", "now wrong",
+]
+SOFT_HISTORY_RE = re.compile(
+    r"(?:" + "|".join(re.escape(w) for w in SOFT_HISTORY_WORDS) + r")",
+    re.IGNORECASE,
+)
+
+# A FORWARD-POINTER: an explicit redirect from the dead token to the live verdict.
+# Either a navigation arrow/verb (`→`, `->`, `see`, `per`, `superseded by`) OR a
+# concrete target reference (a `.md` doc, a `TASK-NNNN`, or a `§N` section). When a
+# SOFT history word co-occurs with one of these in the window, the construct reads
+# as a genuine supersession note ("kept as history → see tuya_sign_static.md") and
+# the hit is framed. `now` is DELIBERATELY excluded — it is too weak a pointer to
+# rescue a soft word on its own (it would re-open the false-negative hole).
+FORWARD_PTR_RE = re.compile(
+    r"(?:→|->|\bsee\b|\bper\b|\bsuperseded by\b|[\w./-]+\.md|TASK-\d+|§\d+)",
+    re.IGNORECASE,
+)
+
 # Strikethrough span `~~ … ~~` — a hit inside one is framed as crossed-out history.
 STRIKE_RE = re.compile(r"~~.*?~~", re.DOTALL)
 # An option-set enumeration `{ a | b | c }` — the token is a menu VALUE, not a
@@ -326,32 +404,46 @@ def _enclosing_heading(lines: list[str], idx: int) -> str:
 
 
 def _is_framed(lines: list[str], idx: int) -> bool:
-    """True iff the hit on line `idx` (0-based) sits inside a forward-pointer frame.
+    """True iff the hit on line `idx` (0-based) sits inside a STRONG supersession frame.
 
-    A hit is framed when ANY of:
-      - a FRAME_WORD appears within ±FRAME_WINDOW lines (the SUPERSEDED/REFUTED/…
-        banner pattern), OR
-      - the ENCLOSING SECTION HEADING carries a frame word (e.g.
-        `## 3. [HISTORICAL — WRONG] …`) — a whole section explicitly marked history
-        frames every line under it, however far down the token sits (section-
-        anchored, robust to line drift — TASK-0020 #3), OR
-      - the hit line is inside a `~~ … ~~` strikethrough (crossed-out history), OR
+    A hit is framed when ANY of (see the module-level rule comment for rationale):
+      - a STRONG BANNER word (SUPERSEDED/REFUTED/CORRECTED/RETRACTED/OVERTURNED/
+        erratum) appears within ±FRAME_WINDOW lines OR in the enclosing section
+        heading — these words assert an overturn outright, so they frame alone; OR
+      - the hit line is inside a `~~ … ~~` strikethrough (crossed-out history); OR
       - the hit sits inside a `{ a | b | c }` option-set enumeration (a menu value,
-        not a current assertion). The enumeration may wrap across lines, so the
-        ±window text is checked, not just the single hit line.
+        not a current assertion); the enumeration may wrap across lines, so the
+        ±window text is checked, not just the single hit line; OR
+      - a SOFT history word (historical/stale/obsolete/…) is IN THE ENCLOSING SECTION
+        HEADING (`## 3. [HISTORICAL — WRONG] …`) — section-anchored history marking,
+        robust to line drift (TASK-0020 #3); OR
+      - a SOFT history word CO-OCCURS with a FORWARD-POINTER (`→`/`see`/`per`/a
+        `.md`/`TASK-NNNN`/`§N` target) within the window — a genuine "kept as history
+        → see X" supersession note.
+
+    A bare, free-floating SOFT word in body prose near the hit does NOT frame it
+    (TASK-0038): that was the exploitable false negative (an unrelated "commit
+    history"/"stale cache" rescuing a genuinely-current stale verdict).
     """
     lo = max(0, idx - FRAME_WINDOW)
     hi = min(len(lines), idx + FRAME_WINDOW + 1)
     window = "\n".join(lines[lo:hi])
-    if FRAME_RE.search(window):
+    heading = _enclosing_heading(lines, idx)
+
+    # Strong banner anywhere in the window or the enclosing heading frames alone.
+    if STRONG_BANNER_RE.search(window) or STRONG_BANNER_RE.search(heading):
         return True
-    if FRAME_RE.search(_enclosing_heading(lines, idx)):
-        return True
-    line = lines[idx]
-    if STRIKE_RE.search(line):
+    # Strikethrough on the hit line = crossed-out history.
+    if STRIKE_RE.search(lines[idx]):
         return True
     # Option-set enumeration may span lines (`{a |\n b | c}`); check the window.
     if OPTION_SET_RE.search(window):
+        return True
+    # Soft history word in the SECTION HEADING marks the whole section as history.
+    if SOFT_HISTORY_RE.search(heading):
+        return True
+    # Soft history word ONLY frames in body prose when paired with a forward-pointer.
+    if SOFT_HISTORY_RE.search(window) and FORWARD_PTR_RE.search(window):
         return True
     return False
 
@@ -1079,14 +1171,203 @@ def selftest() -> int:
             failures += 1
         Path(framed_misc).unlink()
 
+    # ── Frame-tightening self-test (TASK-0038) ───────────────────────────────
+    # The OLD rule let ANY soft word (history/stale/conservative/deprecated/
+    # obsolete) frame a hit by mere ±3-line proximity, with no requirement it
+    # refer to the verdict. Both reviewers planted an UNRELATED nearby soft word
+    # next to a genuinely-CURRENT stale verdict and it PASSED (false negative).
+    # These cases prove the tightened rule now BITES on a free-floating soft word
+    # while still PASSING genuine strong frames and the soft-word-in-heading and
+    # soft-word+forward-pointer forms.
+    with tempfile.TemporaryDirectory() as td:
+        tdir = Path(td)
+
+        def _verdict_findings(name: str, body: str):
+            p = tdir / name
+            p.write_text(body, encoding="utf-8")
+            fs = lint_verdicts(tdir)
+            p.unlink()
+            return fs
+
+        # (vg-tn1) ADVERSARIAL: unrelated "commit history" near a CURRENT stale
+        #          verdict — must now FLAG (the soft word does not refer to the
+        #          verdict and there is no forward-pointer).
+        adv_history = (
+            "## Sign verdict (current)\n\n"
+            "We reviewed the commit history of the signer before concluding.\n"
+            "The production token is `needs-runtime-hook` and a device is "
+            "required to proceed. This remains our live verdict.\n"
+        )
+        if not _verdict_findings("adv_history.md", adv_history):
+            print(
+                "SELFTEST FAIL (TASK-0038): an unrelated nearby 'history' soft "
+                "word let a CURRENT `needs-runtime-hook` verdict pass — the "
+                "free-floating-soft-word false negative is still open.",
+                file=sys.stderr,
+            )
+            failures += 1
+
+        # (vg-tn2) ADVERSARIAL: unrelated "stale cache entry" near a CURRENT
+        #          `no runtime input` verdict — must now FLAG.
+        adv_stale = (
+            "## Decode model (current)\n\n"
+            "A stale cache entry was cleared during testing, no impact.\n"
+            "The decode has no runtime input and is static-config-only as of "
+            "this writing. This is the active model.\n"
+        )
+        if not _verdict_findings("adv_stale.md", adv_stale):
+            print(
+                "SELFTEST FAIL (TASK-0038): an unrelated nearby 'stale' soft word "
+                "let a CURRENT `no runtime input` verdict pass.",
+                file=sys.stderr,
+            )
+            failures += 1
+
+        # (vg-tn3) ADVERSARIAL: unrelated "conservative memory budget" near a
+        #          CURRENT white-box-cipher verdict — must now FLAG.
+        adv_consv = (
+            "## Cipher classification (current)\n\n"
+            "We used a conservative memory budget for the disassembler.\n"
+            "The core transform is a white-box table cipher — the wall, and "
+            "that stands.\n"
+        )
+        if not _verdict_findings("adv_consv.md", adv_consv):
+            print(
+                "SELFTEST FAIL (TASK-0038): an unrelated nearby 'conservative' "
+                "soft word let a CURRENT white-box-cipher verdict pass.",
+                file=sys.stderr,
+            )
+            failures += 1
+
+        # (vg-tn4) GOOD: a SOFT word IN THE ENCLOSING HEADING still frames (the
+        #          section-anchored history mark — the one real-tree pattern that
+        #          relies on a soft word, bmp_token_decode.md §3).
+        soft_heading = (
+            "## 3. [HISTORICAL — WRONG] the old cipher claim\n\n"
+            + "filler\n" * 6
+            + "The core transform is a white-box table cipher — the wall.\n"
+        )
+        if _verdict_findings("soft_heading.md", soft_heading):
+            print(
+                "SELFTEST FAIL (TASK-0038): a soft word in the SECTION HEADING "
+                "([HISTORICAL — WRONG]) failed to frame — section-anchored history "
+                "marking must still pass.",
+                file=sys.stderr,
+            )
+            failures += 1
+
+        # (vg-tn5) GOOD: a SOFT word PAIRED WITH a forward-pointer frames (a
+        #          genuine "kept as history → see X" note).
+        soft_fwd = (
+            "## Sign verdict\n\n"
+            "This `needs-runtime-hook` line is kept only as history → see "
+            "tuya_sign_static.md for the live verdict.\n"
+        )
+        if _verdict_findings("soft_fwd.md", soft_fwd):
+            print(
+                "SELFTEST FAIL (TASK-0038): a soft word PAIRED with a forward-"
+                "pointer (→ / .md target) failed to frame — a genuine "
+                "supersession note must pass.",
+                file=sys.stderr,
+            )
+            failures += 1
+
+        # (vg-tn6) GOOD: each STRONG banner alone frames (sanity over the banner
+        #          set, independent of any soft word).
+        for banner in ("SUPERSEDED", "REFUTED", "CORRECTED", "RETRACTED",
+                       "OVERTURNED", "erratum"):
+            body = (
+                "## Sign verdict\n\n"
+                f"> {banner} by TASK-0023 (tuya_sign_static.md).\n\n"
+                "Verdict: needs-runtime-hook\n"
+            )
+            if _verdict_findings("banner.md", body):
+                print(
+                    f"SELFTEST FAIL (TASK-0038): a '{banner}' banner failed to "
+                    "frame a superseded token.",
+                    file=sys.stderr,
+                )
+                failures += 1
+
+        # (vg-tn7) RE-PROVE the 4 historical recurrence forms still FLAG when
+        #          UN-FRAMED (one per SUPERSEDED_VERDICTS row). Each asserts the
+        #          dead token as a current claim with NO frame of any kind.
+        recurrences = {
+            "rec_runtime.md": (
+                "## Sign\n\nThe signer needs-runtime-hook to produce a token.\n"
+            ),
+            "rec_whitebox.md": (
+                "## Cipher\n\nfcn.11658 is a white-box table cipher we cannot "
+                "port.\n"
+            ),
+            "rec_noinput.md": (
+                "## Decode\n\nThe decode takes no runtime input; it is fully "
+                "static.\n"
+            ),
+            "rec_static.md": (
+                "## Decode\n\nThe token is statically-recoverable-in-principle "
+                "from the BMP.\n"
+            ),
+        }
+        for name, body in recurrences.items():
+            if not _verdict_findings(name, body):
+                print(
+                    f"SELFTEST FAIL (TASK-0038): un-framed recurrence form "
+                    f"'{name}' did NOT flag — the guard must still bite on every "
+                    "SUPERSEDED_VERDICTS row.",
+                    file=sys.stderr,
+                )
+                failures += 1
+
+    # ── _artifact_key @0xHEX collapse self-test (TASK-0038 P2) ────────────────
+    # The `@0xHEX` offset is positional decoration, not a separate artifact:
+    # `lib.so@0x1234`, `lib.so`, and a readelf dump of the same lib must collapse
+    # to ONE artifact key. Previously this worked only by a CITATION_RE alternation
+    # accident; now _artifact_key strips the offset explicitly. Prove the collapse
+    # directly AND end-to-end (a `confirmed` section citing `.so@0xHEX` + the same
+    # `.so` bare is ONE source and must FLAG).
+    k_off = _artifact_key("libthing_security.so@0x11658".casefold())
+    k_bare = _artifact_key("libthing_security.so".casefold())
+    k_dump = _artifact_key("re/symbols/libthing_security.dynsym.txt".casefold())
+    if not (k_off == k_bare == k_dump == "so:libthing_security"):
+        print(
+            "SELFTEST FAIL (TASK-0038): `.so@0xHEX`, bare `.so`, and the `.so` "
+            f"dump did not collapse to one artifact key (got {k_off!r}, "
+            f"{k_bare!r}, {k_dump!r}).",
+            file=sys.stderr,
+        )
+        failures += 1
+
+    with tempfile.TemporaryDirectory() as td:
+        tdir = Path(td)
+        # A `confirmed` claim whose two "sources" are the SAME `.so` at two offsets
+        # is ONE source → must FLAG (the offset must not game the >=2-source rule).
+        so_off = tdir / "so_offset.md"
+        so_off.write_text(
+            "## Native cipher\n\n"
+            "The `key` schedule lives in libthing_security.so@0x11658 and the "
+            "round at libthing_security.so@0x11afc (confidence: confirmed).\n",
+            encoding="utf-8",
+        )
+        if not lint_doc(so_off):
+            print(
+                "SELFTEST FAIL (TASK-0038): a confirmed section citing the SAME "
+                ".so at two @0xHEX offsets passed — the offset gamed the "
+                ">=2-source rule (it is one artifact).",
+                file=sys.stderr,
+            )
+            failures += 1
+
     if failures:
         print(f"check-evidence selftest: {failures} failure(s)", file=sys.stderr)
         return 1
     print(
         "check-evidence selftest: OK (bites on bad, passes good, "
         "verdict-gate works, ratchet holds, symbol-anchored cites accepted "
-        "while no-citation claims still fail, same-artifact .so dumps collapse, "
-        "verdict-overturn guard bites on un-framed stale tokens)"
+        "while no-citation claims still fail, same-artifact .so dumps + @0xHEX "
+        "offsets collapse, verdict-overturn guard bites on un-framed stale tokens "
+        "AND on free-floating soft words while strong/heading/soft+pointer frames "
+        "pass)"
     )
     return 0
 

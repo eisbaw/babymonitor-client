@@ -3,11 +3,27 @@ resolver = "2"
 members = ["babymonitor-core", "babymonitor-cli"]
 
 # Shared dependency versions live here so the two crates stay in lockstep.
-# Kept intentionally minimal for the scaffold; real deps (reqwest, tokio, hmac,
-# sha2, aes, ...) are added by the tasks that need them (see TASK-0007/0012/0013).
+# Kept intentionally minimal; real deps (reqwest, tokio, aes, ...) are added by
+# the tasks that need them (see TASK-0007/0012/0013).
 [workspace.dependencies]
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
+# Signing + token store (TASK-0012). MD5 is the recovered keyed-hash primitive
+# (re/tuya_sign_static.md §3 — plain MD5, NOT HMAC-SHA256); sha2 is for the
+# offline app-cert hash; base64/hex for the canonical-string encodings; dirs for
+# the XDG data dir; serde/serde_json/chrono for the session token store.
+md5 = "0.7"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+dirs = "5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+# Inflate the (DEFLATE-compressed) APK signature block for the offline cert
+# hash. Pure-Rust miniz_oxide backend (no system zlib) keeps the e2e gate
+# self-contained and offline.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [workspace.package]
 edition = "2021"

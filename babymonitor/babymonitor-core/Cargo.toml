@@ -8,3 +8,12 @@ description = "Core library for a Rust client to the Philips Avent Baby Monitor+
 
 [dependencies]
 thiserror.workspace = true
+md5.workspace = true
+sha2.workspace = true
+base64.workspace = true
+hex.workspace = true
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+flate2.workspace = true

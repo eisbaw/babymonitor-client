@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@architect'
 created_date: '2026-06-25 03:00'
-updated_date: '2026-06-25 08:53'
+updated_date: '2026-06-25 09:02'
 labels:
   - re
   - citation-hygiene
@@ -35,4 +35,6 @@ From cycle-10 review (both GO, P2). Two tiny accuracy fixes in re/js_bundle_map.
 
 <!-- SECTION:NOTES:BEGIN -->
 DONE. js_bundle_map.md WebRTC CORRECTION block: (1) the runtime strings a=ice-ufrag / 'invalid signaling: type: candidate' are now cited to the .so BINARY (verified: strings -n5 decompiled/nativelibs/libThingP2PSDK.so yields 3 hits), with an explicit note that the dynsym is the symbol TABLE carrying imm_p2p_ice_session_* SYMBOLS (not those strings) — so strings->. so, symbols->dynsym. (2) Softened the independence wording borrowing streaming_mode.md:68 candor: the .so native strings/symbols and the Java P2PMQTTServiceManager bridge are NOT fully independent (both the same Tuya P2P SDK); the genuinely-independent pair is JS-kit layer vs native lib (+ public Tuya impls). check-evidence stays GREEN; the confirmed block still has >=2 genuinely independent sources (JS *.pretty greps AND the native .so).
+
+Cycle-25 review: both GO. Verdict-overturn guard proven REAL (both reviewers reconstructed all 4 historical recurrences -> guard FLAGS them); same-artifact dedup breaks no legit claim + forced an honest bmp_token_whitebox §9 confirmed->likely; redaction leak-safe; js_bundle_map citation correct. P1 frame-word looseness (latent, tree unaffected) -> TASK-0038.
 <!-- SECTION:NOTES:END -->

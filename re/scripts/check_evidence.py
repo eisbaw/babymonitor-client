@@ -131,7 +131,13 @@ NAMED_REF_RE = re.compile(
 # files as a citation token, it does NOT relax the requirement that a claim
 # section carry a confidence label AND >=1 citation (nor the >=2-source confirmed
 # rule) — see lint_doc().
-SOURCE_EXT = r"(?:java|kt|kts|smali|so|xml|json|js|ts|bmp|cfg|properties|md)"
+#
+# NOTE (review fix to TASK-0024): `md` is DELIBERATELY NOT in SOURCE_EXT. A `.md`
+# path is a DOC/navigation pointer, not a decompiled artifact, and the re/*.md docs
+# are siblings derived from the same decompile — so a cross-doc `.md` reference is
+# NOT an independent source and must not count toward the >=2-source `confirmed`
+# rule (rule 4b). Adding `md` here re-opens that hole; see selftest case (e).
+SOURCE_EXT = r"(?:java|kt|kts|smali|so|xml|json|js|ts|bmp|cfg|properties)"
 CITATION_RE = re.compile(
     r"(?:"
     r"[\w./-]+:\d+"                       # path:NN (decompiled/foo.java:42) — legacy exact
@@ -649,6 +655,49 @@ def selftest() -> int:
             print(
                 "SELFTEST FAIL: confirmed section citing ONE file twice (bare + "
                 "hinted) passed — the >=2-source rule was gamed by the line hint.",
+                file=sys.stderr,
+            )
+            failures += 1
+
+        # (e) `.md` IS NOT A SOURCE (review fix to TASK-0024). A cross-doc `.md`
+        # reference is a navigation pointer, not an independent decompiled artifact.
+        #   (e1) a `confirmed` section whose two citations are two different `.md`
+        #        files must FLAG as <2 independent sources.
+        #   (e2) a claim whose ONLY citation is a `.md` path must FLAG as missing
+        #        an evidence citation (a `.md` path is not a citation token at all).
+        # Both prove `md` removed from SOURCE_EXT closes the hole that let a sibling
+        # `.md` doc masquerade as the second source for a `confirmed` claim.
+        md_two = tdir / "md_two.md"
+        md_two.write_text(
+            "## Device secrets\n\n"
+            "The `localKey` is a secret AES key (confidence: confirmed); see "
+            "`re/review_gate_findings.md` and `re/streaming_mode.md`.\n",
+            encoding="utf-8",
+        )
+        mf = lint_doc(md_two)
+        # Must flag: zero real citations → "evidence citation" missing (the two
+        # `.md` paths are not citation tokens, so the section has NO source at all).
+        if not mf:
+            print(
+                "SELFTEST FAIL: confirmed section whose only 'sources' are two "
+                "different `.md` docs was NOT flagged — `.md` is being counted as "
+                "an independent source (the TASK-0024 hole is open).",
+                file=sys.stderr,
+            )
+            failures += 1
+
+        md_only = tdir / "md_only.md"
+        md_only.write_text(
+            "## Local key handling\n\n"
+            "The per-device `key` material is documented in "
+            "`re/review_gate_findings.md` (confidence: likely).\n",
+            encoding="utf-8",
+        )
+        mo = lint_doc(md_only)
+        if not any("evidence citation" in m for f in mo for m in f.missing):
+            print(
+                "SELFTEST FAIL: a claim whose ONLY citation is a `.md` path was "
+                "accepted — `.md` must not count as a decompiled-artifact citation.",
                 file=sys.stderr,
             )
             failures += 1

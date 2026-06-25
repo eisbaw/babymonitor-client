@@ -273,12 +273,14 @@ detail is obfuscated to `n` in the DEX and is `likely`/needs-live (see §6).
   `*.app.location.*` / `*.home.*` family but the exact `a=` value here is
   **needs-live-capture** (§6).
 
-### 5b. `DeviceBean` core fields (the device record) (confidence: confirmed)
-Two independent sources: the `DeviceBean` field declarations (class `DeviceBean`,
+### 5b. `DeviceBean` core fields (the device record) (confidence: likely)
+Single decompiled source: the `DeviceBean` field declarations (class `DeviceBean`,
 `decompiled/jadx/sources/com/thingclips/smart/sdk/bean/DeviceBean.java`; `devId`
-~:49, `localKey` ~:106, `secKey` ~:159, `uuid` ~:192, `productId` ~:131)
-AND the device-list secrets call-out in `re/review_gate_findings.md`
-(`localKey` / P2P creds are secrets). Selected fields:
+~:49, `localKey` ~:106, `secKey` ~:159, `uuid` ~:192, `productId` ~:131). The
+`localKey`/`secKey` secrecy is additionally NOTED — not independently grounded — in
+`re/review_gate_findings.md` (a sibling doc derived from the same decompile, so it
+is a navigation pointer, not a second source). This is one decompiled source, hence
+`likely`, not `confirmed`. Selected fields:
 
 | Field | Type | Role | Secret? |
 |---|---|---|---|

@@ -43,6 +43,10 @@ hint to the current tree if you give one. State once per doc that **line hints a
 (jadx-run-dependent) and symbols are authoritative**. `just check-evidence` accepts all three
 forms as citation tokens; for `confirmed` (≥2 sources) the same file cited bare and again with a
 hint counts as ONE source — the line hint is decoration, not a second source.
+A cross-doc `.md` reference (e.g. citing `re/review_gate_findings.md`) is a **navigation pointer,
+NOT an independent evidence source** — the `re/*.md` docs are siblings derived from the same
+decompile, so a `.md` path does not count as a citation token and does not count toward the
+≥2-source `confirmed` rule.
 
 ### Good vs bad (observable)
 - GOOD: a reader can follow a citation to the exact decompiled line / symbol that supports the claim.

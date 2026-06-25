@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@reverser'
 created_date: '2026-06-25 01:50'
-updated_date: '2026-06-25 02:18'
+updated_date: '2026-06-25 02:28'
 labels:
   - phase3
   - re
@@ -46,6 +46,8 @@ GOTCHAS / decisions:
 - Symbols verified to resolve in current tree (rg): ThingApiParams.checkAPIName/initUrlParams/KEY_*; pqdbppq action constants (:42/43/46/66/88/102); LoginBusiness.y/s/r; TUNIAPIRequestManager.apiRequestByAtop + TUNILoginManager.onTicketSuccess; User/Domain/qdddbpp; HomeBean/DeviceBean/CameraInfoBean; ThingApiSignManager.generateSignature(Sdk)/swapSignString/postDataMD5Hex/getUrlWithQueryString/bdpdqbp; pbddddb.bdpdqbp; ThingNetworkSecurity.initJNI; BuildConfig.THING_SMART_* (values stay in secrets/); P2PMQTTServiceManager.send302MessageThroughMqtt/handleMqttAnswer/isP2PMqttAnswer/registerMqtt302; IThingP2P.resendOffer/setSignaling/connect; ThingCameraConstants.P2PType; qpppdqb demo bean; SecureNativeApi.getConfig; manifest permission/activity names + thing_jump_scheme.
 - 'just decompile' ALREADY pins JADX_OPTS=-Xmx12g + --no-debug-info; no change needed.
 - LIMITATIONS: (1) apktool XML line hints (manifest/strings) are more stable than jadx but still re-decode-dependent; left as approximate hints anchored on android:name / resource name. (2) Cross-doc 're/foo.md' references: I removed their stale ':NN' line numbers (they pointed at sibling-doc lines that also drift) but did not re-verify each sibling line; they now resolve as whole-doc references, which is correct for a cross-doc pointer. (3) I did NOT touch every trivial cite; focus was every CLAIM section's citation resolving to a real symbol. (4) Committed on branch task-0024-symbol-anchored-citations (was on master); NOT pushed.
+
+Review NO-GO follow-up (post-commit bcc5d00): the TASK-0024 change added 'md' to SOURCE_EXT in re/scripts/check_evidence.py, which let a cross-doc .md reference count as an independent source for the confidence:confirmed >=2-source rule. A .md sibling doc is derived from the same decompile and is NOT independent evidence; re/tuya_cloud_auth.md section '5b. DeviceBean core fields' exploited this (its 'second source' was re/review_gate_findings.md). FIX: (1) removed 'md' from SOURCE_EXT so a bare .md path is no longer a citation token; only 5b broke (other docs' .md cross-refs sit alongside real decompiled cites). (2) downgraded 5b from confirmed to likely and reworded it to state honestly: single decompiled source = DeviceBean field declarations; localKey/secKey secrecy is NOTED (not independently grounded) in review_gate_findings.md. (3) added check_evidence.py selftest case (e): a confirmed section whose only 'sources' are two .md files FLAGS as <2 sources, and a claim whose ONLY citation is a .md FLAGS as missing citation; proved RED when md is re-added. (4) TESTING.md now states a cross-doc .md reference is a navigation pointer, not an independent evidence source. Gates: check-evidence GREEN (0 waived), gates-selftest GREEN, secret-scan GREEN, e2e GREEN.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

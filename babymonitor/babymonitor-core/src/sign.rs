@@ -656,6 +656,112 @@ fn der_length(b: &[u8], at: usize) -> Option<(usize, usize)> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Sub-step 6: chKey — the per-app channel-auth token (native getChKey@0x16000)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The app package name — the `getPackageName()` value the native `getChKey`
+/// uses as the FIRST `_`-joined part of the HMAC message. STATIC: read from the
+/// APK `AndroidManifest.xml` `package=` attribute (not a secret).
+///
+/// Source: `re/chkey_static.md` §2 (Ghidra `FUN_00116528` calls
+/// `getPackageManager().getPackageName()` and stores it into the `.bss` global
+/// `DAT_001390a0`, which `getChKey@0x116000` reads as the first key part).
+pub const APP_PACKAGE_NAME: &str = "com.philips.ph.babymonitorplus";
+
+/// Compute `chKey` = the per-app channel-auth token the atop envelope carries as
+/// the wire param `chKey` (and that is in [`SIGN_WHITELIST`]).
+///
+/// # Algorithm (Ghidra-recovered, r2 cross-checked — `re/chkey_static.md`)
+///
+/// Native `JNICLibrary.getChKey(Context, byte[] appId)` (`getChKey@0x16000`,
+/// rebased `0x116000`) computes:
+///
+/// ```text
+/// chKey = lowercase_hex( HMAC-SHA256( key   = appId_bytes,
+///                                     msg   = packageName + "_" + certSha256Hex ) )
+/// ```
+///
+/// where:
+/// - `appId` = `ThingSmartNetWork.mAppId.getBytes()` = the Tuya **appKey** (the
+///   same value carried on the wire as `clientId`);
+/// - `packageName` = `getPackageName()` = [`APP_PACKAGE_NAME`] (static, from the
+///   manifest); stored by native `FUN_00116528` into `.bss` `DAT_001390a0`;
+/// - `certSha256Hex` = the app signing-cert SHA-256 lowercase hex —
+///   offline-computable from the APK (`re/tuya_sign_static.md` §4,
+///   [`app_cert_sha256_hex_from_apk`]); stored into `.bss` `DAT_00139058`.
+///
+/// The keyed digest is **HMAC-SHA256** (NOT plain MD5 like the request `sign`):
+/// the native algo-descriptor at `0x132fe0` is `{id=6, name="SHA256",
+/// digestSize=0x20, blockSize=0x40}` and the key-setup `FUN_00117780` does the
+/// canonical HMAC ipad(`0x36`)/opad(`0x5c`) pad-XOR. The `_` join byte (`0x5f`)
+/// is written at `getChKey@0x116108`. All STATIC — no runtime/device/cloud input.
+///
+/// # Static-derivable
+/// Every input is a static, offline-recoverable value (appKey from `secrets/`,
+/// package name from the manifest, cert hash from the APK signing block). No
+/// device, no live cloud call, no runtime config blob. See `re/chkey_static.md`
+/// for the static-vs-runtime verdict.
+///
+/// # Arguments
+/// - `app_key` — the Tuya appKey string (its UTF-8 bytes are the HMAC key);
+/// - `package_name` — the app package name (usually [`APP_PACKAGE_NAME`]);
+/// - `cert_sha256_hex` — the app-cert SHA-256 lowercase hex (64 chars).
+///
+/// The returned `chKey` is a per-app value derived from the appKey + cert hash —
+/// **secret-by-policy** (CLAUDE.md): it must only ever go to `secrets/`, never a
+/// tracked file.
+#[must_use]
+pub fn ch_key(app_key: &str, package_name: &str, cert_sha256_hex: &str) -> String {
+    let message = format!("{package_name}{KEY_PART_SEP}{cert_sha256_hex}");
+    let mac = hmac_sha256(app_key.as_bytes(), message.as_bytes());
+    hex::encode(mac)
+}
+
+/// HMAC-SHA256 over the `sha2` primitive (no extra `hmac` dependency).
+///
+/// Standard construction (RFC 2104): with block size `B=64` and a key `K`,
+/// `K0 = (len(K) > B) ? H(K) : K`, right-padded to `B`; then
+/// `HMAC = H( (K0 ^ opad) || H( (K0 ^ ipad) || msg ) )` with `ipad=0x36`,
+/// `opad=0x5c`. This matches the native key-setup `FUN_00117780`
+/// (`re/chkey_static.md` §3): the >block-size pre-hash, the `0x36`/`0x5c` pads.
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+
+    // K0: hash an over-long key, then zero-pad to the block size.
+    let mut k0 = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        let mut h = Sha256::new();
+        h.update(key);
+        let d = h.finalize();
+        k0[..32].copy_from_slice(&d);
+    } else {
+        k0[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] ^= k0[i];
+        opad[i] ^= k0[i];
+    }
+
+    // inner = H(ipad || msg)
+    let mut hi = Sha256::new();
+    hi.update(ipad);
+    hi.update(msg);
+    let inner = hi.finalize();
+
+    // outer = H(opad || inner)
+    let mut ho = Sha256::new();
+    ho.update(opad);
+    ho.update(inner);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&ho.finalize());
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Injected key material + token provider (the clean injected interface)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1072,6 +1178,80 @@ mod tests {
         let correct = assemble_sign_key("A", "B", "C");
         let swapped = assemble_sign_key("C", "B", "A");
         assert_ne!(correct, swapped);
+    }
+
+    // ── Sub-step 6: chKey (HMAC-SHA256) ────────────────────────────────────
+    //
+    // INDEPENDENT differential for the HMAC primitive: RFC 4231 Test Case 2
+    // (key="Jefe", data="what do ya want for nothing?"). This validates our
+    // hand-rolled HMAC-SHA256 against a published vector — NOT our own
+    // decompilation — so a construction bug (wrong pad, missing pre-hash) is
+    // caught loudly.
+    #[test]
+    fn hmac_sha256_rfc4231_test_case_2() {
+        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            hex::encode(mac),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    // RFC 4231 Test Case 6: key longer than the 64-byte block (131 bytes of
+    // 0xaa) — exercises the >block-size pre-hash branch of the key-setup, which
+    // mirrors the native FUN_00117780 over-long-key path.
+    #[test]
+    fn hmac_sha256_rfc4231_test_case_6_long_key() {
+        let key = vec![0xaau8; 131];
+        let data = b"Test Using Larger Than Block-Size Key - Hash Key First";
+        let mac = hmac_sha256(&key, data);
+        assert_eq!(
+            hex::encode(mac),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    // chKey composition: with SYNTHETIC inputs, the recovered pipeline
+    // (HMAC-SHA256(key=appId, msg=packageName_"_"_certHex) → hex) must equal an
+    // INDEPENDENT recomputation. This pins the key/message ordering recovered
+    // from getChKey@0x16000 (appId is the HMAC KEY; packageName_cert is the
+    // MESSAGE — re/chkey_static.md §1).
+    #[test]
+    fn ch_key_composes_hmac_over_packagename_cert() {
+        let app_key = "SYNTH_APPKEY_000000";
+        let pkg = "com.example.app";
+        let cert = "ab".repeat(32); // synthetic 64-hex
+        let got = ch_key(app_key, pkg, &cert);
+
+        // INDEPENDENT: HMAC-SHA256(key=appId, msg=pkg + "_" + cert), hex.
+        let expected = hex::encode(hmac_sha256(
+            app_key.as_bytes(),
+            format!("{pkg}_{cert}").as_bytes(),
+        ));
+        assert_eq!(got, expected);
+        assert_eq!(got.len(), 64, "chKey is SHA-256 → 64 hex chars");
+        assert!(got
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    // The key/message roles are NOT symmetric: swapping appId and the message
+    // yields a different chKey. Proves the recovered ordering is load-bearing
+    // (a wrong key/msg swap would silently produce a wrong, plausible token).
+    #[test]
+    fn ch_key_key_message_order_is_load_bearing() {
+        let correct = ch_key("APPID", "PKG", &"cd".repeat(32));
+        // Wrong: treat the message as the key and vice-versa.
+        let swapped = hex::encode(hmac_sha256(
+            format!("PKG_{}", "cd".repeat(32)).as_bytes(),
+            b"APPID",
+        ));
+        assert_ne!(correct, swapped);
+    }
+
+    // The default package name constant matches the manifest `package=`.
+    #[test]
+    fn app_package_name_is_the_manifest_package() {
+        assert_eq!(APP_PACKAGE_NAME, "com.philips.ph.babymonitorplus");
     }
 
     // ── Sub-step 5: cert SHA-256 extraction (synthetic DER) ────────────────

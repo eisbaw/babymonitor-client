@@ -31,8 +31,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use babymonitor_core::sign::{
-    app_cert_sha256_hex_from_apk, md5_hex_lower, post_data_digest_hex, SignBody, Signer,
-    SigningKeyMaterial, StaticBmpToken,
+    app_cert_sha256_hex_from_apk, ch_key, md5_hex_lower, post_data_digest_hex, SignBody, Signer,
+    SigningKeyMaterial, StaticBmpToken, APP_PACKAGE_NAME,
 };
 use rand::rngs::OsRng;
 use rsa::pkcs8::DecodePublicKey;
@@ -71,6 +71,49 @@ const LANG: &str = "en";
 /// the load-bearing part for the gateway client check is the `Thing-UA=APP/Android`
 /// prefix. Overriding it has no effect on the sign.
 const THING_SDK_VERSION: &str = "5.18.0";
+
+// ── SDK-fidelity envelope params (TASK-0044) ─────────────────────────────────
+// The real `ThingApiParams.initUrlParams` (~:1771-1831,
+// `decompiled/.../ThingApiParams.java`) sends these in addition to the core
+// envelope. They make the request indistinguishable from the app. Several are
+// runtime/device-specific (`ThingSmartNetWork.m*` set at `ThingSdk.init`,
+// `Build.*` device fields); we use the app's documented defaults and note where
+// a value is a representative stand-in (overriding any has no effect on the
+// `sign`, since `requestId`/`postData`/etc. dominate the canonical string —
+// but `chKey` IS signed, see below).
+
+/// `sdkVersion` (`KEY_SDK_VERSION`) — `ThingSmartNetWork.mSdkVersion`, the
+/// thingclips SDK version passed at `ThingSdk.init`. Runtime-set, not a static
+/// literal in the DEX; we reuse [`THING_SDK_VERSION`] (same value as in the UA).
+const SDK_VERSION: &str = THING_SDK_VERSION;
+
+/// `deviceCoreVersion` (`KEY_DEVICE_CORE_VERSION`) —
+/// `ThingSmartNetWork.mDeviceCoreVersion`, passed at init. Runtime-set; the SDK
+/// ships it lock-stepped with the SDK version, so we use the same string as a
+/// representative default. NOT load-bearing for the gateway client check.
+const DEVICE_CORE_VERSION: &str = THING_SDK_VERSION;
+
+/// `channel` (`"channel"` key) — `ThingSmartNetWork.mChannel`, which defaults to
+/// the literal `"sdk"` (`ThingSmartNetWork.java:89 mChannel = "sdk"` /
+/// `CHANNEL_SDK`) unless the app overrides it at init. We use the SDK default.
+const CHANNEL: &str = "sdk";
+
+/// `osSystem` (`KEY_OS_SYSTEM`) — `Build.VERSION.RELEASE`, the Android OS
+/// version. Device-specific; we use a plausible modern Android release. Purely
+/// informational to the gateway (not the client-identity gate).
+const OS_SYSTEM: &str = "13";
+
+/// `platform` (`KEY_PLATFORM`) — `Build.MODEL`, the device model string.
+/// Device-specific; we use a generic but real-looking model. Informational.
+const PLATFORM: &str = "Pixel 6";
+
+/// `timeZoneId` (`KEY_TIME_ZONE_ID`) — `ThingCommonUtil.getTimeZoneId()`. The
+/// account owner is in Denmark (`COUNTRY_CODE_DK`), so the matching zone.
+const TIME_ZONE_ID: &str = "UTC";
+
+/// `cp` (`KEY_CP`) — set to `VALUE_CP_GZIP="gzip"` whenever `et == "3"`
+/// (`ThingApiParams.initUrlParams` ~:1786-1788). Our `et` is always `3`.
+const CP_GZIP: &str = "gzip";
 
 /// token.get action + version (`re/tuya_cloud_auth.md` §2 step 1). The wire `a`
 /// is the `thing.*`→`smartlife.*`-rewritten form (§1a); we sign over the
@@ -119,6 +162,10 @@ struct LiveConfig {
     bmp_token: String,
     app_version: String,
     device_id: String,
+    /// The per-app channel-auth token (native `getChKey@0x16000`,
+    /// `re/chkey_static.md`). Wire `chKey` param AND a SIGNED whitelist param.
+    /// Secret-by-policy (derived from appKey + cert hash) — never logged.
+    ch_key: String,
     secrets_dir: PathBuf,
 }
 
@@ -232,6 +279,33 @@ fn load_config(secrets_dir: &Path, apk_path: &Path) -> Result<LiveConfig, LiveEr
         ttid: appkey.ttid,
     };
 
+    // chKey: the per-app channel-auth token. Computed from STATIC inputs
+    // (appKey + package name + offline cert hash) per native getChKey@0x16000
+    // (re/chkey_static.md). If a pre-computed secrets/chkey.txt exists we prefer
+    // it (lets an operator pin a captured value), else we derive it here. The
+    // value is secret-by-policy and is NEVER logged. If we derived it, persist it
+    // to secrets/chkey.txt (gitignored, 0600) so the next cycle can reuse it.
+    let ch_key_value = {
+        let pinned = std::fs::read_to_string(secrets_dir.join("chkey.txt"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        match pinned {
+            Some(v) => v,
+            None => {
+                let v = ch_key(
+                    &material.app_key,
+                    APP_PACKAGE_NAME,
+                    &material.app_cert_sha256_hex,
+                );
+                let path = secrets_dir.join("chkey.txt");
+                let _ = std::fs::write(&path, &v);
+                restrict_permissions(&path);
+                v
+            }
+        }
+    };
+
     // A stable, NON-secret per-install device id. The atop envelope needs a
     // `deviceId`; the app uses PhoneUtil.getDeviceID. A fixed UUID-shaped value
     // is fine for a from-scratch client (it is not a credential). Derive it
@@ -245,6 +319,7 @@ fn load_config(secrets_dir: &Path, apk_path: &Path) -> Result<LiveConfig, LiveEr
         bmp_token,
         app_version,
         device_id,
+        ch_key: ch_key_value,
         secrets_dir: secrets_dir.to_path_buf(),
     })
 }
@@ -309,6 +384,25 @@ fn build_signed_envelope_with(
     envelope.insert("ttid".into(), cfg.material.ttid.clone());
     envelope.insert("clientId".into(), cfg.material.app_key.clone());
     envelope.insert("deviceId".into(), cfg.device_id.clone());
+
+    // chKey: the per-app channel-auth token (native getChKey@0x16000). It is BOTH
+    // a wire query param AND a SIGNED whitelist param (SIGN_WHITELIST contains
+    // "chKey"), so it MUST be in the envelope BEFORE signing — the canonical
+    // string then includes it. Its absence is the likely ILLEGAL_CLIENT_ID cause.
+    envelope.insert("chKey".into(), cfg.ch_key.clone());
+
+    // SDK-fidelity params the real initUrlParams sends (TASK-0044). These are NOT
+    // in SIGN_WHITELIST, so they ride the wire query without affecting the sign —
+    // they make the request shape match the app. `cp=gzip` is set because et==3.
+    envelope.insert("sdkVersion".into(), SDK_VERSION.into());
+    envelope.insert("deviceCoreVersion".into(), DEVICE_CORE_VERSION.into());
+    envelope.insert("channel".into(), CHANNEL.into());
+    envelope.insert("osSystem".into(), OS_SYSTEM.into());
+    envelope.insert("platform".into(), PLATFORM.into());
+    envelope.insert("timeZoneId".into(), TIME_ZONE_ID.into());
+    envelope.insert("cp".into(), CP_GZIP.into());
+    envelope.insert("bizData".into(), build_biz_data());
+
     for (k, v) in extra {
         envelope.insert(k.clone(), v.clone());
     }
@@ -349,6 +443,22 @@ fn rewrite_action(action: &str) -> String {
 /// value from the timestamp + action without adding a uuid dependency.
 fn derive_request_id(now_ms: i64, wire_action: &str) -> String {
     md5_hex_lower(format!("{now_ms}::{wire_action}").as_bytes())
+}
+
+/// Build the `bizData` envelope param: the JSON object the real
+/// `ThingApiParams.initUrlParams` (~:1793-1822) assembles. It always carries
+/// `customDomainSupport="1"`, and folds in `sdkInt` (`Build.VERSION.SDK_INT`)
+/// and `brand` (`Build.BRAND`). Device-ish fields use representative values
+/// matching the [`PLATFORM`]/[`OS_SYSTEM`] picks. It is NOT a signed param.
+fn build_biz_data() -> String {
+    serde_json::json!({
+        "customDomainSupport": "1",
+        // Build.VERSION.SDK_INT for the OS in OS_SYSTEM ("13" → API 33).
+        "sdkInt": "33",
+        // Build.BRAND matching PLATFORM ("Pixel 6").
+        "brand": "google",
+    })
+    .to_string()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -985,6 +1095,123 @@ fn scan_p2p_type(result: &serde_json::Value) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A SYNTHETIC LiveConfig for envelope tests — no real secret. The bmp_token
+    /// is a placeholder so signing yields a deterministic value; chKey is a fixed
+    /// synthetic 64-hex.
+    fn synthetic_cfg() -> LiveConfig {
+        LiveConfig {
+            creds: LoginCreds {
+                email: "user@example.com".into(),
+                password: "pw".into(),
+                authorization: None,
+            },
+            material: SigningKeyMaterial {
+                app_key: "SYNTH_APPKEY_000000".into(),
+                app_secret: "SYNTH_APPSECRET_0000000000000000".into(),
+                app_cert_sha256_hex: "ab".repeat(32),
+                ttid: "SYNTH_TTID".into(),
+            },
+            bmp_token: "PLACEHOLDER_BMP_TOKEN".into(),
+            app_version: "1.9.0".into(),
+            device_id: "0123456789abcdef".into(),
+            ch_key: "cd".repeat(32), // synthetic 64-hex
+            secrets_dir: std::env::temp_dir(),
+        }
+    }
+
+    // AC: chKey MUST be present in BOTH the wire envelope AND the canonical sign
+    // string (it is in SIGN_WHITELIST). Without it the request omits chKey from
+    // both surfaces — the likely ILLEGAL_CLIENT_ID cause. This proves it now
+    // rides both.
+    #[test]
+    fn envelope_carries_chkey_in_wire_and_canonical_sign() {
+        use babymonitor_core::sign::{canonical_string, post_data_digest_hex};
+
+        let cfg = synthetic_cfg();
+        let (envelope, _body) = build_signed_envelope(
+            &cfg,
+            TOKEN_GET_ACTION,
+            TOKEN_GET_VERSION,
+            "{}",
+            SignBody::KeyAndCanonical,
+        )
+        .expect("envelope build");
+
+        // (1) chKey is on the wire query, with the configured value.
+        assert_eq!(
+            envelope.get("chKey").map(String::as_str),
+            Some(cfg.ch_key.as_str()),
+            "chKey must ride the wire envelope"
+        );
+
+        // (2) chKey enters the CANONICAL SIGN STRING. Reconstruct the exact sign
+        // input the builder uses: the envelope (minus the wire-only `sign`) with
+        // postData replaced by its digest, then canonicalize.
+        let mut sign_params = envelope.clone();
+        sign_params.remove("sign");
+        sign_params.insert("postData".into(), post_data_digest_hex(b"{}").unwrap());
+        let canonical = canonical_string(&sign_params);
+        assert!(
+            canonical.contains(&format!("chKey={}", cfg.ch_key)),
+            "chKey must appear in the canonical sign string; got: {canonical}"
+        );
+    }
+
+    // The SDK-fidelity params the real initUrlParams sends are all on the wire.
+    #[test]
+    fn envelope_carries_sdk_fidelity_params() {
+        let cfg = synthetic_cfg();
+        let (envelope, _body) = build_signed_envelope(
+            &cfg,
+            TOKEN_GET_ACTION,
+            TOKEN_GET_VERSION,
+            "{}",
+            SignBody::KeyAndCanonical,
+        )
+        .expect("envelope build");
+        for k in [
+            "sdkVersion",
+            "deviceCoreVersion",
+            "channel",
+            "osSystem",
+            "platform",
+            "timeZoneId",
+            "cp",
+            "bizData",
+        ] {
+            assert!(
+                envelope.contains_key(k),
+                "envelope must carry SDK-fidelity param {k}"
+            );
+        }
+        assert_eq!(envelope.get("cp").map(String::as_str), Some("gzip"));
+        assert_eq!(envelope.get("channel").map(String::as_str), Some("sdk"));
+    }
+
+    // Removing chKey from the envelope MUST change the canonical sign string —
+    // proving chKey is load-bearing for the signature (it is whitelisted).
+    #[test]
+    fn chkey_changes_the_canonical_sign() {
+        use babymonitor_core::sign::canonical_string;
+        let cfg = synthetic_cfg();
+        let (envelope, _b) = build_signed_envelope(
+            &cfg,
+            TOKEN_GET_ACTION,
+            TOKEN_GET_VERSION,
+            "{}",
+            SignBody::KeyAndCanonical,
+        )
+        .unwrap();
+        let with_chkey = canonical_string(&envelope);
+        let mut without = envelope.clone();
+        without.remove("chKey");
+        let without_chkey = canonical_string(&without);
+        assert_ne!(
+            with_chkey, without_chkey,
+            "chKey is whitelisted → dropping it must change the canonical string"
+        );
+    }
 
     #[test]
     fn rewrite_action_maps_thing_to_smartlife() {

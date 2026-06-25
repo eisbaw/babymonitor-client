@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@architect'
 created_date: '2026-06-25 11:40'
-updated_date: '2026-06-25 12:16'
+updated_date: '2026-06-25 13:10'
 labels:
   - phase3
   - wave3
@@ -47,18 +47,5 @@ GUARDRAILS: password.login AT MOST ONCE; no retry-spam; READ-only; all values to
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-LIVE RUN OUTCOME (no values; all captured artifacts in gitignored secrets/):
-- The live SIGN ORACLE was UNREACHABLE. The public Tuya/thingclips atop gateway (a1.tuyaeu.com, HTTP 200) rejected token.get with errorCode=ILLEGAL_CLIENT_ID / 'Invalid client;No access' at the CLIENT-IDENTITY layer, BEFORE evaluating our sign. token.get SIGN was neither accepted nor rejected.
-- => bmp_token candidate + MD5 fold are NEITHER validated NOR refuted. This is NOT a sign-rejection (would need the server to judge our sign); it is a gateway routing/provisioning blocker upstream of signature verification.
-- password.login was NOT attempted (ZERO lockout-sensitive calls consumed). 2FA NOT reached.
-- token.get tried (a few minimal network-level routing attempts, guardrail-allowed): a1.tuyaeu.com (EU default), a1.tuyaus.com (US) -> both ILLEGAL_CLIENT_ID; m1.tuyaeu.com is MQTT/media host (no /api.json). Retry with SDK-correct User-Agent (Thing-UA=APP/Android/<ver>/SDK/<ver>) also ILLEGAL_CLIENT_ID -> UA not the gate. STOPPED per 'a few calls max'.
-SHIPPED (code+doc, method only, no values):
-- Gated live path behind CLI 'live' Cargo feature (reqwest+rsa+rustls OUT of default build; just e2e/assert-offline stay green). New: babymonitor-cli/src/live.rs (token.get->RSA pw->ONE password.login; 2FA capture; READ-only device-list; all captures->secrets/ only; URL/secret scrub on network errors).
-- FIX: signer SIGN_WHITELIST had 'appId'/'t' but recovered wire names are 'clientId'/'time' (provenance §2.1, auth §1); old values silently dropped appKey+timestamp from the canonical str => wrong sign. Now correct.
-- Added post_data_digest_hex (32-hex-MD5+swap; the well-defined postData fold) resolving the len-24-vs-32 ambiguity for the live path.
-- Deliverable: re/live_login.md (outcome + method, no values).
-LIKELY CAUSE (speculative, NOT validated): appKey provisioned for a region-config-decrypted datacenter host (encrypted thing_domains_v1/regions, native getConfig), not the legacy a1.tuya*.com gateway. NEXT: decrypt regions blob OR one Frida/proxy capture (TASK-0022) to get the real host + any missing provisioning field, then re-run the ONE token.get to reach the sign oracle.
-GATES: just e2e GREEN; check-evidence GREEN; secret-scan GREEN; secrets/* gitignored+unstaged.
-
-Cycle review: both GO (no P0; secret hygiene clean — no value in any tracked file/commit/history; guardrails honored: 0 password attempts, 2FA NOT reached; whitelist fix correct; URL-scrubber works). OUTCOME: token.get rejected ILLEGAL_CLIENT_ID at the gateway client-identity layer BEFORE sign eval -> bmp_token candidate NEITHER validated NOR refuted (still live). LOGIN FAILED at the gateway -> per guardrail, STOPPED + reporting to operator. Status: In Progress (blocked on gateway host/provisioning). P1 hardening for the NEXT live cycle: (a) scrub_url_secrets docstring claims without_url it doesn't call — fix doc or implement; (b) probe_host uses unscrubbed {e} (safe only incidentally) + add a 'do not run live with RUST_LOG=reqwest/hyper debug' warning (reqwest/hyper can log the full signed URL). Orchestrator dropped the wx-prefix appKey-shape disclosure from re/live_login.md.
+FEED-FORWARD (TASK-0044): chKey + SDK-fidelity params are now IN the live request, ready for the single token.get re-attempt. chKey = HMAC-SHA256(appId, packageName_"_"_certSha256Hex) recovered STATIC from native getChKey@0x16000 (re/chkey_static.md); computed in live.rs::load_config from appKey+manifest-package+offline-cert-hash, persisted to secrets/chkey.txt (gitignored). It is added to the atop envelope BEFORE signing (chKey is in SIGN_WHITELIST), so it rides the wire query AND enters the canonical sign. Also added the SDK-fidelity wire params the real initUrlParams sends: channel=sdk, sdkVersion, deviceCoreVersion, osSystem, platform, timeZoneId, bizData, cp=gzip (these are NOT signed; app defaults used for device-ish values). This was the likely ILLEGAL_CLIENT_ID cause (chKey was previously omitted from BOTH wire+sign). NEXT-cycle action: spend exactly ONE token.get with the corrected request; if ILLEGAL_CLIENT_ID clears, the bmp_token+MD5-fold sign oracle finally becomes reachable. NB the chKey key/message ordering is likely (not confirmed) — a token.get rejection could also be a wrong chKey ordering, not only a wrong sign.
 <!-- SECTION:NOTES:END -->

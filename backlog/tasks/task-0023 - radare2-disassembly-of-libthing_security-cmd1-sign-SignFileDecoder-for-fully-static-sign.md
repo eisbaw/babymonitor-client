@@ -1,13 +1,13 @@
 ---
 id: TASK-0023
 title: >-
-  Ghidra disassembly of libthing_security cmd=1 sign + SignFileDecoder for
+  radare2 disassembly of libthing_security cmd1 sign + SignFileDecoder for
   fully-static sign
 status: Done
 assignee:
   - '@reverser'
 created_date: '2026-06-25 01:22'
-updated_date: '2026-06-25 03:45'
+updated_date: '2026-06-25 06:54'
 labels:
   - phase3
   - re

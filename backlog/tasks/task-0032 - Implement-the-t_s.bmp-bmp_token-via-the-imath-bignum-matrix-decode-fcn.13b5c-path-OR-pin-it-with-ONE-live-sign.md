@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-06-25 05:42'
-updated_date: '2026-06-25 06:35'
+updated_date: '2026-06-25 06:56'
 labels:
   - phase3
   - re
@@ -31,5 +31,5 @@ TASK-0030 JOB-1 corrected the premise of the original TASK-0032 (which wrongly s
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-TASK-0033 (Ghidra-headless port) is the deep-static attempt to resolve this residual; if it lands a confident byte-exact port, TASK-0032 narrows to just the live-vector validation.
+TASK-0033 (Ghidra port) RESULT: the imath+matrix decode is now ported BYTE-EXACT from Ghidra C (re/scripts/bmp_token_ghidra.py, re/ghidra/*.c, 16 tests). Decode: fully-ported-unvalidated. BUT a NEW finding shifts the residual: Ghidra's doCommandNative.c shows the config arg to read_keys_from_content is a RUNTIME JNI byte[] (param_6, GetByteArrayElements), NOT a static asset. strhash(config) selects the pixel offset AND the validity (pixels[base+1]=num_keys must be 1..5); for arbitrary static configs the header is rejected. So the matrix port is NO LONGER the residual (it is done) -- the residual is now OBTAINING the runtime SDK-config byte[] that doCommandNative(cmd=0) is invoked with (constructed in the Java/SDK layer). Also: the BMP decode runs on cmd=0 (setup; joins keys with '_' into cached DAT_00139070), and cmd=1/cmd=2 MD5 that cached key -- the r2 trace's 'cmd=1' attribution was off-by-one (recorded in bmp_token_whitebox.md s9). AC#1 path (a): matrix ported but blocked on the runtime config blob, so still cannot emit the production token offline. Path (b) live-vector remains the cheaper full-resolution oracle. BmpTokenProvider stays PendingBmpToken (not wired to a fake).
 <!-- SECTION:NOTES:END -->

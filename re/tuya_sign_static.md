@@ -1,9 +1,19 @@
 # Tuya mobile-app signer — fully-STATIC recovery dive (TASK-0023)
 
-Heavy static (Ghidra/radare2) disassembly of the native Tuya request-signer, to
+Heavy static disassembly of the native Tuya request-signer, to
 decide whether the FULL signer — string-to-sign + `t_s.bmp` token decode + key
 combine + keyed hash — can be reproduced in Rust **from static analysis alone, with
-no device**. This supersedes the `needs-runtime-hook` verdict of TASK-0005
+no device**.
+
+> **TOOL ATTRIBUTION (corrected, TASK-0033).** The disassembly underlying THIS
+> doc (TASK-0023) and its follow-ups (TASK-0029/0030/0032) was performed with
+> **radare2**, despite earlier "Ghidra" name-drops. The byte-exact decompilation
+> of the `t_s.bmp` decode chain in §5 was first done with **Ghidra 11.4.2 headless
+> under TASK-0033** (see `re/ghidra/*.c` and `re/bmp_token_whitebox.md` §9). Where
+> this doc says "Ghidra", read it as: radare2 for §1–4/§6–7, Ghidra for the §5
+> matrix port. No claim of "Ghidra" should be read as Ghidra for the earlier cycles.
+
+This supersedes the `needs-runtime-hook` verdict of TASK-0005
 (`re/tuya_sign.md`) now that the native cmd=1 path and the hash primitive have been
 disassembled to byte level.
 

@@ -246,10 +246,79 @@ MATERIAL:**
   matrix init/deobf `fcn.5eb0` ("inited matrix:" `@0x2b30`, dense `mp_int_*`) — the
   imath-bignum + matrix decode of the config using the BMP pixels.
 
-**Verdict — `BmpToken: partially` (statically-recoverable-in-principle, un-ported).**
-The decode is fully deterministic and device-independent (static `t_s.bmp` pixels +
-static config blob + embedded matrix constants; no runtime/network input), so it can
-be ported offline. But it requires porting imath bignum (`mp_int_*`) + the matrix
-`transform`/`fcn.5eb0` exactly — the same heavy residual as `re/tuya_sign_static.md`
-§5, now confirmed to sit on the `t_s.bmp` sign path. Not completed in this task. A
-single accepted live sign remains the cheaper end-to-end oracle (contingency).
+**Verdict (§8, as of TASK-0030, radare2) — `BmpToken: partially`
+(statically-recoverable-in-principle, un-ported).** Superseded in part by §9 below
+(the §8 claim of "no runtime input / static config blob" is **CORRECTED** by the
+Ghidra port: the config blob is a RUNTIME JNI `byte[]`, not a static asset).
+
+## 9. The Ghidra-C BYTE-EXACT port + the runtime-config finding (TASK-0033, confidence: confirmed)
+
+Two independent sources: **Ghidra 11.4.2 headless** C decompilation of all nine
+functions in the decode chain (committed under `re/ghidra/*.c`) AND the radare2
+disassembly of `libthing_security_algorithm.so@0x5138` (used to resolve two
+offset-walk arguments Ghidra elided). The port is `re/scripts/bmp_token_ghidra.py`
+(+ `test_bmp_token_ghidra.py`, 16 tests). Ghidra invocation that worked:
+
+```
+ghidra-analyzeHeadless analysis/ghidra bmptok \
+  -import decompiled/nativelibs/libthing_security_algorithm.so \
+  -scriptPath analysis/ghidra -postScript DumpDecomp.py re/ghidra <name|name@0xADDR ...>
+# (Ghidra applies image base 0x100000; pass file-offset+0x100000 for raw addresses.
+#  Re-import the SECOND lib into the SAME project with a separate -import run.)
+```
+
+**The algorithm, now fully resolved from Ghidra C:**
+- `read_keys_from_content(config, &keys, &count, bmp)` → `header_check` (`'BM'`;
+  `0x2800≤filesize<0x200001`; `filesize-0x36 ≥ bfOffBits`; bpp∈{24,32}; comp==0) →
+  `dispatch_decode(config, …, pixels=bmp+0x36, pixel_len=filesize-bfOffBits)`.
+- selector: `h=strhash(config)` (`acc=acc*31+byte`, signed int32, abs); `r=(h%L)//2`;
+  `idx=r%L`; `sel=pixels[idx]`; `1→decode_op1`, `2→decode_op2`, else error 0x15.
+- `decode_op1/op2`: `num_keys=pixels[(base+1)%L]` (1..5), `num_coeffs=pixels[(base+2)%L]`,
+  then read `num_coeffs` `(a,b)` coefficient pairs from the pixels along a chained
+  offset (start `= xorstep_u32(px,base+1) ^ r`, XOR-stepped per pair by `xorstep_583c`
+  = 4 pixel bytes packed big-endian). op1 takes value bytes **directly** from pixels;
+  op2 reconstructs each byte **bit-by-bit from the LSB of 8 consecutive pixel bytes**
+  (steganographic LSB packing). Each value is `%02x`-formatted → a base-16 string.
+- `matrix_fcn5eb0` (+ `matrix_init`): builds a **Vandermonde** system over exact
+  rationals (imath `mp_rat`): row i `= [a_i^(n-1)…a_i^1, 1 | b_i]`, `a_i,b_i =
+  mp_rat_read_string(hex, base 16)`; Gaussian elimination with partial pivoting;
+  solved final unknown `c = lastrow[n]/lastrow[n-1]`, **REDUCED and REQUIRED integral**
+  (`mp_int_compare_value(denom,1)==0`, else error 0xb); output key `= "%02x"` of
+  `mp_int_to_binary(numerator)` (leading 0x00 stripped). `transform@0x6c58` is a
+  **no-op stub** (`return 0`) in this build — it does NOT post-process the key.
+
+**Ghidra-vs-radare2 cross-check:**
+- **AGREE** on the entire algorithm-lib chain (read_keys_from_content → fcn.4a34 →
+  fcn.4b28 → fcn.5138/fcn.54f4 → fcn.5eb0; pixels @ offset 54; selector walk). Ghidra
+  **ADDS** the exact math r2 only characterized: the Vandermonde build, the
+  exact-rational elimination, the denominator==1 gate, the `transform` no-op, and the
+  op1-vs-op2 byte-sourcing difference (direct bytes vs LSB packing).
+- **DIVERGENCE (recorded):** §8 (r2) put the `fcn.13b5c` raw-BMP read +
+  `read_keys_from_content` calls on the **cmd=1** sign branch of `doCommandNative`.
+  Ghidra's `doCommandNative.c` shows they are on the **cmd=0** branch (`param_4==0`):
+  **cmd=0 runs the BMP decode**, joins the key list with `'_'` (the `0x5f` write at
+  `0x114c30`) into the cached global key (`DAT_00139070`), and **cmd=1/cmd=2 then MD5
+  that CACHED key** with the request data. End-to-end model unchanged (raw t_s.bmp →
+  read_keys_from_content → key list → `_`-joined → MD5); only the cmd-number that
+  triggers the decode is corrected (cmd=0 setup, not cmd=1).
+
+**CORRECTION to §5/§8 — the decode is NOT purely static:** Ghidra shows the `config`
+argument to `read_keys_from_content` is `param_6` of `doCommandNative` — a **runtime
+JNI `byte[]`** (`GetByteArrayElements`/`GetArrayLength` @ vtable 0x5c0/0x558), NOT a
+static asset. `strhash(config)` selects both the pixel offset AND (via `pixels[base+1]`)
+whether the header is valid. Empirically, for arbitrary/static config strings
+`pixels[base+1]` is almost always >5 → the validator rejects (asserted in
+`test_arbitrary_static_config_does_not_yield_valid_header`). So the earlier "depends
+only on static t_s.bmp + matrix constants, no runtime input" claim is **REFUTED**:
+the production token additionally requires the **runtime SDK-config blob**. The matrix
+machinery itself is fully ported and runs end-to-end on a synthetic crafted BMP+config
+(`test_synthetic_bmp_full_decode_runs`).
+
+**Verdict — `Decode: fully-ported-unvalidated`.** The imath+matrix decode is now
+ported byte-exact (Ghidra C primary source, r2-confirmed), with NO static oracle in
+the `.so` (no embedded test vector); the only true oracle is a live sign-accept
+(excluded by scope). The residual is no longer "port the matrix" (done) — it is
+**obtaining the runtime SDK-config `byte[]`** that `doCommandNative(cmd=0)` is called
+with (where the Java/SDK layer constructs it). Until that blob is known, the
+`BmpTokenProvider` stays `PendingBmpToken` (NOT wired to a fake). A single accepted
+live sign remains the cheaper end-to-end oracle (contingency).

@@ -140,5 +140,6 @@ derived from `lib/arm64-v8a/libThingP2PSDK.so` in `config.arm64_v8a.apk`.
   (named JNI symbols) but the exact sign/key-derivation routine inside
   `libthing_security_algorithm.so` is NOT yet located — that is task 5's job and
   is only pointed at here.
-- No code-offset analysis (Ghidra/radare2 disassembly) was done; this task is the
-  inventory + identity layer. Wire-format recovery is downstream.
+- No code-offset analysis (radare2/Ghidra disassembly) was done in THIS inventory
+  task; this task is the inventory + identity layer. Wire-format recovery is
+  downstream (radare2 in TASK-0023/0029/0030/0032; Ghidra in TASK-0033).

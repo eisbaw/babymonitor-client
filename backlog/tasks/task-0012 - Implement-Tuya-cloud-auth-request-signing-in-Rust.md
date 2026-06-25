@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@architect'
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 06:03'
+updated_date: '2026-06-25 06:56'
 labels:
   - phase5
   - rust
@@ -63,36 +63,5 @@ GATE: nix-shell just e2e (build+test+clippy -D+fmt+stub-grep+offline) GREEN; che
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-IMPLEMENTER FINAL SUMMARY (TASK-0012) — TOKEN-PENDING, left In Progress.
-
-LANDED (babymonitor-core, commit c60d2fc):
-- sign module: recovered 5/6 signer ingredients as independently-testable pure fns + an injected key interface. swap_sign_string (B1+A+C+B2), md5_hex_lower/md5_as_base64 (plain MD5, NOT HMAC), canonical_string (sorted whitelist, literal '||' join, drop-empty), assemble_sign_key ('_'-join), app_cert_sha256_hex[_from_apk] (offline cert hash). Injected interface: SigningKeyMaterial{app_key,app_secret,app_cert_sha256_hex,ttid} + BmpTokenProvider trait (PendingBmpToken / StaticBmpToken impls) + Signer{material,provider,SignBody}.
-- session module (AC#2): SessionStore -> ~/.local/share/babymonitor/session.json, refresh-before-expiry (2-min buffer), load/save/clear, unit + negative tests.
-
-PER-AC STATUS:
-- AC#1 (byte-for-byte differential vector): UNMET — honestly TOKEN-PENDING. The full valid sign needs the real bmp_token (TASK-0030) AND an INDEPENDENT gold vector (nalajcie tooling or one live capture). Did NOT fabricate a vector. Encoded as a #[ignore]d pending test (sign::tests::full_signature_byte_parity_pending_task_0030) citing TASK-0030. A PARTIAL differential over the recovered sub-steps composes NOW (partial_differential_recovered_substeps_compose) with a synthetic placeholder token.
-- AC#2 (token store + refresh + no unflagged stubs): MET. Unit-tested incl. corrupt-store negative.
-- AC#3 (impl+unit-test the ALGORITHM, record blocker, do NOT fake a vector): MET. Algorithm + all recovered sub-steps implemented and unit-tested against independent/known vectors; blocker (bmp_token white-box cipher) recorded; no faked vector.
-- AC#4 (live auth rate-limited single-shot): N/A this task — NO live calls made (structure + unit tests only, per static-only). To be honored by the login-flow task that actually issues requests.
-
-VALIDATION (prove-the-check-bites):
-- swap_sign_string: known 32-char vector -> documented permutation; negatives reject wrong-length + non-ASCII.
-- md5_hex_lower/md5_as_base64: RFC1321 + python-hashlib-independent vectors; corrupt-input diverges.
-- canonical_string: '||'-joined sorted output; asserts NOT '&'; differs-from-query-form negative.
-- assemble_sign_key: order-is-load-bearing negative.
-- cert helper: synthetic-DER 64-hex shape + reject-no-cert negative; AND the REAL ingredient cross-checked byte-for-byte vs the openssl reference on extracted/xapk/...'s META-INF/BNDLTOOL.RSA (Rust pure path prefix == openssl prefix; value withheld). Real-cert test is #[ignore]d (needs gitignored APK).
-
-GATES (actual): just e2e GREEN (build+test 27 pass/2 ignore + clippy -D + fmt-check + stub-grep + assert-offline + bmp-decode); check-evidence GREEN; secret-scan GREEN; showcase GREEN; gates-selftest bites.
-
-GOTCHAS / HONEST LIMITATIONS:
-1. post_data_digest 24-vs-32 length contradiction: md5AsBase64(16-byte digest)=24 chars, but the decompiled swapSignString is characterized on a 32-char input (slices [0:8],[8:24],[24:32]). On a 24-char input those slices are OOB. We surface this as a typed Error::InvalidSignInput (documented gotcha) rather than silently mangling — the real postData fold is an OPEN ambiguity the gold vector (TASK-0030/live) must resolve. So post_data_digest is currently non-functional on real bodies BY DESIGN-HONESTY.
-2. SignBody fold (MD5(key) vs MD5(key||canonical)) and the '_'-part ORDER are 'likely' (control-flow read, not executed) per re/tuya_sign_static.md §7-8. Made EXPLICIT (SignBody enum, single assemble_sign_key) so one gold vector fixes them in one place; NOT silently guessed.
-3. cert extractor is a pragmatic DER scanner (no full ASN.1 crate); validated against the real cert but could mis-pick on an unusual PKCS#7 layout — fails loud if no cert SEQUENCE found.
-4. Added flate2 (rust_backend / miniz_oxide, pure-Rust, offline) to inflate the DEFLATE-compressed signature block; keeps the offline gate self-contained.
-
-FEED-FORWARD: appended interface shapes to TASK-0013 (SigningKeyMaterial) and TASK-0030 (BmpTokenProvider). Kept In Progress: AC#1 stays token-pending until TASK-0030 lands the token + an independent gold vector.
-
-Cycle-14 review: both GO. Architect re-derived all 5 recovered sub-steps independently = correct; token-pending honest; cert value confirmed correct (raw-embedded-cert = Android semantics). Non-blocking P1/P2 -> TASK-0031 (cert validation reproducibility + leaf-selection robustness + spec contradiction caveat). AC#1 stays token-pending.
-
-FEED-FORWARD from TASK-0030 JOB-1 (2026-06-25): the byte-exact signer is NOT yet offline-recoverable, but the residual is now fully characterized and is a STATIC port (not inherently device-bound). The signer's bmp_token (the middle _-part of the MD5 sign key) is produced by: doCommandNative (libthing_security.so@0x13ef4, cmd=1) -> fcn.13b5c reads the RAW t_s.bmp bytes (verbatim, no transform; t_s_daily.bmp selected by the JNI boolean Z flag but NOT shipped, so production uses t_s.bmp) -> passed as arg x3 to read_keys_from_content (libthing_security_algorithm.so@0x4974) -> BMP header validated (fcn.4a34), pixel array at offset 54 -> imath-bignum + matrix deobfuscation (fcn.4b28 -> fcn.5138/fcn.54f4 -> matrix fcn.5eb0) decodes the SDK-config blob into the labelled key list -> feeds the MD5 key-builder fcn.13474. NOTE: the AES-128-CBC path (fcn.11658, TASK-0030) decodes a DIFFERENT t_s.bmp consumer (the TLS cert-pinning config) and is NOT the signer token. EXACT NEXT STEP for AC#1/AC#3: pick ONE of (a) port the imath bignum + matrix decode offline per re/bmp_token_whitebox.md s8 (deterministic, device-independent, but no local oracle until the end-to-end sign differential — a 1-element error fails silently); or (b) the cheaper contingency — capture ONE accepted live sign and differential it against core::sign. Tracked in TASK-0032 (re-scoped). Keep the BmpTokenPending discipline until one of those lands; do NOT wire a guessed token.
+TASK-0033 feed-forward (bmp_token / AC#1): the t_s.bmp imath+matrix decode is now ported byte-exact from Ghidra C (re/scripts/bmp_token_ghidra.py). HOWEVER the signer is NOT yet offline-complete: Ghidra revealed the decode's config input is a RUNTIME JNI byte[] (doCommandNative param_6), not a static asset, so the production bmp_token cannot be computed from assets alone. The byte-for-byte differential (AC#1) therefore still needs EITHER the runtime SDK-config byte[] OR one live sign vector (AC#3 contingency). BmpTokenProvider stays PendingBmpToken; Signer::sign still returns BmpTokenPending (honest). MD5-not-HMAC, '_'-join order, and cert-SHA256-offline all stand from TASK-0023. Precise residual now = the runtime config blob (or a live vector), NOT the matrix algorithm (which is done).
 <!-- SECTION:NOTES:END -->

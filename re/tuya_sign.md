@@ -21,7 +21,8 @@ source lines live ONLY in `secrets/tuya_appkey.json` (gitignored). This doc reco
 ## Verdict (confidence: confirmed)
 
 > **SUPERSEDED by `re/tuya_sign_static.md` (TASK-0023).** The heavy static
-> (Ghidra/r2) dive recovered the signer — the verdict is now
+> **radare2** dive (TASK-0023; the `t_s.bmp` matrix port was later done in
+> **Ghidra** under TASK-0033) recovered the signer — the verdict is now
 > **partially-recoverable** (NO device needed; only the `t_s.bmp` token-decode
 > port, filed as TASK-0029, remains). Concretely the static dive proved the keyed
 > hash is **plain MD5** (not HMAC-SHA256; MD5 IV constants in

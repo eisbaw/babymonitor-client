@@ -267,7 +267,7 @@ WyzeCam `tutk` (https://kroo.github.io/wyzecam/reference/tutk/tutk/).
 **confirmed** present (`re/symbols/libThingP2PSDK.dynsym.txt`). Targets are named
 functions/symbols (no fixed code offsets — no disassembly was done this task; the
 offsets in the `.dynsym.txt` dumps are symbol addresses, the disassembly entry
-points for Ghidra/r2 in TASK-0010).
+points for radare2/Ghidra in TASK-0010).
 
 ### PRIORITY 1 — WebRTC signaling/session path (the CHOSEN transport)
 
@@ -315,7 +315,7 @@ grounded in the exported-symbol-only evidence of `libThingP2PSDK.so` /
 `re/symbols/libThingP2PSDK.dynsym.txt` — no call graph was analyzed, so the
 argument semantics remain a single-source open item for TASK-0010).
 
-- No Ghidra/r2 disassembly was done — argument **semantics** (e.g. the meaning of
+- No radare2/Ghidra disassembly was done — argument **semantics** (e.g. the meaning of
   the trailing `int` flags on `connect_v2`, the `skill` bitmask vs enum) need
   decompilation. This task is the **API-surface + entry-point map**, not the
   control-flow recovery.

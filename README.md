@@ -215,9 +215,14 @@ So clearing the identity gate is a hard prerequisite for the project's actual go
 It is **complete and token-injectable but CANNOT log in on its own** (the server-side
 identity gate, §3) and so cannot stream unattended today. `auth login` and any live
 fetch **honestly report that login is not available** rather than fabricate a session.
-The live end-to-end test exists but is `#[ignore]`d and asserts the honest pending
-state today. The session-token slot is **injectable**: given one captured live `sid`
-(§6), the same code path runs the rest of the chain for real.
+The session-token slot is **injectable, and the consumer is wired**: `devices list
+--live` (gated `--features live`, TASK-0055) **loads an injected `sid`** from the
+on-disk session store and drives a byte-faithful, signed `device.list` request with
+it — **bypassing `password.login`** (the blocked step). With no session injected it
+reports the blocked state honestly. The wiring is test-backed offline
+(`injected_sid_rides_device_list_envelope_and_canonical_sign`, no network), and the
+`#[ignore]`d live end-to-end test asserts the honest pending state for the full
+stream. So given one captured live `sid` (§6), the read path runs for real.
 
 Build and run (from the repo root, inside the nix shell):
 
@@ -297,14 +302,31 @@ same file `auth status` reads. To validate the full chain end-to-end:
    plaintext-`sid` CLI flag by design, to avoid `sid` landing in shell history.)
 3. Confirm it is loaded: `nix-shell --run 'just run -- auth status'` now reports a
    stored session (with `sid`/`uid` redacted) and its `mobile_api_base`.
-4. Exercise the chain against the real account using the gated live build
-   (`--features live`, single-shot, rate-limited): the `auth live-login` /
-   device-fetch paths in `babymonitor-cli/src/live.rs` carry the injected `sid` on the
-   atop envelope, so login → `device.list` → per-camera `p2pType` → the MQTT **302**
-   signaling → WebRTC can run for real. The `#[ignore]`d live gold-oracle test
-   (`babymonitor-cli/tests/live_e2e.rs`) is the assertion harness for this run; it
-   checks **shape only** (a camera is found, transport is WebRTC) and never prints a
-   `sid`/`uid`/device id.
+4. Drive the **read path** against the real account using the gated live build —
+   `devices list --live` is the injected-session consumer (TASK-0055):
+
+   ```sh
+   nix-shell --run 'cargo run --manifest-path babymonitor/Cargo.toml --features live \
+       --bin babymonitor-cli -- devices list --live'
+   ```
+
+   With a session in the store this **loads the injected `sid`**, builds a
+   byte-faithful signed `device.list` atop request carrying that `sid` (folded into
+   the envelope BEFORE signing, so it enters the canonical sign string — `sid` is in
+   the sign whitelist, `re/tuya_cloud_auth.md` §3a), and sends ONE call —
+   **bypassing `password.login`** entirely (the step the identity gate blocks). It
+   reports SHAPE only (`camera_found`, `p2p_type`); the raw response is captured to
+   gitignored `secrets/`. With NO session injected (or in the default non-`live`
+   build) it reports the honest identity-gate-blocked state and touches no network.
+   The wiring is proven by the offline test
+   `injected_sid_rides_device_list_envelope_and_canonical_sign`
+   (`babymonitor-cli/src/live.rs`), which asserts the injected `sid` rides the wire
+   envelope AND the canonical sign string with no network call.
+5. Continue the chain (per-camera `p2pType` → the MQTT **302** signaling → WebRTC)
+   once a real `device.list` returns: the `#[ignore]`d live gold-oracle test
+   (`babymonitor-cli/tests/live_e2e.rs`) is the assertion harness for the full
+   stream run; it checks **shape only** (a camera is found, transport is WebRTC) and
+   never prints a `sid`/`uid`/device id.
 
 This is the honest seam: the static work is complete up to the server-side identity
 binding, and a single owned-device capture closes it — no further reverse engineering

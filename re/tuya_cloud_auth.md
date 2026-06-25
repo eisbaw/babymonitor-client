@@ -270,6 +270,39 @@ that the session is the `User.sid` string persisted as JSON, so this is `confirm
   exact role vs `sid` is not exercised on the email-login path we traced, so do not
   assume it refreshes `sid` without a live check).
 
+### 3a. Injected-`sid` read path: how a captured session drives `device.list` (TASK-0055) (confidence: confirmed)
+
+This records the static method (NO values) the Rust client uses to let a
+SEPARATELY-CAPTURED session drive the read side WITHOUT solving the login identity
+gate (§3 of `re/review_gate_findings.md`) — the honest "token-injectable" design.
+The `sid` is carried on an authenticated atop call exactly as the SDK does:
+
+- **Where `sid` rides:** as the `sid` envelope param, injected by
+  `ApiParams.getSession` → `IBaseUser.getSid()` and put into both the URL params and
+  the post body (`ThingApiParams.initUrlParams`: `if (!isEmpty(getSession())) put(KEY_SESSION, getSession())`
+  ~:1403/1660; `KEY_SESSION="sid"` ~:74,
+  `decompiled/jadx/sources/com/thingclips/smart/android/network/ThingApiParams.java`)
+  — same source as §1 line ~:84. An EMPTY (pre-login) `sid` is omitted.
+- **`sid` is SIGNED, not just transported:** it is in the fixed sign whitelist
+  `ThingApiSignManager.bdpdqbp` (`… requestId, et, n4h5, sid, chKey, sp`,
+  `decompiled/jadx/sources/com/thingclips/sdk/network/ThingApiSignManager.java`
+  ~:66, cross-listed in `re/tuya_sign.md` §1 ~:82). So a non-empty `sid` enters the
+  canonical string `str2` (sorted `key=value` joined by `||`) and the keyed
+  signature covers it. The Rust client therefore folds the injected `sid` into the
+  envelope BEFORE signing (`build_signed_envelope_with` → `build_device_list_request`,
+  `babymonitor/babymonitor-cli/src/live.rs`), proven by the offline test
+  `injected_sid_rides_device_list_envelope_and_canonical_sign` (asserts the `sid` is
+  on the wire AND in the canonical string, no network).
+- **Device-list business action name (confidence: likely — single-source, R8-
+  obfuscated):** the exact `a=` value for the home-detail/device-list call is
+  obfuscated to `thing.m.n`-family placeholders in `com/thingclips/sdk/home/*`
+  (§5a/§6); the client uses the documented Tuya mobile action
+  (`DEVICE_LIST_ACTION` in `live.rs`, rewritten `thing*`→`smartlife*` on the wire,
+  §1a) as the single best-known candidate. This is the ONE `likely` ingredient on the
+  injected-sid request — every other envelope field (`clientId`/`chKey`/`ttid`/`sign`/
+  `sid` placement) is `confirmed`. One capture (TASK-0022) confirms or corrects this
+  one action string; the rest of the request shape is already byte-faithful.
+
 ---
 
 ## 4. DATACENTER / region selection — runtime-from-login (confidence: confirmed)

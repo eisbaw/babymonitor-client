@@ -30,6 +30,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use babymonitor_core::session::SessionStore;
 use babymonitor_core::sign::{
     app_cert_sha256_hex_from_apk, ch_key, md5_hex_lower, post_data_digest_hex, SignBody, Signer,
     SigningKeyMaterial, StaticBmpToken, APP_PACKAGE_NAME,
@@ -153,6 +154,18 @@ const TOKEN_GET_VERSION: &str = "2.0";
 /// path). Version is a build constant; `4.0` is the documented mobile value.
 const PASSWORD_LOGIN_ACTION: &str = "thing.m.user.email.password.login";
 const PASSWORD_LOGIN_VERSION: &str = "4.0";
+
+/// device-list (home-detail) action + version. CONFIDENCE: `likely` — the exact
+/// `a=` value is R8-obfuscated to `thing.m.n` in `com/thingclips/sdk/home/*`
+/// (`re/tuya_cloud_auth.md` §5a/§6: "the home-detail action name is R8-obfuscated
+/// … the exact `a=` value here is needs-live-capture"). We use the documented
+/// Tuya mobile device-list action as the single best-known candidate; a real
+/// capture (TASK-0022) confirms or corrects it. This is the ONE single-source,
+/// `likely` value on the injected-sid read path — every other envelope ingredient
+/// is `confirmed`. Defined once here so both the post-login and the injected-sid
+/// builders sign byte-identically.
+const DEVICE_LIST_ACTION: &str = "thing.m.my.group.device.list";
+const DEVICE_LIST_VERSION: &str = "1.0";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Loaded secrets (from secrets/, never echoed)
@@ -279,6 +292,27 @@ pub enum ProbeOutcome {
     /// server-supplied code + message (non-secret) so the caller can classify
     /// `ILLEGAL_CLIENT_ID` vs a DIFFERENT (informative) error.
     ServerError { code: String, msg: String },
+}
+
+/// The outcome of the INJECTED-SESSION read path (TASK-0055). This path bypasses
+/// `password.login` entirely: it LOADS a SEPARATELY-captured `sid` from the
+/// on-disk [`SessionStore`] (the user supplies it into gitignored `secrets/`) and
+/// drives one signed `device.list` atop call with that `sid`. It NEVER attempts a
+/// login and NEVER fabricates a session — if no session is injected it reports
+/// [`InjectedOutcome::NoSession`] honestly. No variant carries a secret value.
+#[derive(Debug)]
+pub enum InjectedOutcome {
+    /// No session is injected in the store. The read path is honestly blocked:
+    /// a from-scratch login is denied by the server-side identity gate, so there
+    /// is no `sid` to drive `device.list`. The caller reports the blocked state.
+    NoSession,
+    /// An injected `sid` drove a real `device.list` call. Carries non-secret shape
+    /// facts: whether the SCD921 camera was found and its `p2pType` (transport
+    /// selector). The raw response is captured to `secrets/` (gitignored).
+    Fetched {
+        camera_found: bool,
+        p2p_type: Option<i32>,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1127,6 +1161,101 @@ pub fn run_token_get_probe(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// INJECTED-SESSION read path (TASK-0055): a SEPARATELY-captured sid drives
+// device.list, BYPASSING password.login. The login identity gate is NOT solved
+// here — this is the honest "token-injectable" design: a real captured session
+// the user supplies into gitignored secrets/ drives the read side.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolve the atop host for the injected session. The login `User` carries
+/// `domain.mobileApiUrl` (persisted as [`Session::mobile_api_base`]); that is the
+/// authoritative gateway for every subsequent call (`re/tuya_cloud_auth.md` §4).
+/// We parse its host; if it is empty/unparseable we fall back to the EU gateway.
+/// NOT a secret (region-revealing only).
+fn host_from_mobile_api_base(mobile_api_base: &str) -> String {
+    // reqwest re-exports the `url` crate as `reqwest::Url`, so we parse without
+    // adding a separate dependency (this fn is live-feature-only anyway).
+    reqwest::Url::parse(mobile_api_base)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| EU_ATOP_HOST.to_string())
+}
+
+/// Drive `device.list` using a SEPARATELY-CAPTURED session injected into the
+/// on-disk [`SessionStore`], BYPASSING `password.login` entirely (TASK-0055).
+///
+/// This is the consumer that makes "token-injectable" literally true: it LOADS the
+/// `sid` from the store (the user writes a real captured session into gitignored
+/// `secrets/` → the store), builds the byte-faithful signed `device.list` request
+/// via [`build_device_list_request`] (the SAME builder the post-login path uses,
+/// with the `sid` signed into the canonical string), and sends ONE call. It NEVER
+/// attempts a login and NEVER fabricates a session:
+/// - no session in the store → [`InjectedOutcome::NoSession`] (honest blocked);
+/// - an injected session → [`InjectedOutcome::Fetched`] with SHAPE-only facts.
+///
+/// `store` is injected (a real default-path store in production, a temp store in
+/// tests) so this is testable offline. The host is taken from the session's
+/// `mobile_api_base` (`User.domain.mobileApiUrl`), the authoritative gateway. No
+/// secret value (sid/uid) is ever logged or returned.
+pub fn run_injected_device_list(
+    secrets_dir: &Path,
+    apk_path: &Path,
+    store: &SessionStore,
+) -> Result<InjectedOutcome, LiveError> {
+    // LOAD the injected session. A corrupt store errors loud (it does NOT mask as
+    // "no session"). No session → honest blocked state, no network touched.
+    let session = store
+        .load()
+        .map_err(|e| LiveError::Config(format!("session store: {e}")))?;
+    let Some(session) = session else {
+        eprintln!(
+            "live: no session injected in the store — read path is blocked (no captured sid). \
+             No network touched."
+        );
+        return Ok(InjectedOutcome::NoSession);
+    };
+
+    let cfg = load_config(secrets_dir, apk_path)?;
+    eprintln!("live: config + injected session loaded (all secret values withheld).");
+
+    // Same most-likely fold as the login path (re/tuya_sign_static.md §7).
+    let sign_body = SignBody::KeyAndCanonical;
+
+    // The injected session pins the gateway (User.domain.mobileApiUrl).
+    let host = host_from_mobile_api_base(&session.mobile_api_base);
+
+    // Non-account reachability check (NOT a signed call).
+    probe_host(&host)?;
+    eprintln!("live: host {host} reachable (non-account TLS probe ok).");
+
+    let user_agent = format!(
+        "Thing-UA=APP/Android/{}/SDK/{}",
+        cfg.app_version, THING_SDK_VERSION
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(user_agent)
+        .build()
+        .map_err(|e| LiveError::Network(format!("build http client: {e}")))?;
+
+    // Build the device.list request carrying the INJECTED sid (signed into the
+    // canonical string), send it ONCE. No password.login is performed.
+    eprintln!("live: sending ONE device.list with the INJECTED sid (no password.login)...");
+    let (envelope, body) = build_device_list_request(&cfg, &session.sid, sign_body)?;
+    let resp = send_atop(&client, &host, &cfg, &envelope, &body)?;
+    capture_to_secrets(&cfg, "tuya_device_list.json", &resp.raw)?;
+    if !resp.success {
+        eprintln!("live: device.list returned a server error (captured raw to secrets/).");
+    }
+    let (camera_found, p2p_type) = inspect_device_list(&resp.raw);
+    Ok(InjectedOutcome::Fetched {
+        camera_found,
+        p2p_type,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Orchestration: the one-shot live login
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1257,11 +1386,43 @@ fn probe_host(host: &str) -> Result<(), LiveError> {
     }
 }
 
+/// Build the SIGNED `device.list` atop request carrying the injected/post-login
+/// `sid`. PURE — no network, no I/O. This is the SINGLE SOURCE OF TRUTH for the
+/// device-list request shape, used by BOTH the post-login fetch
+/// ([`fetch_and_capture_device_list`]) and the injected-sid read path
+/// ([`run_injected_device_list`]), so the two produce a byte-identical envelope.
+///
+/// The `sid` is folded into the envelope BEFORE signing (it is in the sign
+/// whitelist `bdpdqbp`, `re/tuya_sign.md` §1 line ~:82: `… sid, chKey …`), so a
+/// non-empty `sid` enters the canonical string `str2` and the signature covers it
+/// — exactly where the SDK puts it (`ApiParams.getSession` → wire `sid`,
+/// `re/tuya_cloud_auth.md` §1 line ~:84). An empty `sid` is dropped (the signer
+/// filters empty whitelist values), which is the pre-login shape.
+fn build_device_list_request(
+    cfg: &LiveConfig,
+    sid: &str,
+    sign_body: SignBody,
+) -> Result<(BTreeMap<String, String>, String), LiveError> {
+    let post_data = "{}";
+    let extra = if sid.is_empty() {
+        BTreeMap::new()
+    } else {
+        BTreeMap::from([("sid".to_string(), sid.to_string())])
+    };
+    build_signed_envelope_with(
+        cfg,
+        DEVICE_LIST_ACTION,
+        DEVICE_LIST_VERSION,
+        post_data,
+        sign_body,
+        &extra,
+    )
+}
+
 /// READ-ONLY device-list fetch + capture. Returns (camera_found, p2p_type).
 ///
-/// The home-detail / device-list action name is R8-obfuscated; we use the
-/// documented Tuya mobile device-list action and sign with the post-login `sid`
-/// present in the envelope (so it enters the canonical string). On any failure we
+/// Builds the request via [`build_device_list_request`] (the shared builder) with
+/// the post-login `sid` taken from the in-process login `User`. On any failure we
 /// surface it but do NOT retry-spam.
 fn fetch_and_capture_device_list(
     client: &reqwest::blocking::Client,
@@ -1271,18 +1432,7 @@ fn fetch_and_capture_device_list(
     sign_body: SignBody,
 ) -> Result<(bool, Option<i32>), LiveError> {
     let sid = user.get("sid").and_then(|v| v.as_str()).unwrap_or("");
-    let post_data = "{}";
-    let wire_action = "thing.m.my.group.device.list";
-
-    // Build the envelope WITH sid present BEFORE signing, so the sign covers the
-    // post-login session param (sid is whitelisted; non-empty → enters str2).
-    let extra = if sid.is_empty() {
-        BTreeMap::new()
-    } else {
-        BTreeMap::from([("sid".to_string(), sid.to_string())])
-    };
-    let (envelope, body) =
-        build_signed_envelope_with(cfg, wire_action, "1.0", post_data, sign_body, &extra)?;
+    let (envelope, body) = build_device_list_request(cfg, sid, sign_body)?;
 
     let resp = send_atop(client, host, cfg, &envelope, &body)?;
     capture_to_secrets(cfg, "tuya_device_list.json", &resp.raw)?;
@@ -1664,5 +1814,139 @@ mod tests {
         });
         let (found, _p2p) = inspect_device_list(&raw);
         assert!(found, "an sp-category device must be reported as a camera");
+    }
+
+    // ── TASK-0055: injected-session device.list request shape (OFFLINE) ─────────
+
+    // CORE AC#2: an INJECTED sid must ride the device.list request on BOTH the
+    // wire envelope AND the canonical sign string. This is the proof the captured
+    // session actually drives — and is signed into — the real read-path request,
+    // with NO network call. The fake sid is obviously-synthetic.
+    #[test]
+    fn injected_sid_rides_device_list_envelope_and_canonical_sign() {
+        use babymonitor_core::sign::{canonical_string, post_data_digest_hex};
+
+        let cfg = synthetic_cfg();
+        let fake_sid = "FAKE_INJECTED_SID_0001"; // SYNTHETIC — never a real sid.
+
+        let (envelope, body) = build_device_list_request(&cfg, fake_sid, SignBody::KeyAndCanonical)
+            .expect("device.list request build");
+
+        // (0) It is the device.list action, byte-faithful to the shared constant
+        // (rewritten thing*→smartlife* on the wire), with an empty postData body.
+        assert_eq!(
+            envelope.get("a").map(String::as_str),
+            Some(rewrite_action(DEVICE_LIST_ACTION).as_str()),
+            "wire action must be the device.list action"
+        );
+        assert_eq!(
+            envelope.get("v").map(String::as_str),
+            Some(DEVICE_LIST_VERSION)
+        );
+        assert_eq!(body, "{}", "device.list postData body is empty object");
+
+        // (1) The injected sid is on the wire query with its exact value.
+        assert_eq!(
+            envelope.get("sid").map(String::as_str),
+            Some(fake_sid),
+            "the injected sid must ride the wire envelope"
+        );
+
+        // (2) The injected sid enters the CANONICAL SIGN STRING (sid is in the
+        // whitelist bdpdqbp, re/tuya_sign.md §1) — so the signature covers it.
+        let mut sign_params = envelope.clone();
+        sign_params.remove("sign");
+        sign_params.insert("postData".into(), post_data_digest_hex(b"{}").unwrap());
+        let canonical = canonical_string(&sign_params);
+        assert!(
+            canonical.contains(&format!("sid={fake_sid}")),
+            "injected sid must appear in the canonical sign string; got: {canonical}"
+        );
+
+        // (3) The sign value is present and non-empty (the request is fully signed).
+        assert!(
+            envelope.get("sign").is_some_and(|s| !s.is_empty()),
+            "device.list request must carry a non-empty sign"
+        );
+    }
+
+    // NEGATIVE: with an EMPTY sid (the pre-login shape) the request must NOT carry
+    // a `sid` param at all — neither on the wire nor in the canonical string. This
+    // proves the sid is genuinely sourced from the injection, not hardcoded.
+    #[test]
+    fn empty_sid_is_dropped_from_device_list_request() {
+        use babymonitor_core::sign::{canonical_string, post_data_digest_hex};
+
+        let cfg = synthetic_cfg();
+        let (envelope, _body) =
+            build_device_list_request(&cfg, "", SignBody::KeyAndCanonical).expect("build");
+
+        assert!(
+            !envelope.contains_key("sid"),
+            "an empty sid must be dropped (pre-login shape), not sent empty"
+        );
+
+        let mut sign_params = envelope.clone();
+        sign_params.remove("sign");
+        sign_params.insert("postData".into(), post_data_digest_hex(b"{}").unwrap());
+        let canonical = canonical_string(&sign_params);
+        assert!(
+            !canonical.contains("sid="),
+            "empty sid must not enter the canonical sign string; got: {canonical}"
+        );
+    }
+
+    // A different injected sid MUST change the signature (the sid is genuinely an
+    // input to the keyed sign, not cosmetic). Guards against a regression where
+    // the sid is added to the wire but accidentally excluded from the sign input.
+    #[test]
+    fn different_injected_sid_changes_the_sign() {
+        let cfg = synthetic_cfg();
+        let (e1, _) =
+            build_device_list_request(&cfg, "SID_AAAA", SignBody::KeyAndCanonical).unwrap();
+        let (e2, _) =
+            build_device_list_request(&cfg, "SID_BBBB", SignBody::KeyAndCanonical).unwrap();
+        assert_ne!(
+            e1.get("sign"),
+            e2.get("sign"),
+            "a different injected sid must produce a different signature"
+        );
+    }
+
+    // NEGATIVE / honesty: run_injected_device_list with NO session injected must
+    // report the blocked state and touch NO network (it returns BEFORE building
+    // any HTTP client or making any call). Uses a temp store with no session file.
+    #[test]
+    fn no_injected_session_reports_blocked_offline() {
+        // A unique empty temp store: load() returns None → NoSession, before any
+        // config load or network. apk path is irrelevant (never reached).
+        let dir = std::env::temp_dir().join(format!(
+            "bmp-inject-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = SessionStore::at(dir.join("session.json"));
+        let out =
+            run_injected_device_list(Path::new("secrets"), Path::new("nonexistent.apk"), &store)
+                .expect("no-session path must not error");
+        assert!(
+            matches!(out, InjectedOutcome::NoSession),
+            "no injected session must report NoSession (honest blocked), got {out:?}"
+        );
+    }
+
+    // host_from_mobile_api_base parses the gateway host and falls back to EU.
+    #[test]
+    fn host_from_mobile_api_base_parses_and_falls_back() {
+        assert_eq!(
+            host_from_mobile_api_base("https://a1.tuyaeu.com/api.json"),
+            "a1.tuyaeu.com"
+        );
+        // Empty / unparseable → EU fallback (never panics, never an empty host).
+        assert_eq!(host_from_mobile_api_base(""), EU_ATOP_HOST);
+        assert_eq!(host_from_mobile_api_base("not a url"), EU_ATOP_HOST);
     }
 }

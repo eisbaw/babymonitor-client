@@ -16,8 +16,12 @@
 //! - `devices list` / `devices show <id>` — parse + display a device list. The
 //!   OFFLINE path reads a response **body** from a `--fixture` file (default: the
 //!   synthetic test fixture) so the model layer is exercised without a network.
-//!   The `--live` path is blocked by the same identity gate (it never obtains the
-//!   session a real fetch needs) and says so, touching no network.
+//!   `devices list --live` is the INJECTED-SESSION consumer (TASK-0055): under the
+//!   gated `--features live` build with a captured session in the on-disk store it
+//!   loads the injected `sid` and drives a real signed `device.list` call with it
+//!   (bypassing the blocked `password.login`); with no session injected (or in the
+//!   default non-live build) it reports the honest identity-gate-blocked state and
+//!   touches no network.
 //!
 //! Output policy: every subcommand supports `--json` for machine consumption
 //! alongside the default human text.
@@ -167,11 +171,14 @@ struct DevicesSource {
     /// the synthetic test fixture so the command always has something to show.
     #[arg(long)]
     fixture: Option<PathBuf>,
-    /// Attempt the LIVE cloud fetch instead of a fixture. BLOCKED: returns the
-    /// honest no-session state (no network is touched). A live fetch needs an
-    /// authenticated session, which the server-side identity gate prevents a
-    /// from-scratch client from obtaining (TASK-0050/0051). Inject a captured
-    /// session (TASK-0022) to drive the real path.
+    /// Consume an INJECTED captured session instead of a fixture (TASK-0055).
+    /// Under the gated `--features live` build with a session in the on-disk store,
+    /// this LOADS the injected `sid` and drives a real, signed `device.list` atop
+    /// call carrying it — BYPASSING `password.login` (the step the server-side
+    /// identity gate blocks). With NO session injected (or in the default non-live
+    /// build) it reports the honest identity-gate-blocked state and touches no
+    /// network. A from-scratch login cannot create a session (TASK-0050/0051);
+    /// inject a captured one (TASK-0022; README §6) to drive the real read path.
     #[arg(long)]
     live: bool,
     /// Reveal secret/PII fields (localKey, p2pKey, …) in the output. OFF by
@@ -464,6 +471,14 @@ fn auth_logout(json: bool) -> Result<(), Error> {
 fn run_devices(action: DevicesAction, json: bool) -> Result<(), Error> {
     match action {
         DevicesAction::List(source) => {
+            // `--live` consumes an injected captured session (TASK-0055): under the
+            // gated `live` build it LOADS the SessionStore sid and drives a real
+            // device.list; without the feature (or with no session injected) it
+            // reports the identity-gate-blocked state honestly. This is the
+            // "token-injectable" consumer the README §6 describes.
+            if source.live {
+                return devices_list_live(json);
+            }
             let list = load_device_list(&source)?;
             print_device_list(&list, json, source.show_secrets);
             Ok(())
@@ -479,6 +494,89 @@ fn run_devices(action: DevicesAction, json: bool) -> Result<(), Error> {
             print_device_show(dev, json, source.show_secrets);
             Ok(())
         }
+    }
+}
+
+/// `devices list --live`: consume an INJECTED captured session.
+///
+/// Under the gated `live` build, this LOADS the on-disk [`SessionStore`] sid and
+/// drives a real, byte-faithful `device.list` atop call carrying that sid
+/// (BYPASSING `password.login`, which the server-side identity gate blocks). If no
+/// session is injected it reports the honest blocked state and touches no network.
+///
+/// In the DEFAULT (non-`live`) build the live network tree is not compiled in, so
+/// it reports the same honest blocked state offline (the `--features live` build is
+/// required to actually send a request — see README §6).
+#[cfg(feature = "live")]
+fn devices_list_live(json: bool) -> Result<(), Error> {
+    let secrets_dir = PathBuf::from("secrets");
+    let apk = PathBuf::from("extracted/xapk/com.philips.ph.babymonitorplus.apk");
+    let store = SessionStore::default_path()?;
+    match live::run_injected_device_list(&secrets_dir, &apk, &store) {
+        Ok(live::InjectedOutcome::NoSession) => {
+            live_device_list_blocked(json);
+            Ok(())
+        }
+        Ok(live::InjectedOutcome::Fetched {
+            camera_found,
+            p2p_type,
+        }) => {
+            if json {
+                println!(
+                    "{{\"command\":\"devices list --live\",\"source\":\"injected-session\",\"camera_found\":{},\"p2p_type\":{}}}",
+                    camera_found,
+                    p2p_type
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "null".into())
+                );
+            } else {
+                println!(
+                    "devices list --live: fetched via INJECTED session (raw captured to secrets/)."
+                );
+                println!("camera_found: {camera_found}");
+                match p2p_type {
+                    Some(t) => println!("p2p_type: {t}"),
+                    None => println!("p2p_type: (not surfaced in this response)"),
+                }
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("devices list --live: {e}");
+            Err(Error::NotImplemented(
+                "live device.list did not complete (see message above)",
+            ))
+        }
+    }
+}
+
+/// `devices list --live` in the DEFAULT (non-`live`) build: the live network tree
+/// is not compiled in, so report the honest identity-gate-blocked state offline.
+/// To actually consume an injected session, build with `--features live`.
+#[cfg(not(feature = "live"))]
+fn devices_list_live(json: bool) -> Result<(), Error> {
+    live_device_list_blocked(json);
+    Ok(())
+}
+
+/// Print the honest `--live` blocked report (no session injected / non-live build).
+/// `Ok`-status report (the command ran correctly); never fabricates a list.
+fn live_device_list_blocked(json: bool) {
+    if json {
+        println!(
+            "{{\"command\":\"devices list --live\",\"fetched\":false,\"status\":\"blocked\",\"blocked_on\":\"identity-gate\",\"reason\":{}}}",
+            json_str(LOGIN_BLOCKED_REASON)
+        );
+    } else {
+        println!(
+            "devices list --live: NOT fetched — no injected session and a from-scratch login is \
+             blocked by the server-side identity gate."
+        );
+        println!("reason: {LOGIN_BLOCKED_REASON}");
+        println!(
+            "Inject a captured live session into the session store (TASK-0022; see README §6), then \
+             re-run with `--features live` to drive the real device.list."
+        );
     }
 }
 

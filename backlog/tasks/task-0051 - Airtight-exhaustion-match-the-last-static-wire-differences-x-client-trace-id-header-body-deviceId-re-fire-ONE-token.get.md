@@ -3,11 +3,11 @@ id: TASK-0051
 title: >-
   Airtight exhaustion: match the last static wire differences (x-client-trace-id
   header + body deviceId), re-fire ONE token.get
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-06-25 15:31'
-updated_date: '2026-06-25 15:32'
+updated_date: '2026-06-25 15:35'
 labels:
   - phase3
   - wave3
@@ -27,8 +27,8 @@ Final static-fidelity probe before declaring the cloud-login avenue exhausted to
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 x-client-trace-id header (=requestId) added to the live token.get request; deviceId included in the POST body (still signed); change behind the live feature, e2e stays green
-- [ ] #2 Exactly one token.get fired against a1.tuyaeu.com under guardrails; errorCode recorded in re/live_login.md (no values); result classified (still ILLEGAL_CLIENT_ID = airtight exhaustion, or changed = avenue reopened)
+- [x] #1 x-client-trace-id header (=requestId) added to the live token.get request; deviceId included in the POST body (still signed); change behind the live feature, e2e stays green
+- [x] #2 Exactly one token.get fired against a1.tuyaeu.com under guardrails; errorCode recorded in re/live_login.md (no values); result classified (still ILLEGAL_CLIENT_ID = airtight exhaustion, or changed = avenue reopened)
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -41,3 +41,29 @@ Final static-fidelity probe before declaring the cloud-login avenue exhausted to
 5. Gates: just e2e + secret-scan + check-evidence + clippy --features live -Dwarnings + cargo test --features live --no-run. Commit.
 6. Fire EXACTLY ONE token.get probe: --probe-only --host a1.tuyaeu.com. Record errorCode+HTTP in re/live_login.md (no values). Classify: still ILLEGAL_CLIENT_ID = airtight exhaustion; changed = avenue reopened.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Implemented in send_atop (single send path → covers probe + login):
+- Added `x-client-trace-id` request header = envelope requestId (OKHttpBusinessRequest.java:23,342, unconditional).
+- Added `deviceId` to the POST form body alongside postData (ApiParams.getRequestBody, ApiParams.java:87-89); deviceId stays in the signed query envelope (SIGN_WHITELIST), so the canonical sign string is unchanged.
+Gates green: just e2e, secret-scan, check-evidence, clippy --features live -D warnings, cargo test --features live --no-run.
+Fired EXACTLY ONE token.get --probe-only --host a1.tuyaeu.com (no corrupt-sign, no password.login). Result: HTTP 200, success=false, errorCode=ILLEGAL_CLIENT_ID (Invalid client;No access) — UNCHANGED. Recorded in re/live_login.md (no values). Verdict: static cloud-login avenue AIRTIGHT-EXHAUSTED.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Closed the final two statically-derivable wire differences between our token.get and the real app, then re-fired ONE token.get to confirm the cloud-login avenue is exhausted.
+
+Changes (babymonitor/babymonitor-cli/src/live.rs, behind the `live` feature, in the single send_atop path used by both probe and login):
+- Add the `x-client-trace-id` request HEADER = requestId, mirroring OKHttpBusinessRequest.java:23,342 (CLIENT_TRACE_ID, unconditional, value = getRequestId()). Reuses the requestId already in the signed envelope.
+- Add `deviceId` to the POST form body in addition to the signed query, mirroring ApiParams.getRequestBody() (ApiParams.java:87-89). deviceId is a SIGN_WHITELIST param signed from the envelope map, so the canonical sign string is UNCHANGED.
+
+Gates: just e2e, just secret-scan, just check-evidence all green; clippy --features live -D warnings clean; cargo test --features live --no-run compiles. live is gated out of e2e.
+
+Live probe: EXACTLY ONE signed token.get to a1.tuyaeu.com (--probe-only, no corrupt-sign, no password.login). Result HTTP 200, success=false, errorCode=ILLEGAL_CLIENT_ID — identical to before. ZERO password.login; 2FA not reached.
+
+Verdict: every statically-derivable identity field/header/host and the sign are now matched to the app and the gateway STILL rejects → the static cloud-login avenue is AIRTIGHT-EXHAUSTED. The blocker is a server-side identity/provisioning gate (app-attestation / app-cert-pin / appKey↔package binding) a standalone static client cannot reproduce. Unblocking now requires on-device capture (TASK-0022) or more material from the owner. Recorded in re/live_login.md (no secret values).
+<!-- SECTION:FINAL_SUMMARY:END -->

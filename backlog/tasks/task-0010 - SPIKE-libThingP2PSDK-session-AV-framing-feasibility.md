@@ -4,7 +4,7 @@ title: 'SPIKE: libThingP2PSDK session + AV framing feasibility'
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:36'
-updated_date: '2026-06-25 00:23'
+updated_date: '2026-06-25 01:04'
 labels:
   - phase4
   - re
@@ -38,4 +38,6 @@ RISK SPIKE (skill phase 4). Deepest static dive: reconstruct P2P session establi
 
 <!-- SECTION:NOTES:BEGIN -->
 forward-carried from TASK-0001/0004: Strong static evidence the SCD921 stream is WebRTC-over-MQTT (review-gate F2 CONFIRMED at lib level). Java side: com/thingclips/smart/p2p/api/IThingP2P.java (connect/recvData/resendOffer=SDP) + utils/IMqttServiceUtils.java (send302MessageThroughMqtt, registerMqtt302 - "302" is Tuya camera signaling code over MQTT). Native libThingP2PSDK has full SDP/ICE/STUN/TURN/DTLS-SRTP + MQTT signaling strings. PPCS legacy path also present. connect_v2 skill field likely encodes capability negotiation. Likely task-10 verdict: partially (framing recoverable; per-session DTLS key exchange needs live pcap). Public ref: tuya/tuya-rtc-camera-sdk-android.
+
+Forward-carried from TASK-0017 (streaming triage): if WebRTC is the live path (likely - p2pType=4 default, 302 MQTT signaling confirmed in libThingP2PSDK.so + Java P2PMQTTServiceManager, matches seydx/tuya-ipc-terminal), the PPCS AV-framing reconstruction this spike targets is LOWER priority. Recommend gating this spike behind a live check: only dive into PPCS framing if the real SCD921 device record returns p2pType=2. Otherwise Wave-2 should spike WebRTC-over-MQTT (webrtc-rs + rumqttc) instead. See re/streaming_mode.md.
 <!-- SECTION:NOTES:END -->

@@ -4,6 +4,7 @@ title: 'RE-PLAN: plan Wave 2 from Wave-1 knowledge (not feature code)'
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:37'
+updated_date: '2026-06-25 01:04'
 labels:
   - phase-gate
   - replan
@@ -27,3 +28,9 @@ Re-plan task - NOT feature code. Re-invoke Skill phase2-backlog-snowball with: r
 - [ ] #2 Wave 2 again ends with its own re-plan task UNLESS the project is now firm enough for a full breakdown
 - [ ] #3 TESTING.md updated with what Wave 1 taught (especially the real P2P verdict and any new oracles)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Forward-carried from TASK-0017 (streaming-mode triage) for the Wave-2 re-plan: VERDICT = implement WebRTC-over-MQTT FIRST (cheaper than PPCS AV-framing). Transport is data-driven per device (p2pType 2=PPCS/4=WebRTC + skill.webrtc bitmask), MQTT msg code 302, envelope {header:{type:offer|answer|candidate,from,to,sessionid,trace_id},msg,token}, 302 payload AES-localKey at proto ver pv. Suggested Wave-2 tasks: (1) Tuya MQTT client + 302 message crypto (depends on localKey from device-list TASK-0013 + sign TASK-0007); (2) WebRTC session over webrtc-rs (SDP/trickle-ICE/DTLS-SRTP); (3) H264/Opus decode. DEPENDENCY/RISK EDGE: a live obtainCameraConfig call on the real SCD921 must confirm p2pType=4 BEFORE committing - the only finding that can flip the transport choice. De-prioritize the PPCS spikes (TASK-0009/0010) unless that live check returns p2pType=2. Full evidence: re/streaming_mode.md.
+<!-- SECTION:NOTES:END -->

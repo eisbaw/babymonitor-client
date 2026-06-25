@@ -162,6 +162,15 @@ AND F1's `[cert_sha256]_[bmp_token]_[appSecret]`.
 
 ## 5. t_s.bmp token decode = imath bignum + matrix (THE residual blocker) (confidence: confirmed)
 
+> **CORRECTION (TASK-0029, supersedes the "imath matrix" hypothesis below).** Deeper
+> disassembly of the BMP decode driver (`libthing_security.so@0x1a030`) shows the
+> imath/matrix path decodes the *SDK-config blob* (asset `tecrkcehc`), NOT `t_s.bmp`.
+> The actual `t_s.bmp` token is produced by a **white-box table cipher**
+> (`libthing_security.so@0x11658`), a different (harder) residual. Full analysis,
+> evidence, and the verifiable port live in `re/bmp_token_decode.md`
+> (`Decode: partially-ported`). The paragraphs below are retained as the original
+> spike reasoning but are revised by that doc.
+
 Two independent sources: the SignFileDecoder asset-read in `libthing_security.so` AND
 the imath/matrix exports of `libthing_security_algorithm.so`.
 

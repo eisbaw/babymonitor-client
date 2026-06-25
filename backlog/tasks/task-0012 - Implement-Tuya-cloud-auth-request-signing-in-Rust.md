@@ -4,7 +4,7 @@ title: Implement Tuya cloud auth + request signing in Rust
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 03:29'
+updated_date: '2026-06-25 04:11'
 labels:
   - phase5
   - rust
@@ -36,17 +36,5 @@ WHY: the first genuinely buildable+testable slice. Implement Tuya HMAC request s
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-[from TASK-0007: re/tuya_cloud_auth.md is the auth contract]
-EXACT ENDPOINTS (atop mobile gateway, NOT OpenAPI):
-- Login is 2-step ticket flow:
-  1) thing.m.user.username.token.get v2.0 (sessionRequire=false) -> TokenBean{token(ticket), publicKey, exponent, pExponent}. publicKey+exponent = RSA pubkey; RSA-encrypt the password with it (ifencrypt=1).
-  2) thing.m.user.email.password.login (email) / thing.m.user.mobile.passwd.login v4.0 (mobile) / uid variants. postData: countryCode, email|mobile, passwd(RSA-enc), token(ticket), ifencrypt(0/1), mfa blob {"group":1,"mfaCode":"..."}. Returns User{sid, uid, ecode, domain, timezoneId, ...}.
-- Other creds available: email.code.login, mobile.code.login, uid.password.login, uid.token.create, sso.ticket.user.get, qr.token.login. Primary path for this app = email/uid + region.
-ENVELOPE (signed URL/GET params): a(action), v(version), t/time(server epoch), sid(session, empty pre-login), requestId(UUID per req), et=3, lang, os=Android, appVersion, ttid(secrets/), clientId(appKey, secrets/), deviceId, sign. Body = postData (JSON). Defaults: sessionRequire/locationRequire true, apiVersion='*'. checkAPIName() rewrites thing.*->smartlife.* before sign.
-SIGN: see re/tuya_sign.md (NOT here). String-to-sign reproducible (sort whitelist, join with '||', postData->swap(md5b64)); keyed sign is NATIVE -> needs the TASK-0022 Frida vector to validate (this task depends on TASK-0022). Do NOT self-derive the vector.
-TOKEN MODEL: session=User.sid. No refresh-token; on session-invalid RE-LOGIN. Persist sid+uid to ~/.local/share/babymonitor/ (both SECRET).
-DATACENTER: do NOT hardcode base URL. Use User.domain.mobileApiUrl (+ gwApiUrl, gwMqttUrl, regionCode) from the login response (F5). Bootstrap login against the region candidate, then switch to domain.mobileApiUrl. Pre-login helpers: thing.m.user.region.list, thing.m.app.domain.query.
-LIMITATION: exact on-wire a= spelling + obfuscated device-list action need a live/Frida confirm.
-
-FEED-FORWARD from TASK-0023 (static signer dive, re/tuya_sign_static.md). CORRECTION: the keyed sign primitive is **plain MD5 (32-char lowercase hex)**, NOT HMAC-SHA256 — confirmed at byte level (MD5 IV 0x67452301.. at libthing_security.so@0x76c0; 16-byte digest out @0x194b0; hex table @0x7810). Rust algorithm: sign = MD5_hex_lower(cert_sha256_hex + '_' + bmp_token + '_' + appSecret [+ canonical_str2]); '_'-join confirmed (sep @0x88c4, '_' write @0x14c30); native key-builder @0x13474 MD5s twice. canonical str2 = the sorted-whitelist '||'-joined string from re/tuya_sign.md §1-3 (unchanged). UNBLOCKED parts (no device): (a) MD5/hex/'_'-join; (b) appKey/appSecret in secrets/tuya_appkey.json; (c) app-cert SHA-256 is COMPUTABLE OFFLINE from the APK signing cert META-INF/BNDLTOOL.RSA (method+location in secrets/tuya_appkey.json:app_cert_sha256) — removes the runtime-cert blocker. RESIDUAL BLOCKER: the t_s.bmp -> bmp_token decode is a deterministic imath-bignum+matrix deobfuscation (libthing_security_algorithm.so: read_keys_from_content/parse/transform + mp_int_exptmod, 'inited matrix:' @0x5eb0) — reproducible in principle but UN-PORTED (filed as follow-up TASK for the matrix port). STATIC DIFFERENTIAL VECTOR is possible WITHOUT a device: reference = nalajcie/tuya-sign-hacking re-impl; until bmp_token is ported, a partial differential validates the MD5/'_'-join/cert-hash sub-steps. So AC#1 byte-for-byte is achievable statically ONCE the bmp matrix port lands; AC#3's live-vector fallback is NOT required if that port succeeds. Update AC#1/#2 wording 'HMAC' -> 'MD5'.
+FEED-FORWARD from TASK-0029 (bmp_token residual): the byte-for-byte differential signer is NOT yet fully achievable offline. The bmp_token decode (key-join part [cert_sha256]_[bmp_token]_[appSecret]) is the single remaining blocker. Finding: t_s.bmp is decoded by a WHITE-BOX TABLE CIPHER (libthing_security.so fcn.11658), not the nalajcie polynomial/matrix scheme — see re/bmp_token_decode.md (Decode: partially-ported). Exact remaining step: either (a) AC#3 contingency — capture ONE real signed request (gated live run) and use its sign as the gold vector (recommended; far cheaper), or (b) complete the white-box port (extract .rodata 0x7800 + .data.rel.ro 0x38000/0x39000 T-tables, reconstruct fcn.11658 SPN byte-exact, feed t_s.bmp + tecrkcehc_ext + constant '7178265647164836'). Everything ELSE in the signer is recovered+portable (canonical string, MD5-hex, '_'-join, offline cert-SHA256, appKey/appSecret) — a PARTIAL differential over those sub-steps with a placeholder token bites now, no network.
 <!-- SECTION:NOTES:END -->

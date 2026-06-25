@@ -47,9 +47,14 @@ fmt-check:
 stub-grep:
     @bash re/scripts/stub_grep.sh
 
+# Unit-test the offline t_s.bmp token-decode port + nalajcie cross-check (TASK-0029).
+[group('test')]
+test-bmp-decode:
+    cd re/scripts && python3 test_bmp_token_decode.py
+
 # End-to-end gate (build+test+lint+fmt-check+stub-grep+offline). Green before any commit.
 [group('test')]
-e2e: build test lint fmt-check stub-grep assert-offline
+e2e: build test lint fmt-check stub-grep assert-offline test-bmp-decode
 
 # Assert the test suite needs no network (--offline build + enumerate).
 [group('test')]

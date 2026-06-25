@@ -1,9 +1,8 @@
 # chKey — the per-app channel-auth token (native getChKey@0x16000) (TASK-0044)
 
-Static recovery of `chKey`, the missing per-app channel-auth token the Tuya atop
-login envelope carries as the wire param `chKey` and that is a SIGNED whitelist
-param. Its absence from our request is the likely `ILLEGAL_CLIENT_ID` cause
-(`re/live_login.md`). This doc records the algorithm + the static-vs-runtime
+Static recovery of `chKey`, the per-app channel-auth token the Tuya atop login
+envelope carries as the wire param `chKey` and that is a SIGNED whitelist param.
+This doc records the algorithm + the static-vs-runtime
 verdict; **no secret value appears here** (the computed chKey lives ONLY in
 `secrets/chkey.txt`, gitignored).
 
@@ -22,7 +21,7 @@ verdict; **no secret value appears here** (the computed chKey lives ONLY in
 
 ```text
 chKey = lowercase_hex( HMAC-SHA256( key = appId_bytes,
-                                    msg = packageName + "_" + certSha256Hex ) )
+                                    msg = packageName + "_" + certSha256Hex ) )[8..24]
 ```
 
 where every input is a static, offline-recoverable value:
@@ -34,7 +33,9 @@ where every input is a static, offline-recoverable value:
   offline-computable from the APK signing block (already done for the request
   `sign`, `re/tuya_sign_static.md` §4; `sign.rs::app_cert_sha256_hex_from_apk`).
 
-The keyed digest is **HMAC-SHA256** (NOT plain MD5 like the request `sign`).
+The keyed digest is **HMAC-SHA256** (NOT plain MD5 like the request `sign`), but
+the native return value is the 16-character slice `hex_hmac[8..24]`, not the full
+64-character hex digest.
 
 Two independent sources ground the verdict: (1) the Ghidra 11.4.2 headless
 decompilation of `getChKey` + its callees (cited inline), and (2) a radare2
@@ -73,9 +74,11 @@ Decompiled body (`libthing_security.so@0x16000`, Ghidra base 0x100000 →
    digest (§3). Output is 32 bytes in `auStack_88`.
 5. Hex-encodes the 32 bytes to 64 lowercase chars via `__vsprintf_chk` with the
    format string `DAT_001090ea = "%02x"` (`FUN_00116ae4`, loop to `0x40`).
-6. Returns the 64-hex string to Java via `NewStringUTF` (`*param_1+0x538`).
+6. Copies up to 16 chars from byte offset 8 of the hex string into a second
+   std::string and returns that 16-char slice to Java via `NewStringUTF`
+   (`*param_1+0x538`).
 
-So: `chKey = hex( keyed_digest( key=appId, msg=DAT_001390a0_"_"_DAT_00139058 ) )`.
+So: `chKey = hex( keyed_digest( key=appId, msg=DAT_001390a0_"_"_DAT_00139058 ) )[8..24]`.
 
 ## 2. The two `.bss` key-string globals are STATIC values (confidence: confirmed)
 
@@ -183,7 +186,8 @@ named below); the package-name const is grounded by the manifest
   `APP_PACKAGE_NAME` const = the manifest package.
 - Validation: `hmac_sha256` is differentially tested against RFC 4231 Test Case 2
   and Case 6 (the >block-size pre-hash branch) — INDEPENDENT vectors, not our own
-  decompilation. `ch_key_composes_hmac_over_packagename_cert` pins the composition.
+  decompilation. `ch_key_composes_hmac_over_packagename_cert` pins the composition
+  and the native `[8..24]` return slice.
 - Computed value: the real chKey is computed in
   `babymonitor/babymonitor-cli/src/live.rs::load_config` from the appKey +
   `APP_PACKAGE_NAME` + the offline cert hash, and persisted to

@@ -34,34 +34,24 @@ nix-shell --run 'just run -- devices list'
 nix-shell --run 'just run -- --json auth status'
 ```
 
-## Login status: BLOCKED by a server-side identity gate (token-injectable)
+## Login status: static request-shape fix pending live re-test
 
-> **A from-scratch static client cannot obtain a session.** Tuya rejects
-> `token.get` with `ILLEGAL_CLIENT_ID` ("Invalid client;No access") at the
-> **client-identity layer, before it ever evaluates the request signature**. This
-> was **proven sign-insensitive** by a corrupted-sign differential (a
-> one-hex-nibble-flipped `sign` yields the byte-identical reject, so the gateway
-> rejects *before* sign-verification — **TASK-0050**) and **host-exhausted** across
-> every datacenter gateway, legacy and iotbing (**TASK-0048/0051**). No further
-> static field clears it — see the top-level README §3.
->
-> The client is therefore **token-injectable, not login-capable on its own**:
-> `auth login` and any live cloud fetch **honestly report the blocked state and
-> never fabricate a session or a response.** The single unblock is **one on-device
-> capture** of a live session (**TASK-0022**), injected into the session store —
-> see the top-level README §6. (The `bmp_token`, decoded from `assets/t_s.bmp`, is
-> the signer's **un-validated 6th sign ingredient**, carried in an injectable slot;
-> the TASK-0050 differential proved the gateway never even evaluates the signature,
-> so the token is **not** the login blocker.)
+> **Correction (2026-06-25):** the previous "blocked by a proven server-side
+> identity gate" status is superseded. Static review found the Rust live login path
+> was not APK-faithful: signed params were sent as URL query params instead of form
+> fields, `postData` was raw JSON instead of ET=3 AES-GCM encrypted before signing,
+> `time` used milliseconds instead of seconds, and `requestId` was not UUID-shaped.
+> The live path now builds the Java-shaped request. A fresh guarded `token.get`
+> probe is required before calling the login avenue blocked or open.
 
 What works **offline today**:
 
 | Command | Status |
 |---|---|
 | `auth status` / `auth logout` | works (reads/clears the local session store) |
-| `auth login` | reports **blocked** by the server-side identity gate (no real login; token-injectable — inject a captured session, TASK-0022) |
+| `auth login` | live-gated; request shape corrected, fresh guarded probe pending |
 | `devices list` / `devices show <id>` | works against a **fixture body** (`--fixture <file>`; defaults to the synthetic test fixture) |
-| `devices list --live` | **blocked** (no session ⇒ no fetch; no network touched; surfaces the honest blocked state) |
+| `devices list --live` | live-gated; consumes an injected/stored session, otherwise no fetch and no network touched |
 
 Every command supports `--json`. **Secret/PII fields** (`localKey`, `secKey`,
 `p2pKey`, `initStr`, session/relay descriptors, …) are **redacted by default**;
@@ -71,14 +61,15 @@ own authorized/synthetic data.
 ## The live gold-oracle test (gated)
 
 The strongest acceptance signal is a live end-to-end run against the real camera:
-`auth login` → `devices list` → find the SCD921. It lives in
+`auth live-login` → `devices list` → find the SCD921. It lives in
 `babymonitor-cli/tests/live_e2e.rs` and is **`#[ignore]`d** so it never runs in
 `just e2e` / CI and makes no network call there. Today, when run manually, it
-asserts the **honest login-blocked state** (a from-scratch client cannot clear the
-server-side identity gate, TASK-0050/0051); once a **captured session is injected**
-(**TASK-0022**) it becomes the real login-and-discover assertion.
+asserts the **honest no-live-credentials state**; once a fresh guarded login probe
+passes or a **captured session is injected** (**TASK-0022**) it becomes the real
+login-and-discover assertion.
 
-To run it manually once a captured session is injected (single-shot, rate-limited):
+To run it manually once fresh login or a captured session is available (single-shot,
+rate-limited):
 
 ```sh
 # 1. secrets/tuya_appkey.json  -> { "app_key": "...", "app_secret": "...", "ttid": "..." }

@@ -48,18 +48,15 @@
 //! `dev_id`/`uuid`/`p2p_id` are not crypto secrets but are account-linked PII —
 //! callers must not print them by default (feed-forward to the CLI, TASK-0014).
 //!
-//! # Offline-only (no live network in this task)
+//! # Offline-first core
 //!
 //! [`parse_device_list`] takes a response **body** (injected bytes) so it is
-//! fully testable offline. A real HTTP fetch is intentionally NOT implemented
-//! here: the device list rides an authenticated session, and there is none — a
-//! from-scratch `token.get` is rejected by the server-side identity gate
-//! (`ILLEGAL_CLIENT_ID`, proven sign-insensitive — TASK-0050/0051), so the cloud
-//! never issues a `sid` to authorize a home-detail call. [`list_devices`]
-//! additionally cannot even sign without the un-validated `bmp_token` (the
-//! signer's 6th ingredient — TASK-0032), so it threads the signer/session through
-//! and returns [`Error::BmpTokenPending`] the moment a signature is required.
-//! Either way it never makes a live call and never fabricates a response.
+//! fully testable offline. A real HTTP fetch is intentionally NOT implemented in
+//! this core crate: the device list rides an authenticated session produced by the
+//! live auth path or injected into the CLI store. [`list_devices`] threads signer
+//! and session inputs through the API and returns [`Error::BmpTokenPending`] when
+//! callers still supply the pending signer. Either way it never makes a live call
+//! and never fabricates a response.
 
 use std::collections::BTreeMap;
 
@@ -528,17 +525,14 @@ pub fn parse_camera_info(body: &[u8]) -> Result<CameraInfoBean, Error> {
 /// material, a token provider, a session, and a home id, it would build a signed
 /// home-detail request, POST it, and [`parse_device_list`] the response.
 ///
-/// **No live call is made in this task.** The home-detail call needs an
-/// authenticated session, and there is none: a from-scratch `token.get` is
-/// rejected by the server-side identity gate (`ILLEGAL_CLIENT_ID`, proven
-/// sign-insensitive — TASK-0050/0051), so the cloud never issues a `sid`.
-/// Independently, this function also cannot sign without the un-validated
-/// `bmp_token` (the signer's 6th ingredient, TASK-0032), so it threads the signer
-/// through and returns [`Error::BmpTokenPending`] the moment a signature is
-/// required — exactly the TASK-0012 discipline. Either way the request-decoration
-/// wiring stays real and reviewable without fabricating a response or hitting the
-/// network. The real HTTP path lands when an authenticated session is injected
-/// (one on-device capture, TASK-0022 — a follow-up).
+/// **No live call is made in this core crate.** The home-detail call needs an
+/// authenticated session and a live HTTP transport, both supplied by the CLI live
+/// layer. This function threads signer and session inputs through and returns
+/// [`Error::BmpTokenPending`] when callers still supply the pending signer —
+/// exactly the TASK-0012 discipline. Either way the request-decoration wiring
+/// stays real and reviewable without fabricating a response or hitting the
+/// network. The real HTTP path runs in the CLI live layer when an authenticated
+/// session is injected or created by a validated live login.
 ///
 /// `_material`/`_token_provider`/`_session_sid`/`_home_id` are accepted now so
 /// the call signature is stable for callers (the CLI, TASK-0014) — they are
@@ -552,17 +546,13 @@ pub fn list_devices<P: BmpTokenProvider>(
     _session_sid: &str,
     _home_id: &str,
 ) -> Result<DeviceList, Error> {
-    // The fetch is blocked first by the absent authenticated session (the
-    // server-side identity gate rejects token.get with ILLEGAL_CLIENT_ID,
-    // TASK-0050/0051, so no sid is issued). On top of that, the signer cannot even
-    // produce a signature without the un-validated bmp_token: probe that dependency
-    // here, and if it is pending we cannot sign, so we cannot make the request.
-    // Surface that honestly rather than touching the network or returning an empty
-    // list.
+    // The core crate has no live HTTP transport. On top of that, a caller using
+    // the pending signer cannot produce a signature: probe that dependency here,
+    // and if it is pending we cannot sign, so we cannot make the request. Surface
+    // that honestly rather than touching the network or returning an empty list.
     token_provider.bmp_token()?;
-    // Even if a token became available, the request would still need an authed
-    // session (identity gate above), and the live HTTP path is not wired in this
-    // task either — that is a separate follow-up (request decoration + POST).
+    // Even if a token became available, the core crate still has no live HTTP path
+    // or session source. Those live concerns are owned by the CLI `live` feature.
     Err(Error::NotImplemented(
         "list_devices live HTTP fetch (signer unblocked but fetch not wired \
          yet — follow-up task)",

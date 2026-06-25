@@ -18,11 +18,31 @@ OUTCOME, never a value.
 
 ---
 
-## Final wire-fidelity probe — every static field matched, still rejected (TASK-0051) (confidence: confirmed)
+## 2026-06-25 correction — TASK-0050/0051 exhaustion verdict superseded
 
-**The last two statically-derivable wire differences between our `token.get` and
-the real app were closed, and the gateway STILL returns the identical
-`ILLEGAL_CLIENT_ID`. The static cloud-login avenue is now AIRTIGHT-EXHAUSTED.**
+The "static cloud-login avenue is airtight-exhausted" conclusion below is now
+**superseded**. A fresh static pass found the Rust request was not byte-faithful to
+the APK:
+
+- Java posts to `/api.json` with an empty query string; `ThingApiParams.getRequestBody()`
+  merges encrypted `postData`, `sign`, and the URL-param map into the form body.
+- Java defaults `signWhitEncryptedBody=true`, ET version `3`; login `token.get` and
+  `password.login` set `sessionRequire(false)`, so `postData` is AES-GCM encrypted
+  with `getEncryptoKey(requestId, null)` before `postDataMD5Hex` and signing.
+- Java signs epoch-second `time` and a `UUID.randomUUID().toString()` `requestId`.
+
+The Rust live path now mirrors those points. The old corrupted-sign differential was
+therefore performed against a malformed request shape and cannot prove a
+sign-insensitive identity gate. A fresh guarded `token.get` probe is required before
+classifying `ILLEGAL_CLIENT_ID` again.
+
+---
+
+## Historical TASK-0051 probe — superseded by request-shape correction
+
+**Superseded:** this section records the old TASK-0051 probe result. It was performed
+before the Rust client matched the APK's form-body/encrypted-`postData` request
+shape, so it is retained as history but is no longer a current auth conclusion.
 
 The post-0050 architect request-shape sweep found exactly TWO remaining
 statically-derivable differences; both were judged very unlikely to move a
@@ -47,6 +67,7 @@ then fired against `a1.tuyaeu.com` (`--probe-only --host a1.tuyaeu.com`, no
 | probe | wire delta vs 0050 | HTTP | errorCode | errorMsg |
 |---|---|---|---|---|
 | TASK-0051 (`--probe-only`) | +`x-client-trace-id` header, +body `deviceId` | 200 | `ILLEGAL_CLIENT_ID` | `Invalid client;No access` |
+| post-Ghidra recheck | native-sliced `chKey=hex_hmac[8..24]`, +`nd=1`, SDK `6.7.0`, Pixel 8 Pro profile, no `Authorization` header | 200 | `ILLEGAL_CLIENT_ID` | `Invalid client;No access` |
 
 (raw capture in gitignored `secrets/tuya_live_debug.json`; the captured
 `request_param_keys` confirm `deviceId`+`requestId` in the envelope — the body
@@ -132,8 +153,9 @@ are STILL NEITHER validated NOR refuted. `password.login` was NOT attempted (zer
 lockout-sensitive calls consumed across BOTH cycles); 2FA was NOT reached.
 
 > **Wave-3 RESULT (TASK-0044 → TASK-0042 single re-attempt):** the recovered
-> `chKey` (native getChKey@0x16000 = HMAC-SHA256(appId, packageName_"_"_certHex),
-> STATIC — `re/chkey_static.md`) + the SDK-fidelity params (`channel`,
+> `chKey` (native getChKey@0x16000 =
+> lowercase_hex(HMAC-SHA256(appId, packageName_"_"_certHex))[8..24], STATIC —
+> `re/chkey_static.md`) + the SDK-fidelity params (`channel`,
 > `sdkVersion`, `deviceCoreVersion`, `osSystem`, `platform`, `timeZoneId`,
 > `bizData`, `cp=gzip`) were added to the live request and the corrected request
 > was sent ONCE. The captured request param-keys (`secrets/tuya_live_debug.json`)
@@ -145,7 +167,10 @@ lockout-sensitive calls consumed across BOTH cycles); 2FA was NOT reached.
 > reproduce; (b) a still-wrong `chKey` (the §3a key/msg ordering is single-source)
 > or an un-modelled signed identity input. The owner decides next (provide more
 > material / authorize broader on-device capture, e.g. a Frida `getChKey` /
-> request hook on the authorized device).
+> request hook on the authorized device). Later Ghidra recheck corrected the
+> chKey length/slice, added neutral-domain `nd=1`, exact SDK `6.7.0`, Pixel 8 Pro
+> Android profile values, OkHttp `+` form-space encoding, and removed the
+> non-APK `Authorization` header; the live `token.get` result remained unchanged.
 
 > **Regions/host note (TASK-0043):** the runtime `getConfig` native host-decrypt
 > hypothesis (§"Likely cause") is SUPERSEDED — the `thing_domains_v1/regions`

@@ -8,19 +8,15 @@
 //!
 //! ## Why it is gated (honest)
 //!
-//! A from-scratch static client cannot log in: Tuya rejects `token.get` with a
-//! server-side identity gate (`ILLEGAL_CLIENT_ID`) *before* it evaluates the
-//! request signature — proven sign-insensitive by a corrupted-sign differential
-//! (TASK-0050) and host-exhausted across every datacenter gateway (TASK-0048/0051).
-//! No further static field clears it. The client is **token-injectable**, so the
-//! real unblock is ONE on-device capture of a live session (TASK-0022; top-level
-//! README §6). So today this test, when run with `--include-ignored`, asserts the
-//! HONEST no-session state end-to-end rather than a fabricated success (the
-//! signer's un-validated 6th ingredient trips first, so the concrete probe still
-//! surfaces [`Error::BmpTokenPending`] — either way no network call, no fabricated
-//! response). When a captured session is injected, the body below is replaced with
-//! the real login -> device-list -> find-SCD921 assertions; the manual setup and
-//! authorized-scope contract documented here do not change.
+//! The previous `ILLEGAL_CLIENT_ID` identity-gate conclusion is superseded: the
+//! APK signs encrypted `postData` plus ATOP params in the form body, and the Rust
+//! live builder now mirrors that shape. A fresh authorized `auth live-login` probe
+//! is still required before this ignored test can become a real login ->
+//! device-list -> find-SCD921 assertion. Until then, this test asserts the HONEST
+//! no-live-credentials state rather than a fabricated success. The client remains
+//! **token-injectable** via one captured live session (TASK-0022; top-level README
+//! §6), and the manual setup / authorized-scope contract documented here do not
+//! change.
 //!
 //! ## Authorized scope
 //!
@@ -28,7 +24,7 @@
 //! device. This is a benign, authorized personal RE project: the user owns the
 //! device + account. No third-party account/device is ever targeted.
 //!
-//! ## Manual setup (once a captured session unblocks login — TASK-0022)
+//! ## Manual setup (fresh login probe or captured session)
 //!
 //! 1. Place the app key material at `secrets/tuya_appkey.json` (gitignored):
 //!    `{ "app_key": "...", "app_secret": "...", "ttid": "..." }`.
@@ -51,32 +47,30 @@ use babymonitor_core::{device, Error};
 
 /// The gold-oracle live path. `#[ignore]`d: excluded from the offline suite.
 ///
-/// CURRENT (login-blocked) behaviour, asserted honestly when run with
-/// `--ignored`: a from-scratch client cannot obtain a session (server-side
-/// identity gate, TASK-0050/0051), so no live fetch happens. The live device-list
-/// fetch surfaces [`Error::BmpTokenPending`] (the signer's un-validated 6th
-/// ingredient is its first stop; not the login blocker). It makes NO network call
-/// and fabricates NO response.
+/// CURRENT behaviour, asserted honestly when run with `--ignored`: this harness
+/// has no validated live credentials/session, so no live fetch happens. The
+/// device-list fetch surfaces [`Error::BmpTokenPending`] because this ignored unit
+/// uses the pending signer. It makes NO network call and fabricates NO response.
 ///
-/// FUTURE (once a captured session is injected — TASK-0022): replace the body with
-///   1. `auth login` against `secrets/`-sourced credentials,
+/// FUTURE (once fresh login is validated or a captured session is injected):
+/// replace the body with
+///   1. `auth live-login` against `secrets/`-sourced credentials,
 ///   2. `device::list_devices(...)` returning the real list,
 ///   3. assert the SCD921 camera is found (`find_camera_device().is_some()` and
 ///      `is_camera()`), asserting SHAPE only — never printing the devId.
 #[test]
-#[ignore = "live gold-oracle: a from-scratch login is blocked by the server-side \
-            identity gate (ILLEGAL_CLIENT_ID, TASK-0050/0051); needs an injected \
-            captured session (TASK-0022) + the user's own Tuya account. Run manually \
-            with --ignored --test-threads=1. Today it asserts the honest \
-            login-blocked state, not a fabricated login."]
+#[ignore = "live gold-oracle: fresh auth live-login probe still pending; needs \
+            secrets for the user's own Tuya account or an injected captured session \
+            (TASK-0022). Run manually with --ignored --test-threads=1. Today it \
+            asserts the honest no-live-credentials state, not a fabricated login."]
 fn live_login_then_device_list_finds_scd921() {
     // SINGLE-SHOT: no retry loop, no parallelism. With the real signer this is
     // the one live request; here the signer probe fails first, so no network is
     // touched at all.
     let material = SigningKeyMaterial {
-        // Placeholder-by-construction: never read a real secret here while the
-        // login path is blocked. The captured-session harness (TASK-0022) injects
-        // a real session into the store and drives the read path from there.
+        // Placeholder-by-construction: never read a real secret here. The live
+        // harness uses secrets/ for auth live-login or injects a real session into
+        // the store and drives the read path from there.
         app_key: String::new(),
         app_secret: String::new(),
         app_cert_sha256_hex: String::new(),
@@ -85,20 +79,18 @@ fn live_login_then_device_list_finds_scd921() {
 
     let result = device::list_devices(&material, &PendingBmpToken, "", "");
 
-    // HONEST assertion: a from-scratch login is blocked by the server-side identity
-    // gate, so no live fetch happens. We assert the no-session state rather than a
-    // login we cannot perform (the signer's un-validated 6th ingredient trips first,
-    // so the concrete variant is BmpTokenPending). This test FAILS (goes red) the
-    // day someone makes it pretend to succeed without an injected session — which is
-    // exactly the negative-feedback property we want.
+    // HONEST assertion: this ignored harness has no live credentials/session, so
+    // no live fetch happens. We assert the pending-signer state rather than a
+    // login we have not validated. This test FAILS (goes red) the day someone
+    // makes it pretend to succeed without real auth material.
     match result {
         Err(Error::BmpTokenPending) => {
-            // Expected today. When a captured session is injected (TASK-0022), this
-            // arm is replaced by the real list-and-find-SCD921 assertions.
+            // Expected today. When fresh login is validated or a captured session
+            // is injected (TASK-0022), this arm is replaced by the real
+            // list-and-find-SCD921 assertions.
         }
         other => panic!(
-            "live device-list expected the login-blocked state (no session — identity gate, \
-             TASK-0050/0051); got {other:?}. \
+            "live device-list expected the no-live-credentials state; got {other:?}. \
              If login now works, update this harness to assert the real SCD921 discovery."
         ),
     }
@@ -110,12 +102,9 @@ fn live_login_then_device_list_finds_scd921() {
 /// CURRENT (stream-pending) behaviour, asserted honestly when run with
 /// `--ignored`: the live session driver surfaces [`Error::StreamPending`] because
 /// (a) every runtime credential (token/p2pId/p2pKey/ices/session/localKey/pv)
-/// rides an authenticated session that cannot be obtained — `token.get` is
-/// rejected by the server-side identity gate (`ILLEGAL_CLIENT_ID`, proven
-/// sign-insensitive — TASK-0050/0051), so login never issues a `sid` to fetch the
-/// device's `CameraInfoBean`/`P2pConfig` (the signer's un-validated 6th
-/// ingredient, the `bmp_token` — TASK-0032 — is a sign input, not this blocker),
-/// (b) the 302-payload localKey-AES
+/// rides an authenticated session that this harness does not yet establish, so it
+/// cannot fetch the device's `CameraInfoBean`/`P2pConfig`, (b) the 302-payload
+/// localKey-AES
 /// PRIMITIVE is now implemented (AES-128/ECB/PKCS5, key=localKey), but the full
 /// 302 envelope assembly is pending (`Error::MqttEnvelopePending`: the
 /// pv→output-variant binding + outer Tuya MQTT framing need a live capture —
@@ -134,14 +123,12 @@ fn live_login_then_device_list_finds_scd921() {
 /// own SCD921; creds from `secrets/` (gitignored), never a tracked file; single
 /// shot, `--test-threads=1`. Nothing here prints a secret.
 #[test]
-#[ignore = "live A/V stream: needs an authenticated session, which a from-scratch \
-            client cannot obtain — token.get is rejected by the server-side identity \
-            gate (ILLEGAL_CLIENT_ID, TASK-0050/0051), so the device creds it would \
-            fetch are unreachable; needs an injected captured session (TASK-0022). It \
-            also needs the 302 envelope variant/framing binding + webrtc-rs engine \
-            (TASK-0037) and a live SCD921 returning p2pType=4. Run manually with \
-            --ignored --test-threads=1. Today it asserts the honest stream-pending \
-            state, not a fabricated stream."]
+#[ignore = "live A/V stream: needs an authenticated session from fresh auth \
+            live-login or an injected captured session (TASK-0022). It also needs \
+            the 302 envelope variant/framing binding + webrtc-rs engine (TASK-0037) \
+            and a live SCD921 returning p2pType=4. Run manually with --ignored \
+            --test-threads=1. Today it asserts the honest stream-pending state, \
+            not a fabricated stream."]
 fn live_webrtc_session_renders_first_frame() {
     // A panicking engine/transport: if the (gated) driver ever reached real I/O
     // these would explode, proving no live path runs while stream-pending.

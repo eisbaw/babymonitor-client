@@ -20,6 +20,7 @@ dirs = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
+aes-gcm = "0.10"
 # 302-payload localKey-AES primitive (TASK-0037). The recovered cipher is
 # AES-128/ECB/PKCS5(=PKCS7), NO IV, key=localKey ASCII bytes — see
 # decompiled/.../AESUtil.java getInstance(this.ALGO="AES") + init(mode,key) with

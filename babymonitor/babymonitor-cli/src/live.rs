@@ -28,14 +28,19 @@
 //! fold is wrong and we STOP before ever attempting `password.login`.
 
 use std::collections::BTreeMap;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use aes_gcm::aead::{AeadInPlace, KeyInit};
+use aes_gcm::{Aes128Gcm, Nonce};
 use babymonitor_core::session::SessionStore;
 use babymonitor_core::sign::{
-    app_cert_sha256_hex_from_apk, ch_key, md5_hex_lower, post_data_digest_hex, SignBody, Signer,
-    SigningKeyMaterial, StaticBmpToken, APP_PACKAGE_NAME,
+    app_cert_sha256_hex_from_apk, assemble_sign_key, ch_key, et3_encrypto_key, md5_hex_lower,
+    post_data_digest_hex, SignBody, Signer, SigningKeyMaterial, StaticBmpToken, APP_PACKAGE_NAME,
 };
+use base64::Engine as _;
 use rand::rngs::OsRng;
+use rand::RngCore;
 use rsa::pkcs8::DecodePublicKey;
 use rsa::{BigUint, Pkcs1v15Encrypt, RsaPublicKey};
 use serde::Deserialize;
@@ -66,12 +71,10 @@ const OS_ANDROID: &str = "Android";
 const LANG: &str = "en";
 
 /// thingclips SDK version embedded in the `User-Agent`
-/// (`Thing-UA=APP/Android/<appVersion>/SDK/<sdkVersion>`). The exact value is
-/// resolved at runtime (`ThingSmartNetWork.getSdkVersion()`, not a static
-/// literal), so this is a representative thingclips SDK version for the app era;
-/// the load-bearing part for the gateway client check is the `Thing-UA=APP/Android`
-/// prefix. Overriding it has no effect on the sign.
-const THING_SDK_VERSION: &str = "5.18.0";
+/// (`Thing-UA=APP/Android/<appVersion>/SDK/<sdkVersion>`). Resolved statically:
+/// `ThingSdk.getSdkVersion()` parses
+/// `com.thingclips.smart.device.core.sdk.BuildConfig.VERSION_NAME = "6.7.0"`.
+const THING_SDK_VERSION: &str = "6.7.0";
 
 // ── SDK-fidelity envelope params (TASK-0044) ─────────────────────────────────
 // The real `ThingApiParams.initUrlParams` (~:1771-1831,
@@ -89,10 +92,15 @@ const THING_SDK_VERSION: &str = "5.18.0";
 const SDK_VERSION: &str = THING_SDK_VERSION;
 
 /// `deviceCoreVersion` (`KEY_DEVICE_CORE_VERSION`) —
-/// `ThingSmartNetWork.mDeviceCoreVersion`, passed at init. Runtime-set; the SDK
-/// ships it lock-stepped with the SDK version, so we use the same string as a
-/// representative default. NOT load-bearing for the gateway client check.
+/// `ThingSmartNetWork.mDeviceCoreVersion`, from
+/// `ThingSdk.getDeviceCoreVersion()` → `com.thingclips.smart.device.core.sdk.BuildConfig`
+/// `VERSION_NAME = "6.7.0"`.
 const DEVICE_CORE_VERSION: &str = THING_SDK_VERSION;
+
+/// `nd` (`KEY_NEUTRAL_DOMAINS`) — production `SmartApplication.e()` enables the
+/// neutral domain switch before SDK init, and `initUrlParams` emits `nd=1` both
+/// as a top-level form param and inside `bizData`.
+const NEUTRAL_DOMAINS_ENABLED: &str = "1";
 
 /// `channel` (`"channel"` key) — `ThingSmartNetWork.mChannel`, the channel arg
 /// reaching `ThingSmartNetWork.initialize`. RESOLVED statically (TASK-0047,
@@ -115,14 +123,18 @@ const CHANNEL: &str = "oem";
 /// `5.92` is the documented constant and is what we send.)
 const APP_RN_VERSION: &str = "5.92";
 
-/// `osSystem` (`KEY_OS_SYSTEM`) — `Build.VERSION.RELEASE`, the Android OS
-/// version. Device-specific; we use a plausible modern Android release. Purely
-/// informational to the gateway (not the client-identity gate).
-const OS_SYSTEM: &str = "13";
+/// Default `osSystem` (`KEY_OS_SYSTEM`) — `Build.VERSION.RELEASE`.
+/// Pixel 8 Pro on a current stable Android release.
+const DEFAULT_OS_SYSTEM: &str = "16";
 
-/// `platform` (`KEY_PLATFORM`) — `Build.MODEL`, the device model string.
-/// Device-specific; we use a generic but real-looking model. Informational.
-const PLATFORM: &str = "Pixel 6";
+/// Default `platform` (`KEY_PLATFORM`) — `Build.MODEL`.
+const DEFAULT_PLATFORM: &str = "Pixel 8 Pro";
+
+/// Default `sdkInt` (`KEY_SDK_INT`) — `Build.VERSION.SDK_INT`.
+const DEFAULT_SDK_INT: &str = "36";
+
+/// Default `brand` (`KEY_BRAND`) — `Build.BRAND`.
+const DEFAULT_BRAND: &str = "google";
 
 /// `timeZoneId` (`KEY_TIME_ZONE_ID`) — `ThingCommonUtil.getTimeZoneId()`. The
 /// account owner is in Denmark (`COUNTRY_CODE_DK`), so the matching zone.
@@ -176,10 +188,6 @@ const DEVICE_LIST_VERSION: &str = "1.0";
 struct LoginCreds {
     email: String,
     password: String,
-    /// Optional HTTP `Authorization` header value the app presents to the atop
-    /// gateway (channel auth). Sent verbatim if present; never logged.
-    #[serde(default)]
-    authorization: Option<String>,
 }
 
 /// App key material read from `secrets/tuya_appkey.json`. The cert hash is NOT in
@@ -195,6 +203,59 @@ struct AppKey {
     version_name: Option<String>,
 }
 
+/// Runtime Android build identity used by `ThingApiParams.initUrlParams` and
+/// `PhoneUtil.getRemoteDeviceID`. The APK reads these from `android.os.Build`;
+/// the CLI reads an optional gitignored `secrets/android_profile.json` so a user
+/// can pin their real device profile without packet capture.
+#[derive(Clone, Deserialize)]
+struct AndroidProfile {
+    #[serde(
+        rename = "osSystem",
+        alias = "release",
+        alias = "androidRelease",
+        default = "default_os_system"
+    )]
+    os_system: String,
+    #[serde(rename = "platform", alias = "model", default = "default_platform")]
+    model: String,
+    #[serde(rename = "sdkInt", alias = "sdk_int", default = "default_sdk_int")]
+    sdk_int: String,
+    #[serde(default = "default_brand")]
+    brand: String,
+    /// Optional exact app/device store value. If supplied, this wins over the
+    /// generated PhoneUtil-shaped fallback.
+    #[serde(rename = "deviceId", alias = "device_id", default)]
+    device_id: Option<String>,
+}
+
+impl Default for AndroidProfile {
+    fn default() -> Self {
+        Self {
+            os_system: default_os_system(),
+            model: default_platform(),
+            sdk_int: default_sdk_int(),
+            brand: default_brand(),
+            device_id: None,
+        }
+    }
+}
+
+fn default_os_system() -> String {
+    DEFAULT_OS_SYSTEM.to_string()
+}
+
+fn default_platform() -> String {
+    DEFAULT_PLATFORM.to_string()
+}
+
+fn default_sdk_int() -> String {
+    DEFAULT_SDK_INT.to_string()
+}
+
+fn default_brand() -> String {
+    DEFAULT_BRAND.to_string()
+}
+
 /// Resolved live config: secrets + the offline-computed cert hash + a stable
 /// per-install deviceId. Carries secrets; constructed once, never logged.
 struct LiveConfig {
@@ -203,6 +264,7 @@ struct LiveConfig {
     bmp_token: String,
     app_version: String,
     device_id: String,
+    android: AndroidProfile,
     /// The per-app channel-auth token (native `getChKey@0x16000`,
     /// `re/chkey_static.md`). Wire `chKey` param AND a SIGNED whitelist param.
     /// Secret-by-policy (derived from appKey + cert hash) — never logged.
@@ -302,9 +364,9 @@ pub enum ProbeOutcome {
 /// [`InjectedOutcome::NoSession`] honestly. No variant carries a secret value.
 #[derive(Debug)]
 pub enum InjectedOutcome {
-    /// No session is injected in the store. The read path is honestly blocked:
-    /// a from-scratch login is denied by the server-side identity gate, so there
-    /// is no `sid` to drive `device.list`. The caller reports the blocked state.
+    /// No session is injected in the store. The read path is honestly unavailable:
+    /// there is no `sid` to drive `device.list`. The caller reports the
+    /// no-session state.
     NoSession,
     /// An injected `sid` drove a real `device.list` call. Carries non-secret shape
     /// facts: whether the SCD921 camera was found and its `p2pType` (transport
@@ -350,6 +412,7 @@ fn load_config(secrets_dir: &Path, apk_path: &Path) -> Result<LiveConfig, LiveEr
         .version_name
         .clone()
         .unwrap_or_else(|| "1.9.0".to_string());
+    let android = load_android_profile(secrets_dir)?;
 
     let material = SigningKeyMaterial {
         app_key: appkey.app_key,
@@ -359,16 +422,16 @@ fn load_config(secrets_dir: &Path, apk_path: &Path) -> Result<LiveConfig, LiveEr
     };
 
     // chKey: the per-app channel-auth token. Computed from STATIC inputs
-    // (appKey + package name + offline cert hash) per native getChKey@0x16000
-    // (re/chkey_static.md). If a pre-computed secrets/chkey.txt exists we prefer
-    // it (lets an operator pin a captured value), else we derive it here. The
-    // value is secret-by-policy and is NEVER logged. If we derived it, persist it
-    // to secrets/chkey.txt (gitignored, 0600) so the next cycle can reuse it.
+    // (appKey + package name + offline cert hash) per native getChKey@0x16000.
+    // Native returns 16 lowercase hex chars (hex_hmac[8..24]), not the full
+    // 64-hex HMAC. If a pre-computed secrets/chkey.txt exists we prefer it only
+    // when it has the native shape; otherwise we derive and overwrite it. The
+    // value is secret-by-policy and is NEVER logged.
     let ch_key_value = {
         let pinned = std::fs::read_to_string(secrets_dir.join("chkey.txt"))
             .ok()
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+            .filter(|s| is_native_chkey_shape(s));
         match pinned {
             Some(v) => v,
             None => {
@@ -386,11 +449,10 @@ fn load_config(secrets_dir: &Path, apk_path: &Path) -> Result<LiveConfig, LiveEr
     };
 
     // A stable, NON-secret per-install device id. The atop envelope needs a
-    // `deviceId`; the app uses PhoneUtil.getDeviceID. A fixed UUID-shaped value
-    // is fine for a from-scratch client (it is not a credential). Derive it
-    // deterministically from the appKey so it is stable across runs without
-    // persisting anything (single source of truth, no extra state file).
-    let device_id = derive_device_id(&material.app_key);
+    // `deviceId`; the app uses PhoneUtil.getDeviceID(), backed by encrypted
+    // SecuredPreferenceStore key "deviceId". For APK parity, prefer an exact
+    // caller-supplied value, else persist a PhoneUtil-shaped fallback.
+    let device_id = load_or_create_device_id(secrets_dir, &android)?;
 
     Ok(LiveConfig {
         creds,
@@ -398,31 +460,123 @@ fn load_config(secrets_dir: &Path, apk_path: &Path) -> Result<LiveConfig, LiveEr
         bmp_token,
         app_version,
         device_id,
+        android,
         ch_key: ch_key_value,
         secrets_dir: secrets_dir.to_path_buf(),
     })
 }
 
-/// Derive a stable, non-secret deviceId from the appKey. Not a credential; just a
-/// per-install handle the envelope requires. MD5-hex of a fixed-salt + appKey,
-/// truncated to a 16-hex handle (deterministic, no stored state).
-fn derive_device_id(app_key: &str) -> String {
-    let seed = format!("babymonitor-cli-deviceid::{app_key}");
-    let digest = md5_hex_lower(seed.as_bytes());
-    digest[..16].to_string()
+fn is_native_chkey_shape(value: &str) -> bool {
+    value.len() == 16
+        && value
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
+fn load_android_profile(secrets_dir: &Path) -> Result<AndroidProfile, LiveError> {
+    let path = secrets_dir.join("android_profile.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| LiveError::Config(format!("parse {}: {e}", path.display()))),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(AndroidProfile::default()),
+        Err(e) => Err(LiveError::Config(format!("read {}: {e}", path.display()))),
+    }
+}
+
+fn load_or_create_device_id(
+    secrets_dir: &Path,
+    android: &AndroidProfile,
+) -> Result<String, LiveError> {
+    if let Some(device_id) = android
+        .device_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(device_id.to_string());
+    }
+
+    let path = secrets_dir.join("device_id.txt");
+    if let Some(v) = std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(v);
+    }
+
+    let device_id = generate_phone_util_device_id(android);
+    std::fs::write(&path, &device_id)
+        .map_err(|e| LiveError::Config(format!("write {}: {e}", path.display())))?;
+    restrict_permissions(&path);
+    Ok(device_id)
+}
+
+/// Reproduce `PhoneUtil.getRemoteDeviceID()` for a fresh APK install:
+///
+/// `md5(brand+model)[4..16] + md5(random_id3+random_id4)[8..24] +
+/// md5(random_id1+random_id2)[16..]`
+///
+/// Tuya's `MD5Util.md5AsBase64` is misnamed in this build: decompiled code shows
+/// it returns lowercase MD5 hex. The generated value is persisted by
+/// [`load_or_create_device_id`] just like the APK persists it in
+/// `SecuredPreferenceStore`.
+fn generate_phone_util_device_id(android: &AndroidProfile) -> String {
+    let random_id1 = generate_phone_util_random_id(&android.model);
+    let random_id2 = generate_phone_util_random_id(&android.model);
+    let random_id3 = uuid32();
+    let random_id4 = uuid32();
+
+    let part1 = md5_hex_lower(format!("{}{}", android.brand, android.model).as_bytes());
+    let part2 = md5_hex_lower(format!("{random_id3}{random_id4}").as_bytes());
+    let part3 = md5_hex_lower(format!("{random_id1}{random_id2}").as_bytes());
+    format!("{}{}{}", &part1[4..16], &part2[8..24], &part3[16..])
+}
+
+/// Reproduce `PhoneUtil.generateRandomId()`: last 5 millis digits + first 6
+/// non-space model chars padded with `0` + first 4 hex chars of a random long.
+fn generate_phone_util_random_id(model: &str) -> String {
+    let now_ms = chrono::Utc::now().timestamp_millis().unsigned_abs();
+    let millis = format!("{now_ms:05}");
+    let suffix = &millis[millis.len() - 5..];
+
+    let mut model_part: String = model
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .take(6)
+        .collect();
+    while model_part.len() < 6 {
+        model_part.push('0');
+    }
+
+    let random_value = loop {
+        let mut bytes = [0u8; 8];
+        let mut rng = OsRng;
+        rng.fill_bytes(&mut bytes);
+        let value = u64::from_be_bytes(bytes) & 0x7fff_ffff_ffff_ffff;
+        if value >= 4096 {
+            break value;
+        }
+    };
+    let random_hex = format!("{random_value:x}");
+    format!("{suffix}{model_part}{}", &random_hex[..4])
+}
+
+fn uuid32() -> String {
+    new_request_id().replace('-', "")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Atop request envelope + signing
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build the signed atop envelope (URL query params) for one action.
+/// Build the signed atop param map for one pre-login action.
 ///
 /// `action` is the `thing.*` name; it is rewritten to `smartlife.*` for the wire
 /// `a` (and the rewritten name is what gets signed, `re/tuya_cloud_auth.md` §1a).
-/// `post_data` is the raw JSON body string; its `postData` envelope value is the
-/// signed digest [`post_data_digest_hex`]. Returns the full query-param map
-/// (including `sign` and the RAW `postData` body that goes on the wire).
+/// `post_data` is raw JSON; the returned body string is the ET=3 encrypted
+/// `postData` form value, and the returned map contains every other form param
+/// including `sign`.
 fn build_signed_envelope(
     cfg: &LiveConfig,
     action: &str,
@@ -430,14 +584,23 @@ fn build_signed_envelope(
     post_data: &str,
     sign_body: SignBody,
 ) -> Result<(BTreeMap<String, String>, String), LiveError> {
-    build_signed_envelope_with(cfg, action, version, post_data, sign_body, &BTreeMap::new())
+    build_signed_envelope_with(
+        cfg,
+        action,
+        version,
+        post_data,
+        sign_body,
+        &BTreeMap::new(),
+        None,
+    )
 }
 
 /// Like [`build_signed_envelope`] but folds `extra` params (e.g. the post-login
-/// `sid`) into the SIGNED envelope before signing. Only whitelisted, non-empty
-/// extras affect the canonical string (the signer filters); they all ride on the
-/// wire query. Keeping signing in ONE place avoids the "sign then mutate" bug
-/// where a post-sign param edit would invalidate the signature.
+/// `sid`) into the SIGNED form params before signing. Only whitelisted, non-empty
+/// extras affect the canonical string (the signer filters); they all ride in the
+/// POST form body. `ecode` is the optional second arg to native
+/// `getEncryptoKey(requestId, ecode)` for session-required requests; login calls
+/// pass `None` because their Java path sets `setSessionRequire(false)`.
 fn build_signed_envelope_with(
     cfg: &LiveConfig,
     action: &str,
@@ -445,17 +608,18 @@ fn build_signed_envelope_with(
     post_data: &str,
     sign_body: SignBody,
     extra: &BTreeMap<String, String>,
+    ecode: Option<&str>,
 ) -> Result<(BTreeMap<String, String>, String), LiveError> {
     let wire_action = rewrite_action(action);
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let request_id = derive_request_id(now_ms, &wire_action);
+    let now_s = chrono::Utc::now().timestamp();
+    let request_id = new_request_id();
 
-    // The envelope params that ride on the wire (sid empty pre-login → dropped).
+    // Params that ride in the POST form body (sid empty pre-login → dropped).
     let mut envelope: BTreeMap<String, String> = BTreeMap::new();
     envelope.insert("a".into(), wire_action.clone());
     envelope.insert("v".into(), version.into());
-    envelope.insert("time".into(), now_ms.to_string());
-    envelope.insert("requestId".into(), request_id);
+    envelope.insert("time".into(), now_s.to_string());
+    envelope.insert("requestId".into(), request_id.clone());
     envelope.insert("et".into(), ET_VERSION.into());
     envelope.insert("lang".into(), LANG.into());
     envelope.insert("os".into(), OS_ANDROID.into());
@@ -468,41 +632,48 @@ fn build_signed_envelope_with(
     envelope.insert("deviceId".into(), cfg.device_id.clone());
 
     // chKey: the per-app channel-auth token (native getChKey@0x16000). It is BOTH
-    // a wire query param AND a SIGNED whitelist param (SIGN_WHITELIST contains
+    // a wire form param AND a SIGNED whitelist param (SIGN_WHITELIST contains
     // "chKey"), so it MUST be in the envelope BEFORE signing — the canonical
-    // string then includes it. Its absence is the likely ILLEGAL_CLIENT_ID cause.
+    // string then includes it. Earlier probes used it to test SDK fidelity.
     envelope.insert("chKey".into(), cfg.ch_key.clone());
 
     // SDK-fidelity params the real initUrlParams sends (TASK-0044). These are NOT
-    // in SIGN_WHITELIST, so they ride the wire query without affecting the sign —
+    // in SIGN_WHITELIST, so they ride the wire form without affecting the sign —
     // they make the request shape match the app. `cp=gzip` is set because et==3.
     envelope.insert("sdkVersion".into(), SDK_VERSION.into());
     envelope.insert("deviceCoreVersion".into(), DEVICE_CORE_VERSION.into());
     envelope.insert("channel".into(), CHANNEL.into());
-    envelope.insert("osSystem".into(), OS_SYSTEM.into());
-    envelope.insert("platform".into(), PLATFORM.into());
+    envelope.insert("nd".into(), NEUTRAL_DOMAINS_ENABLED.into());
+    envelope.insert("osSystem".into(), cfg.android.os_system.clone());
+    envelope.insert("platform".into(), cfg.android.model.clone());
     envelope.insert("timeZoneId".into(), TIME_ZONE_ID.into());
     envelope.insert("cp".into(), CP_GZIP.into());
     // appRnVersion: emitted by initUrlParams iff mAppRNVersion is non-empty; the
     // app wires it from RNAPIUtil.a() = BuildConfig.appRNVersion ("5.92"), which
     // IS non-empty, so the app sends it — we match (TASK-0048). Not signed.
     envelope.insert("appRnVersion".into(), APP_RN_VERSION.into());
-    // bizData: matches initUrlParams (customDomainSupport + sdkInt + brand). NOTE
-    // (TASK-0048): initUrlParams ALSO folds ThingSmartNetWork.getCommonParams()
+    // bizData: matches initUrlParams (customDomainSupport + nd + sdkInt + brand).
+    // NOTE (TASK-0048): initUrlParams ALSO folds ThingSmartNetWork.getCommonParams()
     // into BOTH bizData and the top-level params — but `addCommonParams` has NO
     // caller anywhere in the decompiled app, so mCommonParams is empty at
     // token.get time and getCommonParams() contributes nothing. We therefore add
     // no commonParams (adding invented ones would diverge from the app).
-    envelope.insert("bizData".into(), build_biz_data());
+    envelope.insert("bizData".into(), build_biz_data(&cfg.android));
 
     for (k, v) in extra {
         envelope.insert(k.clone(), v.clone());
     }
 
-    // Build the SIGN input map: a copy of the envelope with the postData value
-    // replaced by its signed digest (Tuya digests postData before sorting).
+    // Java default path: signWhitEncryptedBody=true and et=3, so `postData` is
+    // AES-GCM encrypted with a random 12-byte nonce, base64(nonce||ciphertext||tag),
+    // then that encrypted string is what enters both the form body and the sign
+    // digest. See ThingApiParams.getPostBody/getEncryptPostDataString.
+    let wire_post_data = encrypt_et3_post_data(cfg, &request_id, post_data, ecode)?;
+
+    // Build the SIGN input map: a copy of the params with `postData` inserted as
+    // the digest of the encrypted wire value (Tuya digests postData before sorting).
     let mut sign_params = envelope.clone();
-    let pd_digest = post_data_digest_hex(post_data.as_bytes())
+    let pd_digest = post_data_digest_hex(wire_post_data.as_bytes())
         .map_err(|e| LiveError::Crypto(format!("{e}")))?;
     sign_params.insert("postData".into(), pd_digest);
 
@@ -515,10 +686,51 @@ fn build_signed_envelope_with(
         .sign(&sign_params)
         .map_err(|e| LiveError::Crypto(format!("sign failed: {e}")))?;
 
-    // The wire query carries the envelope + sign; the digested postData was only
-    // for the signature — the RAW body rides as the form body.
+    // The final POST form body carries encrypted `postData` plus all params below.
     envelope.insert("sign".into(), sign);
-    Ok((envelope, post_data.to_string()))
+    Ok((envelope, wire_post_data))
+}
+
+fn native_cached_key(cfg: &LiveConfig) -> String {
+    assemble_sign_key(
+        &cfg.material.app_cert_sha256_hex,
+        &cfg.bmp_token,
+        &cfg.material.app_secret,
+    )
+}
+
+fn encrypt_et3_post_data(
+    cfg: &LiveConfig,
+    request_id: &str,
+    post_data: &str,
+    ecode: Option<&str>,
+) -> Result<String, LiveError> {
+    let mut nonce = [0u8; 12];
+    let mut rng = OsRng;
+    rng.fill_bytes(&mut nonce);
+    encrypt_et3_post_data_with_nonce(cfg, request_id, post_data, ecode, &nonce)
+}
+
+fn encrypt_et3_post_data_with_nonce(
+    cfg: &LiveConfig,
+    request_id: &str,
+    post_data: &str,
+    ecode: Option<&str>,
+    nonce: &[u8; 12],
+) -> Result<String, LiveError> {
+    let cached_key = native_cached_key(cfg);
+    let key = et3_encrypto_key(request_id, &cached_key, ecode);
+    let cipher = Aes128Gcm::new_from_slice(&key)
+        .map_err(|e| LiveError::Crypto(format!("AES-GCM key init: {e:?}")))?;
+    let mut ciphertext_and_tag = post_data.as_bytes().to_vec();
+    cipher
+        .encrypt_in_place(Nonce::from_slice(nonce), b"", &mut ciphertext_and_tag)
+        .map_err(|e| LiveError::Crypto(format!("AES-GCM encrypt postData: {e:?}")))?;
+
+    let mut out = Vec::with_capacity(nonce.len() + ciphertext_and_tag.len());
+    out.extend_from_slice(nonce);
+    out.extend_from_slice(&ciphertext_and_tag);
+    Ok(base64::engine::general_purpose::STANDARD.encode(out))
 }
 
 /// Build the wire `ttid` value the app actually sends. RESOLVED statically
@@ -548,24 +760,49 @@ fn rewrite_action(action: &str) -> String {
     }
 }
 
-/// A per-request id (the app uses UUID.randomUUID). We derive a unique-enough
-/// value from the timestamp + action without adding a uuid dependency.
-fn derive_request_id(now_ms: i64, wire_action: &str) -> String {
-    md5_hex_lower(format!("{now_ms}::{wire_action}").as_bytes())
+/// A per-request id matching Java `UUID.randomUUID().toString()`.
+fn new_request_id() -> String {
+    let mut bytes = [0u8; 16];
+    let mut rng = OsRng;
+    rng.fill_bytes(&mut bytes);
+    uuid_v4_from_bytes(bytes)
+}
+
+fn uuid_v4_from_bytes(mut bytes: [u8; 16]) -> String {
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
 }
 
 /// Build the `bizData` envelope param: the JSON object the real
 /// `ThingApiParams.initUrlParams` (~:1793-1822) assembles. It always carries
-/// `customDomainSupport="1"`, and folds in `sdkInt` (`Build.VERSION.SDK_INT`)
-/// and `brand` (`Build.BRAND`). Device-ish fields use representative values
-/// matching the [`PLATFORM`]/[`OS_SYSTEM`] picks. It is NOT a signed param.
-fn build_biz_data() -> String {
+/// `customDomainSupport="1"`, carries `nd="1"` when the app's neutral-domain
+/// switch is enabled, and folds in `sdkInt` (`Build.VERSION.SDK_INT`) and
+/// `brand` (`Build.BRAND`). It is NOT a signed param.
+fn build_biz_data(android: &AndroidProfile) -> String {
     serde_json::json!({
         "customDomainSupport": "1",
-        // Build.VERSION.SDK_INT for the OS in OS_SYSTEM ("13" → API 33).
-        "sdkInt": "33",
-        // Build.BRAND matching PLATFORM ("Pixel 6").
-        "brand": "google",
+        "nd": NEUTRAL_DOMAINS_ENABLED,
+        "sdkInt": &android.sdk_int,
+        "brand": &android.brand,
     })
     .to_string()
 }
@@ -587,45 +824,28 @@ struct AtopResponse {
 
 /// POST a signed atop request and parse the response envelope.
 ///
-/// The atop gateway takes the signed params as the URL query string and the RAW
-/// `postData` as a form body. We use reqwest BLOCKING (no async runtime) over
-/// HTTPS (rustls). A timeout bounds the single call. No secret is logged.
+/// The SDK posts to `/api.json` with no query string; `ApiParams.getRequestBody()`
+/// returns a form body containing encrypted `postData`, `sign`, and the params
+/// commonly described as the envelope (`a`, `v`, `clientId`, `time`, etc.). We use
+/// reqwest BLOCKING (no async runtime) over HTTPS (rustls). No secret is logged.
 fn send_atop(
     client: &reqwest::blocking::Client,
     host: &str,
     cfg: &LiveConfig,
-    envelope: &BTreeMap<String, String>,
-    post_data: &str,
+    params: &BTreeMap<String, String>,
+    wire_post_data: &str,
 ) -> Result<AtopResponse, LiveError> {
     let url = format!("https://{host}{ATOP_PATH}");
 
-    // Query = the signed envelope (everything EXCEPT the raw postData body).
-    let query: Vec<(String, String)> = envelope
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-
-    // Form body. App-faithful: `ApiParams.getRequestBody()` puts BOTH `postData`
-    // AND `deviceId` (KEY_DEVICEID="deviceId") into the request body
-    // (`decompiled/.../ApiParams.java:87-89`), even though `deviceId` ALSO rides
-    // the signed URL query (`ApiParams.java:227`, which our envelope already
-    // covers). We mirror that: `deviceId` is added to the body here, while
-    // remaining in the signed query envelope. The sign canonical string is
-    // UNCHANGED — `deviceId` is already a SIGN_WHITELIST param signed from the
-    // envelope map; the wire body form is never part of the sign input. The
-    // body's `deviceId` value is the SAME per-install handle as the envelope's.
-    let mut body_form = format!("postData={}", urlencode(post_data));
-    if let Some(device_id) = envelope.get("deviceId") {
-        body_form.push_str(&format!("&deviceId={}", urlencode(device_id)));
-    }
+    let body_form = form_body(params, wire_post_data);
 
     let mut req = client
         .post(&url)
-        .query(&query)
         .header(
             reqwest::header::CONTENT_TYPE,
             "application/x-www-form-urlencoded",
         )
+        .header(reqwest::header::CONNECTION, "keep-alive")
         .body(body_form);
 
     // App-faithful telemetry header: `OKHttpBusinessRequest` UNCONDITIONALLY adds
@@ -635,12 +855,8 @@ fn send_atop(
     // in our signed envelope, so we reuse that value verbatim. It is a per-request
     // handle, not a secret, but we don't log it. It rides as a request HEADER, not
     // a signed param, so it does not affect the canonical sign string.
-    if let Some(request_id) = envelope.get("requestId") {
+    if let Some(request_id) = params.get("requestId") {
         req = req.header("x-client-trace-id", request_id.clone());
-    }
-
-    if let Some(auth) = &cfg.creds.authorization {
-        req = req.header(reqwest::header::AUTHORIZATION, auth.clone());
     }
 
     let resp = req
@@ -656,9 +872,11 @@ fn send_atop(
     // This is the single source of truth for debugging a routing/sign rejection
     // without ever echoing a value. Overwritten each call (last-call wins).
     {
+        let mut form_param_keys = vec!["postData".to_string()];
+        form_param_keys.extend(params.keys().cloned());
         let dbg = serde_json::json!({
             "host": host,
-            "request_param_keys": envelope.keys().collect::<Vec<_>>(),
+            "form_param_keys": form_param_keys,
             "http_status": status.as_u16(),
             "response_body": text,
         });
@@ -700,7 +918,16 @@ fn send_atop(
     })
 }
 
-/// Minimal application/x-www-form-urlencoded value encoder (no extra dep).
+fn form_body(params: &BTreeMap<String, String>, wire_post_data: &str) -> String {
+    let mut pairs = Vec::with_capacity(params.len() + 1);
+    pairs.push(format!("postData={}", urlencode(wire_post_data)));
+    for (k, v) in params {
+        pairs.push(format!("{}={}", urlencode(k), urlencode(v)));
+    }
+    pairs.join("&")
+}
+
+/// Minimal OkHttp `FormBody.Builder.add` value encoder (no extra dep).
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -708,6 +935,7 @@ fn urlencode(s: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char)
             }
+            b' ' => out.push('+'),
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -1204,7 +1432,7 @@ pub fn run_injected_device_list(
     store: &SessionStore,
 ) -> Result<InjectedOutcome, LiveError> {
     // LOAD the injected session. A corrupt store errors loud (it does NOT mask as
-    // "no session"). No session → honest blocked state, no network touched.
+    // "no session"). No session → honest no-session state, no network touched.
     let session = store
         .load()
         .map_err(|e| LiveError::Config(format!("session store: {e}")))?;
@@ -1242,7 +1470,8 @@ pub fn run_injected_device_list(
     // Build the device.list request carrying the INJECTED sid (signed into the
     // canonical string), send it ONCE. No password.login is performed.
     eprintln!("live: sending ONE device.list with the INJECTED sid (no password.login)...");
-    let (envelope, body) = build_device_list_request(&cfg, &session.sid, sign_body)?;
+    let (envelope, body) =
+        build_device_list_request(&cfg, &session.sid, session.ecode.as_deref(), sign_body)?;
     let resp = send_atop(&client, &host, &cfg, &envelope, &body)?;
     capture_to_secrets(&cfg, "tuya_device_list.json", &resp.raw)?;
     if !resp.success {
@@ -1300,8 +1529,7 @@ pub fn run_live_login(
     // MUST match the SDK's: `Thing-UA=APP/Android/<appVersion>/SDK/<sdkVersion>`
     // (`ThingSmartNetWork.USER_AGENT` = "Thing-UA=APP/Android", appended with
     // `/<appVersion>/SDK/<sdkVersion>` at init; `decompiled/.../ThingSmartNetWork.java`
-    // ~:78/3897). The public atop gateway gates `ILLEGAL_CLIENT_ID` partly on a
-    // recognised app UA, so a generic UA is rejected before the sign is evaluated.
+    // ~:78/3897). Keep it byte-faithful to the SDK request shape.
     let user_agent = format!(
         "Thing-UA=APP/Android/{}/SDK/{}",
         cfg.app_version, THING_SDK_VERSION
@@ -1401,6 +1629,7 @@ fn probe_host(host: &str) -> Result<(), LiveError> {
 fn build_device_list_request(
     cfg: &LiveConfig,
     sid: &str,
+    ecode: Option<&str>,
     sign_body: SignBody,
 ) -> Result<(BTreeMap<String, String>, String), LiveError> {
     let post_data = "{}";
@@ -1416,6 +1645,7 @@ fn build_device_list_request(
         post_data,
         sign_body,
         &extra,
+        ecode,
     )
 }
 
@@ -1432,7 +1662,8 @@ fn fetch_and_capture_device_list(
     sign_body: SignBody,
 ) -> Result<(bool, Option<i32>), LiveError> {
     let sid = user.get("sid").and_then(|v| v.as_str()).unwrap_or("");
-    let (envelope, body) = build_device_list_request(cfg, sid, sign_body)?;
+    let ecode = user.get("ecode").and_then(|v| v.as_str());
+    let (envelope, body) = build_device_list_request(cfg, sid, ecode, sign_body)?;
 
     let resp = send_atop(client, host, cfg, &envelope, &body)?;
     capture_to_secrets(cfg, "tuya_device_list.json", &resp.raw)?;
@@ -1496,13 +1727,12 @@ mod tests {
 
     /// A SYNTHETIC LiveConfig for envelope tests — no real secret. The bmp_token
     /// is a placeholder so signing yields a deterministic value; chKey is a fixed
-    /// synthetic 64-hex.
+    /// synthetic native-shaped 16-hex value.
     fn synthetic_cfg() -> LiveConfig {
         LiveConfig {
             creds: LoginCreds {
                 email: "user@example.com".into(),
                 password: "pw".into(),
-                authorization: None,
             },
             material: SigningKeyMaterial {
                 app_key: "SYNTH_APPKEY_000000".into(),
@@ -1512,22 +1742,32 @@ mod tests {
             },
             bmp_token: "PLACEHOLDER_BMP_TOKEN".into(),
             app_version: "1.9.0".into(),
-            device_id: "0123456789abcdef".into(),
-            ch_key: "cd".repeat(32), // synthetic 64-hex
+            device_id: "0".repeat(44),
+            android: AndroidProfile::default(),
+            ch_key: "cd".repeat(8), // synthetic 16-hex
             secrets_dir: std::env::temp_dir(),
         }
     }
 
-    // AC: chKey MUST be present in BOTH the wire envelope AND the canonical sign
-    // string (it is in SIGN_WHITELIST). Without it the request omits chKey from
-    // both surfaces — the likely ILLEGAL_CLIENT_ID cause. This proves it now
-    // rides both.
-    #[test]
-    fn envelope_carries_chkey_in_wire_and_canonical_sign() {
+    fn canonical_for_params(params: &BTreeMap<String, String>, wire_post_data: &str) -> String {
         use babymonitor_core::sign::{canonical_string, post_data_digest_hex};
 
+        let mut sign_params = params.clone();
+        sign_params.remove("sign");
+        sign_params.insert(
+            "postData".into(),
+            post_data_digest_hex(wire_post_data.as_bytes()).unwrap(),
+        );
+        canonical_string(&sign_params)
+    }
+
+    // AC: chKey MUST be present in BOTH the wire form params AND the canonical sign
+    // string (it is in SIGN_WHITELIST). This proves it rides both the APK-shaped
+    // wire form and canonical string.
+    #[test]
+    fn envelope_carries_chkey_in_wire_and_canonical_sign() {
         let cfg = synthetic_cfg();
-        let (envelope, _body) = build_signed_envelope(
+        let (envelope, body) = build_signed_envelope(
             &cfg,
             TOKEN_GET_ACTION,
             TOKEN_GET_VERSION,
@@ -1536,20 +1776,16 @@ mod tests {
         )
         .expect("envelope build");
 
-        // (1) chKey is on the wire query, with the configured value.
+        // (1) chKey is in the wire form params, with the configured value.
         assert_eq!(
             envelope.get("chKey").map(String::as_str),
             Some(cfg.ch_key.as_str()),
-            "chKey must ride the wire envelope"
+            "chKey must ride the wire form params"
         );
 
         // (2) chKey enters the CANONICAL SIGN STRING. Reconstruct the exact sign
-        // input the builder uses: the envelope (minus the wire-only `sign`) with
-        // postData replaced by its digest, then canonicalize.
-        let mut sign_params = envelope.clone();
-        sign_params.remove("sign");
-        sign_params.insert("postData".into(), post_data_digest_hex(b"{}").unwrap());
-        let canonical = canonical_string(&sign_params);
+        // input the builder uses: params minus `sign`, plus digest(encrypted postData).
+        let canonical = canonical_for_params(&envelope, &body);
         assert!(
             canonical.contains(&format!("chKey={}", cfg.ch_key)),
             "chKey must appear in the canonical sign string; got: {canonical}"
@@ -1572,6 +1808,7 @@ mod tests {
             "sdkVersion",
             "deviceCoreVersion",
             "channel",
+            "nd",
             "osSystem",
             "platform",
             "timeZoneId",
@@ -1585,6 +1822,11 @@ mod tests {
             );
         }
         assert_eq!(envelope.get("cp").map(String::as_str), Some("gzip"));
+        assert_eq!(
+            envelope.get("deviceCoreVersion").map(String::as_str),
+            Some("6.7.0")
+        );
+        assert_eq!(envelope.get("nd").map(String::as_str), Some("1"));
         // TASK-0047: production init routes through the CHANNEL_OEM overload, so
         // the wire channel is "oem", not "sdk".
         assert_eq!(envelope.get("channel").map(String::as_str), Some("oem"));
@@ -1593,6 +1835,13 @@ mod tests {
             envelope.get("appRnVersion").map(String::as_str),
             Some("5.92")
         );
+        let biz_data: serde_json::Value =
+            serde_json::from_str(envelope.get("bizData").expect("bizData value"))
+                .expect("bizData is JSON");
+        assert_eq!(biz_data["customDomainSupport"], "1");
+        assert_eq!(biz_data["nd"], "1");
+        assert_eq!(biz_data["sdkInt"], DEFAULT_SDK_INT);
+        assert_eq!(biz_data["brand"], DEFAULT_BRAND);
     }
 
     // TASK-0047: the wire `ttid` is the rewritten `sdk_<channel>@<appKey>`, NOT
@@ -1662,6 +1911,97 @@ mod tests {
     }
 
     #[test]
+    fn request_shape_uses_uuid_request_id_seconds_time_and_encrypted_form_body() {
+        let cfg = synthetic_cfg();
+        let (params, body) = build_signed_envelope(
+            &cfg,
+            TOKEN_GET_ACTION,
+            TOKEN_GET_VERSION,
+            "{}",
+            SignBody::KeyAndCanonical,
+        )
+        .unwrap();
+
+        let request_id = params.get("requestId").expect("requestId");
+        assert_eq!(request_id.len(), 36);
+        assert_eq!(&request_id[14..15], "4", "UUID version nibble");
+        assert!(
+            matches!(&request_id[19..20], "8" | "9" | "a" | "b"),
+            "UUID variant nibble: {request_id}"
+        );
+        assert_eq!(
+            request_id.chars().filter(|c| *c == '-').count(),
+            4,
+            "UUID string has four hyphens"
+        );
+
+        let time = params.get("time").expect("time");
+        assert_eq!(time.len(), 10, "Java TimeStampManager sends epoch seconds");
+        assert!(time.chars().all(|c| c.is_ascii_digit()));
+
+        assert_ne!(body, "{}", "wire postData is ET=3 encrypted, not raw JSON");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&body)
+            .expect("encrypted postData is standard base64");
+        assert!(
+            decoded.len() >= 12 + 16,
+            "nonce(12) + GCM tag(16) must be present"
+        );
+
+        let form = form_body(&params, &body);
+        assert!(form.starts_with("postData="));
+        assert!(
+            form.contains("platform=Pixel+8+Pro"),
+            "OkHttp FormBody encodes spaces as '+': {form}"
+        );
+        for k in [
+            "sign",
+            "a",
+            "v",
+            "clientId",
+            "time",
+            "requestId",
+            "deviceId",
+            "chKey",
+        ] {
+            assert!(form.contains(&format!("{k}=")), "form missing {k}: {form}");
+        }
+    }
+
+    #[test]
+    fn et3_post_data_matches_java_nonce_prefix_layout() {
+        let cfg = synthetic_cfg();
+        let nonce = [0xa5; 12];
+        let body = encrypt_et3_post_data_with_nonce(
+            &cfg,
+            "trace-id",
+            r#"{"hello":"world"}"#,
+            None,
+            &nonce,
+        )
+        .unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .expect("encrypted postData is standard base64");
+
+        assert_eq!(
+            &decoded[..12],
+            &nonce,
+            "AesGcmUtil.encryptBytes2BytesAppendNonce stores nonce first"
+        );
+        assert!(
+            decoded.len() > 12 + r#"{"hello":"world"}"#.len(),
+            "ciphertext plus GCM tag follows the nonce"
+        );
+    }
+
+    #[test]
+    fn uuid_v4_from_bytes_sets_java_uuid_bits() {
+        let id = uuid_v4_from_bytes([0u8; 16]);
+        assert_eq!(id, "00000000-0000-4000-8000-000000000000");
+    }
+
+    #[test]
     fn rewrite_action_maps_thing_to_smartlife() {
         assert_eq!(
             rewrite_action("thing.m.user.username.token.get"),
@@ -1673,7 +2013,7 @@ mod tests {
 
     #[test]
     fn urlencode_escapes_non_unreserved() {
-        assert_eq!(urlencode("a b{}"), "a%20b%7B%7D");
+        assert_eq!(urlencode("a b{}"), "a+b%7B%7D");
         assert_eq!(urlencode("safe-_.~"), "safe-_.~");
     }
 
@@ -1742,13 +2082,22 @@ mod tests {
     }
 
     #[test]
-    fn derive_device_id_is_stable_and_16_hex() {
-        let a = derive_device_id("SYNTH_APPKEY");
-        let b = derive_device_id("SYNTH_APPKEY");
-        assert_eq!(a, b, "deterministic for the same appKey");
-        assert_eq!(a.len(), 16);
+    fn phone_util_device_id_has_apk_shape() {
+        let a = generate_phone_util_device_id(&AndroidProfile::default());
+        assert_eq!(a.len(), 44);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(derive_device_id("OTHER"), a);
+        let expected_model_brand_prefix =
+            md5_hex_lower(format!("{DEFAULT_BRAND}{DEFAULT_PLATFORM}").as_bytes());
+        assert_eq!(&a[..12], &expected_model_brand_prefix[4..16]);
+    }
+
+    #[test]
+    fn phone_util_random_id_matches_apk_shape() {
+        let id = generate_phone_util_random_id("Pixel 8 Pro");
+        assert_eq!(id.len(), 15);
+        assert!(id[..5].chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(&id[5..11], "Pixel8");
+        assert!(id[11..].chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     // classify_error: a sign-shaped error is the gold negative (SignRejected);
@@ -1824,16 +2173,15 @@ mod tests {
     // with NO network call. The fake sid is obviously-synthetic.
     #[test]
     fn injected_sid_rides_device_list_envelope_and_canonical_sign() {
-        use babymonitor_core::sign::{canonical_string, post_data_digest_hex};
-
         let cfg = synthetic_cfg();
         let fake_sid = "FAKE_INJECTED_SID_0001"; // SYNTHETIC — never a real sid.
 
-        let (envelope, body) = build_device_list_request(&cfg, fake_sid, SignBody::KeyAndCanonical)
-            .expect("device.list request build");
+        let (envelope, body) =
+            build_device_list_request(&cfg, fake_sid, None, SignBody::KeyAndCanonical)
+                .expect("device.list request build");
 
         // (0) It is the device.list action, byte-faithful to the shared constant
-        // (rewritten thing*→smartlife* on the wire), with an empty postData body.
+        // (rewritten thing*→smartlife* on the wire), with encrypted postData.
         assert_eq!(
             envelope.get("a").map(String::as_str),
             Some(rewrite_action(DEVICE_LIST_ACTION).as_str()),
@@ -1843,21 +2191,18 @@ mod tests {
             envelope.get("v").map(String::as_str),
             Some(DEVICE_LIST_VERSION)
         );
-        assert_eq!(body, "{}", "device.list postData body is empty object");
+        assert_ne!(body, "{}", "device.list postData is ET=3 encrypted");
 
-        // (1) The injected sid is on the wire query with its exact value.
+        // (1) The injected sid is in the wire form params with its exact value.
         assert_eq!(
             envelope.get("sid").map(String::as_str),
             Some(fake_sid),
-            "the injected sid must ride the wire envelope"
+            "the injected sid must ride the wire form params"
         );
 
         // (2) The injected sid enters the CANONICAL SIGN STRING (sid is in the
         // whitelist bdpdqbp, re/tuya_sign.md §1) — so the signature covers it.
-        let mut sign_params = envelope.clone();
-        sign_params.remove("sign");
-        sign_params.insert("postData".into(), post_data_digest_hex(b"{}").unwrap());
-        let canonical = canonical_string(&sign_params);
+        let canonical = canonical_for_params(&envelope, &body);
         assert!(
             canonical.contains(&format!("sid={fake_sid}")),
             "injected sid must appear in the canonical sign string; got: {canonical}"
@@ -1875,21 +2220,16 @@ mod tests {
     // proves the sid is genuinely sourced from the injection, not hardcoded.
     #[test]
     fn empty_sid_is_dropped_from_device_list_request() {
-        use babymonitor_core::sign::{canonical_string, post_data_digest_hex};
-
         let cfg = synthetic_cfg();
         let (envelope, _body) =
-            build_device_list_request(&cfg, "", SignBody::KeyAndCanonical).expect("build");
+            build_device_list_request(&cfg, "", None, SignBody::KeyAndCanonical).expect("build");
 
         assert!(
             !envelope.contains_key("sid"),
             "an empty sid must be dropped (pre-login shape), not sent empty"
         );
 
-        let mut sign_params = envelope.clone();
-        sign_params.remove("sign");
-        sign_params.insert("postData".into(), post_data_digest_hex(b"{}").unwrap());
-        let canonical = canonical_string(&sign_params);
+        let canonical = canonical_for_params(&envelope, "");
         assert!(
             !canonical.contains("sid="),
             "empty sid must not enter the canonical sign string; got: {canonical}"
@@ -1900,21 +2240,29 @@ mod tests {
     // input to the keyed sign, not cosmetic). Guards against a regression where
     // the sid is added to the wire but accidentally excluded from the sign input.
     #[test]
-    fn different_injected_sid_changes_the_sign() {
+    fn different_injected_sid_changes_the_canonical_string() {
+        use babymonitor_core::sign::canonical_string;
+
         let cfg = synthetic_cfg();
         let (e1, _) =
-            build_device_list_request(&cfg, "SID_AAAA", SignBody::KeyAndCanonical).unwrap();
+            build_device_list_request(&cfg, "SID_AAAA", None, SignBody::KeyAndCanonical).unwrap();
         let (e2, _) =
-            build_device_list_request(&cfg, "SID_BBBB", SignBody::KeyAndCanonical).unwrap();
+            build_device_list_request(&cfg, "SID_BBBB", None, SignBody::KeyAndCanonical).unwrap();
+        let mut c1_params = e1.clone();
+        let mut c2_params = e2.clone();
+        c1_params.remove("sign");
+        c2_params.remove("sign");
+        c1_params.insert("postData".into(), "SAME_POSTDATA_DIGEST".into());
+        c2_params.insert("postData".into(), "SAME_POSTDATA_DIGEST".into());
         assert_ne!(
-            e1.get("sign"),
-            e2.get("sign"),
-            "a different injected sid must produce a different signature"
+            canonical_string(&c1_params),
+            canonical_string(&c2_params),
+            "a different injected sid must change the canonical string"
         );
     }
 
     // NEGATIVE / honesty: run_injected_device_list with NO session injected must
-    // report the blocked state and touch NO network (it returns BEFORE building
+    // report the no-session state and touch NO network (it returns BEFORE building
     // any HTTP client or making any call). Uses a temp store with no session file.
     #[test]
     fn no_injected_session_reports_blocked_offline() {

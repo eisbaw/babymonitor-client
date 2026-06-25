@@ -13,7 +13,8 @@
 //! - the sorted-whitelist canonical string ([`canonical_string`]) — literal `||`
 //!   join, NOT `&`;
 //! - [`swap_sign_string`] — the 32-char permutation;
-//! - [`post_data_digest`] — `swapSignString(md5AsBase64(body))`;
+//! - [`post_data_digest_hex`] — the live-path `swapSignString(md5_hex(body))`
+//!   fold for `postData`;
 //! - [`md5_hex_lower`] — the keyed-hash primitive is plain **MD5** (NOT
 //!   HMAC-SHA256: MD5 IV constants at `libthing_security.so@0x76c0`,
 //!   `re/tuya_sign_static.md` §3);
@@ -145,8 +146,9 @@ pub fn md5_hex_lower(bytes: &[u8]) -> String {
 }
 
 /// Base64 (standard alphabet, padded) of the raw 16-byte MD5 digest of `bytes`.
-/// This is `MD5Util.md5AsBase64` (`re/tuya_sign.md` §2): the form folded into the
-/// canonical string for the `postData` param.
+/// Kept for the historical `md5AsBase64` ambiguity tests; the live ATOP builder
+/// uses [`post_data_digest_hex`] because the decompiled app path feeds a 32-char
+/// MD5 hex string into `swapSignString`.
 #[must_use]
 pub fn md5_as_base64(bytes: &[u8]) -> String {
     let digest = md5::compute(bytes);
@@ -189,10 +191,12 @@ pub fn post_data_digest(body: &[u8]) -> Result<String, Error> {
 /// the standard Tuya 32-hex MD5 path"). 32 hex chars satisfy `swapSignString`'s
 /// `[0:8]/[8:16]/[16:24]/[24:32]` block permutation exactly.
 ///
-/// This is the variant the live login path (TASK-0042) uses for the `postData`
-/// envelope param, because it is the only one that yields a well-defined input to
-/// `swapSignString`. It is labelled `likely`-correct until a server-accepted live
-/// `sign` confirms it; we expose BOTH forms rather than silently pick one.
+/// This is the variant the live login path uses for the `postData` envelope param,
+/// because the decompiled app path returns a 32-char lowercase MD5 hex string from
+/// the method named `md5AsBase64`, and that is the only form that yields a
+/// well-defined input to `swapSignString`. A fresh server-accepted live `sign`
+/// remains the final parity check; we expose BOTH forms rather than silently pick
+/// one in tests.
 ///
 /// # Errors
 /// [`Error::InvalidSignInput`] only if [`md5_hex_lower`] ever produced a non-32
@@ -678,7 +682,7 @@ pub const APP_PACKAGE_NAME: &str = "com.philips.ph.babymonitorplus";
 ///
 /// ```text
 /// chKey = lowercase_hex( HMAC-SHA256( key   = appId_bytes,
-///                                     msg   = packageName + "_" + certSha256Hex ) )
+///                                     msg   = packageName + "_" + certSha256Hex ) )[8..24]
 /// ```
 ///
 /// where:
@@ -693,8 +697,10 @@ pub const APP_PACKAGE_NAME: &str = "com.philips.ph.babymonitorplus";
 /// The keyed digest is **HMAC-SHA256** (NOT plain MD5 like the request `sign`):
 /// the native algo-descriptor at `0x132fe0` is `{id=6, name="SHA256",
 /// digestSize=0x20, blockSize=0x40}` and the key-setup `FUN_00117780` does the
-/// canonical HMAC ipad(`0x36`)/opad(`0x5c`) pad-XOR. The `_` join byte (`0x5f`)
-/// is written at `getChKey@0x116108`. All STATIC — no runtime/device/cloud input.
+/// canonical HMAC ipad(`0x36`)/opad(`0x5c`) pad-XOR. Ghidra shows the native
+/// function hex-encodes the 32-byte digest, then returns a Java string copied
+/// from byte offset 8, capped at 16 chars. The `_` join byte (`0x5f`) is written
+/// at `getChKey@0x116108`. All STATIC — no runtime/device/cloud input.
 ///
 /// # Static-derivable
 /// Every input is a static, offline-recoverable value (appKey from `secrets/`,
@@ -714,7 +720,35 @@ pub const APP_PACKAGE_NAME: &str = "com.philips.ph.babymonitorplus";
 pub fn ch_key(app_key: &str, package_name: &str, cert_sha256_hex: &str) -> String {
     let message = format!("{package_name}{KEY_PART_SEP}{cert_sha256_hex}");
     let mac = hmac_sha256(app_key.as_bytes(), message.as_bytes());
-    hex::encode(mac)
+    let hex = hex::encode(mac);
+    hex[8..24].to_string()
+}
+
+/// Native `SecureNativeApi.getEncryptoKey(requestId, ecode)` for ET=3 post bodies.
+///
+/// Ghidra export `re/ghidra/getEncryptoKey.c` shows the JNI function calls the same
+/// HMAC-SHA256 helper used by `getChKey`, with:
+/// - HMAC key = `requestId.getBytes()`;
+/// - HMAC message = native cached sign key (`cert "_" bmpToken "_" appSecret`);
+/// - when the second Java arg is non-empty, the message becomes
+///   `cachedKey "_" ecode`;
+/// - return value = a Java byte[16] copied from the first 16 ASCII bytes of the
+///   lowercase hex HMAC digest.
+///
+/// This function implements that JNI behavior for static clients. For pre-login
+/// login requests (`token.get`, `password.login`) the app sets
+/// `setSessionRequire(false)`, so pass `None` for `ecode`.
+#[must_use]
+pub fn et3_encrypto_key(request_id: &str, cached_key: &str, ecode: Option<&str>) -> [u8; 16] {
+    let message = match ecode.filter(|s| !s.is_empty()) {
+        Some(ecode) => format!("{cached_key}{KEY_PART_SEP}{ecode}"),
+        None => cached_key.to_string(),
+    };
+    let mac = hmac_sha256(request_id.as_bytes(), message.as_bytes());
+    let mac_hex = hex::encode(mac);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&mac_hex.as_bytes()[..16]);
+    out
 }
 
 /// HMAC-SHA256 over the `sha2` primitive (no extra `hmac` dependency).
@@ -1211,10 +1245,10 @@ mod tests {
     }
 
     // chKey composition: with SYNTHETIC inputs, the recovered pipeline
-    // (HMAC-SHA256(key=appId, msg=packageName_"_"_certHex) → hex) must equal an
-    // INDEPENDENT recomputation. This pins the key/message ordering recovered
-    // from getChKey@0x16000 (appId is the HMAC KEY; packageName_cert is the
-    // MESSAGE — re/chkey_static.md §1).
+    // (HMAC-SHA256(key=appId, msg=packageName_"_"_certHex) → hex[8..24]) must
+    // equal an INDEPENDENT recomputation. This pins the key/message ordering and
+    // native substring behavior recovered from getChKey@0x16000 (appId is the
+    // HMAC KEY; packageName_cert is the MESSAGE).
     #[test]
     fn ch_key_composes_hmac_over_packagename_cert() {
         let app_key = "SYNTH_APPKEY_000000";
@@ -1222,13 +1256,13 @@ mod tests {
         let cert = "ab".repeat(32); // synthetic 64-hex
         let got = ch_key(app_key, pkg, &cert);
 
-        // INDEPENDENT: HMAC-SHA256(key=appId, msg=pkg + "_" + cert), hex.
-        let expected = hex::encode(hmac_sha256(
+        // INDEPENDENT: HMAC-SHA256(key=appId, msg=pkg + "_" + cert), hex[8..24].
+        let full = hex::encode(hmac_sha256(
             app_key.as_bytes(),
             format!("{pkg}_{cert}").as_bytes(),
         ));
-        assert_eq!(got, expected);
-        assert_eq!(got.len(), 64, "chKey is SHA-256 → 64 hex chars");
+        assert_eq!(got, full[8..24]);
+        assert_eq!(got.len(), 16, "native getChKey returns hex_hmac[8..24]");
         assert!(got
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
@@ -1246,6 +1280,34 @@ mod tests {
             b"APPID",
         ));
         assert_ne!(correct, swapped);
+    }
+
+    #[test]
+    fn et3_encrypto_key_matches_native_hmac_shape() {
+        let request_id = "REQ-123";
+        let cached_key = "cert_bmp_secret";
+
+        // Native getEncryptoKey returns Java byte[16] copied from the first 16
+        // ASCII bytes of lowercase hex(HMAC-SHA256(key=requestId, msg=cachedKey)).
+        let expected_hex = hex::encode(hmac_sha256(request_id.as_bytes(), cached_key.as_bytes()));
+        let got = et3_encrypto_key(request_id, cached_key, None);
+        assert_eq!(&got, &expected_hex.as_bytes()[..16]);
+        assert!(got.iter().all(u8::is_ascii_hexdigit));
+    }
+
+    #[test]
+    fn et3_encrypto_key_appends_ecode_when_present() {
+        let request_id = "REQ-123";
+        let cached_key = "cert_bmp_secret";
+        let ecode = "ECODE";
+
+        let no_ecode = et3_encrypto_key(request_id, cached_key, None);
+        let with_ecode = et3_encrypto_key(request_id, cached_key, Some(ecode));
+        assert_ne!(no_ecode, with_ecode, "ecode changes the native message");
+
+        let msg = format!("{cached_key}_{ecode}");
+        let expected_hex = hex::encode(hmac_sha256(request_id.as_bytes(), msg.as_bytes()));
+        assert_eq!(&with_ecode, &expected_hex.as_bytes()[..16]);
     }
 
     // The default package name constant matches the manifest `package=`.

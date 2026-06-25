@@ -5,23 +5,22 @@
 //!
 //! - `auth status` / `auth logout` — work fully OFFLINE against the on-disk
 //!   [`SessionStore`] (no network).
-//! - `auth login` — **blocked by a server-side identity gate**: a from-scratch
-//!   static client cannot obtain a session. Tuya rejects `token.get` with
-//!   `ILLEGAL_CLIENT_ID` at the client-identity layer, *before* it ever evaluates
-//!   our request signature — proven sign-insensitive by a corrupted-sign
-//!   differential (TASK-0050) and host-exhausted (TASK-0048/0051). `login` reports
-//!   that honestly and NEVER fabricates a session. The client is nonetheless
-//!   **token-injectable**: supply one captured live session (TASK-0022) and the
-//!   same code path runs for real (see the top-level README §6).
+//! - `auth login` — offline status only. The previous identity-gate conclusion is
+//!   superseded: the APK sends encrypted `postData` and signed ATOP params in the
+//!   form body, not signed params in the URL query. `auth live-login` is the gated
+//!   network path that can perform a fresh authorized probe; `auth login` never
+//!   fabricates a session. The client is still **token-injectable**: supply one
+//!   captured live session (TASK-0022) and the same code path runs for real (see
+//!   the top-level README §6).
 //! - `devices list` / `devices show <id>` — parse + display a device list. The
 //!   OFFLINE path reads a response **body** from a `--fixture` file (default: the
 //!   synthetic test fixture) so the model layer is exercised without a network.
 //!   `devices list --live` is the INJECTED-SESSION consumer (TASK-0055): under the
 //!   gated `--features live` build with a captured session in the on-disk store it
 //!   loads the injected `sid` and drives a real signed `device.list` call with it
-//!   (bypassing the blocked `password.login`); with no session injected (or in the
-//!   default non-live build) it reports the honest identity-gate-blocked state and
-//!   touches no network.
+//!   (bypassing login); with no session injected (or in the default non-live
+//!   build) it reports the honest no-session/non-live state and touches no
+//!   network.
 //!
 //! Output policy: every subcommand supports `--json` for machine consumption
 //! alongside the default human text.
@@ -80,14 +79,14 @@ struct Cli {
 enum Command {
     /// Print build/scaffold info. A safe smoke-test target for `just showcase`.
     Info,
-    /// Account session commands (status/logout offline; login is blocked by the
-    /// server-side identity gate).
+    /// Account session commands (status/logout offline; live-login is gated
+    /// network I/O).
     Auth {
         #[command(subcommand)]
         action: AuthAction,
     },
-    /// Device-list commands (offline against a fixture body; live is blocked by
-    /// the server-side identity gate).
+    /// Device-list commands (offline against a fixture body; live consumes an
+    /// injected session under `--features live`).
     Devices {
         #[command(subcommand)]
         action: DevicesAction,
@@ -97,11 +96,9 @@ enum Command {
 /// `auth` subcommands.
 #[derive(Debug, Subcommand)]
 enum AuthAction {
-    /// Attempt account login. BLOCKED by a server-side identity gate: Tuya rejects
-    /// `token.get` with `ILLEGAL_CLIENT_ID` before it evaluates the signature
-    /// (proven sign-insensitive, TASK-0050; host-exhausted, TASK-0048/0051), so a
-    /// from-scratch static client cannot obtain a session. Reports that honestly;
-    /// never fabricates a session. The session slot is injectable (TASK-0022).
+    /// Offline login placeholder. The real network path is `auth live-login`,
+    /// gated behind `--features live`; this command never fabricates a session.
+    /// The session slot is injectable (TASK-0022).
     Login,
     /// Show the on-disk session state (offline; no network).
     Status,
@@ -129,14 +126,14 @@ struct LiveLoginArgs {
     )]
     apk: PathBuf,
     /// Override the atop gateway host (default: the EU mobile gateway). Use to
-    /// pin the appKey's provisioned regional gateway if the default is rejected
+    /// pin the appKey's provisioned regional gateway if a fresh probe is rejected
     /// with ILLEGAL_CLIENT_ID. Network-level routing, not an extra login attempt.
     #[arg(long)]
     host: Option<String>,
     /// PROBE-ONLY (TASK-0048 Stage B): send EXACTLY ONE `token.get` to `--host`
     /// and STOP — never proceed to `password.login`, even on success. Use this to
-    /// sweep the un-tried iotbing/px datacenter gateways for ILLEGAL_CLIENT_ID
-    /// without risking the lockout-sensitive login step.
+    /// sweep datacenter gateways for ILLEGAL_CLIENT_ID without risking the
+    /// lockout-sensitive login step.
     #[arg(long)]
     probe_only: bool,
     /// CORRUPT-SIGN differential (TASK-0050): only meaningful with --probe-only.
@@ -174,11 +171,11 @@ struct DevicesSource {
     /// Consume an INJECTED captured session instead of a fixture (TASK-0055).
     /// Under the gated `--features live` build with a session in the on-disk store,
     /// this LOADS the injected `sid` and drives a real, signed `device.list` atop
-    /// call carrying it — BYPASSING `password.login` (the step the server-side
-    /// identity gate blocks). With NO session injected (or in the default non-live
-    /// build) it reports the honest identity-gate-blocked state and touches no
-    /// network. A from-scratch login cannot create a session (TASK-0050/0051);
-    /// inject a captured one (TASK-0022; README §6) to drive the real read path.
+    /// call carrying it. With NO session injected (or in the default non-live
+    /// build) it reports the honest no-session/non-live state and touches no
+    /// network. Inject a captured session (TASK-0022; README §6), or use
+    /// `auth live-login` after a successful fresh probe, to drive the real read
+    /// path.
     #[arg(long)]
     live: bool,
     /// Reveal secret/PII fields (localKey, p2pKey, …) in the output. OFF by
@@ -230,17 +227,14 @@ fn print_info(json: bool) {
 
     if json {
         println!(
-            "{{\"cli\":\"babymonitor-cli\",\"cli_version\":{},\"core\":{},\"login\":\"blocked\",\"login_blocked_on\":\"identity-gate\"}}",
+            "{{\"cli\":\"babymonitor-cli\",\"cli_version\":{},\"core\":{},\"login\":\"pending-live-retest\",\"login_blocked_on\":null}}",
             json_str(cli_version),
             json_str(&id)
         );
     } else {
         println!("babymonitor-cli {cli_version}");
         println!("core: {id}");
-        println!(
-            "login: blocked (server-side identity gate ILLEGAL_CLIENT_ID; \
-             token-injectable — see README §6)"
-        );
+        println!("login: request-shape corrected; fresh guarded live probe pending");
     }
 }
 
@@ -328,7 +322,7 @@ fn auth_token_get_probe(args: &LiveLoginArgs, json: bool) -> Result<(), Error> {
     };
     // TASK-0050: the corrupted-sign differential. `--corrupt-sign` flips one hex
     // nibble of the signature post-build so we can tell a sign-sensitive reject
-    // (our candidate sign is wrong) from a sign-insensitive identity gate.
+    // (candidate sign/body shape is wrong) from a sign-insensitive upstream gate.
     let corrupt = args.corrupt_sign;
     let variant = if corrupt {
         "corrupt-sign"
@@ -369,33 +363,28 @@ fn auth_token_get_probe(args: &LiveLoginArgs, json: bool) -> Result<(), Error> {
     }
 }
 
-/// The single source of truth for WHY a from-scratch static client cannot log in.
-/// The blocker is NOT a missing sign ingredient: it is a server-side identity gate
-/// that Tuya enforces before it ever evaluates our signature. Proven by a
-/// corrupted-sign differential (TASK-0050: a one-nibble-flipped sign produces the
-/// byte-identical `ILLEGAL_CLIENT_ID`, so the reject precedes sign-verification)
-/// and host-exhausted across every datacenter gateway (TASK-0048/0051).
-const LOGIN_BLOCKED_REASON: &str = "Tuya rejects token.get with a server-side \
-    identity gate (ILLEGAL_CLIENT_ID) before it evaluates the request signature \
-    (proven sign-insensitive, TASK-0050; host-exhausted, TASK-0048/0051); a \
-    from-scratch static client cannot satisfy it. The client is token-injectable: \
-    supply one captured live session (TASK-0022) — see README §6 — to run the \
-    rest of the chain for real.";
+/// The single source of truth for the current login status exposed by the offline
+/// `auth login` command. The earlier identity-gate conclusion is superseded by the
+/// APK request-shape correction in the live builder.
+const LOGIN_STATUS_REASON: &str = "auth login is offline-only in this CLI surface. \
+    The previous ILLEGAL_CLIENT_ID identity-gate verdict is superseded: the live \
+    request builder now matches the APK form-body/encrypted-postData shape and \
+    needs a fresh guarded auth live-login probe.";
 
-/// HONEST login-blocked report. This is NOT a failure of the command — the command
-/// ran and correctly reported that a from-scratch login is not possible against the
-/// server-side identity gate. So it returns `Ok(())` (exit 0) after printing the
-/// blocked state; it never fabricates a session and never claims success.
+/// HONEST login-status report. This is NOT a failure of the command — the command
+/// ran and correctly reported that the offline surface cannot create a session. It
+/// returns `Ok(())` (exit 0) after printing the status; it never fabricates a
+/// session and never claims success.
 fn auth_login(json: bool) -> Result<(), Error> {
     if json {
         println!(
-            "{{\"command\":\"auth login\",\"logged_in\":false,\"status\":\"blocked\",\"reason\":{},\"blocked_on\":\"identity-gate\"}}",
-            json_str(LOGIN_BLOCKED_REASON)
+            "{{\"command\":\"auth login\",\"logged_in\":false,\"status\":\"pending-live-retest\",\"reason\":{},\"blocked_on\":null}}",
+            json_str(LOGIN_STATUS_REASON)
         );
     } else {
-        println!("auth login: NOT logged in — login is blocked by a server-side identity gate.");
-        println!("reason: {LOGIN_BLOCKED_REASON}");
-        println!("Inject a captured live session to use the client (TASK-0022; see README §6).");
+        println!("auth login: NOT logged in — live login needs a fresh guarded probe.");
+        println!("reason: {LOGIN_STATUS_REASON}");
+        println!("Use `auth live-login` under `--features live`, or inject a captured session.");
     }
     Ok(())
 }
@@ -437,9 +426,9 @@ fn auth_status(json: bool) -> Result<(), Error> {
                 println!("auth status: no session stored (not logged in).");
                 println!("store: {path}");
                 println!(
-                    "note: a from-scratch login is blocked by the server-side identity gate \
-                     (ILLEGAL_CLIENT_ID, TASK-0050/0051), so no session is created here. \
-                     Inject a captured session to populate this store (TASK-0022; README §6)."
+                    "note: no session is stored. Run `auth live-login` under `--features live` \
+                     after the fresh probe path is validated, or inject a captured session to \
+                     populate this store (TASK-0022; README §6)."
                 );
             }
         }
@@ -474,7 +463,7 @@ fn run_devices(action: DevicesAction, json: bool) -> Result<(), Error> {
             // `--live` consumes an injected captured session (TASK-0055): under the
             // gated `live` build it LOADS the SessionStore sid and drives a real
             // device.list; without the feature (or with no session injected) it
-            // reports the identity-gate-blocked state honestly. This is the
+            // reports the no-session/non-live state honestly. This is the
             // "token-injectable" consumer the README §6 describes.
             if source.live {
                 return devices_list_live(json);
@@ -501,12 +490,13 @@ fn run_devices(action: DevicesAction, json: bool) -> Result<(), Error> {
 ///
 /// Under the gated `live` build, this LOADS the on-disk [`SessionStore`] sid and
 /// drives a real, byte-faithful `device.list` atop call carrying that sid
-/// (BYPASSING `password.login`, which the server-side identity gate blocks). If no
-/// session is injected it reports the honest blocked state and touches no network.
+/// (BYPASSING login). If no session is injected it reports the honest no-session
+/// state and touches no network.
 ///
 /// In the DEFAULT (non-`live`) build the live network tree is not compiled in, so
-/// it reports the same honest blocked state offline (the `--features live` build is
-/// required to actually send a request — see README §6).
+/// it reports the same honest no-session/non-live state offline (the
+/// `--features live` build is required to actually send a request — see README
+/// §6).
 #[cfg(feature = "live")]
 fn devices_list_live(json: bool) -> Result<(), Error> {
     let secrets_dir = PathBuf::from("secrets");
@@ -551,50 +541,43 @@ fn devices_list_live(json: bool) -> Result<(), Error> {
 }
 
 /// `devices list --live` in the DEFAULT (non-`live`) build: the live network tree
-/// is not compiled in, so report the honest identity-gate-blocked state offline.
-/// To actually consume an injected session, build with `--features live`.
+/// is not compiled in, so report the honest non-live/no-session state offline. To
+/// actually consume an injected session, build with `--features live`.
 #[cfg(not(feature = "live"))]
 fn devices_list_live(json: bool) -> Result<(), Error> {
     live_device_list_blocked(json);
     Ok(())
 }
 
-/// Print the honest `--live` blocked report (no session injected / non-live build).
+/// Print the honest `--live` report (no session injected / non-live build).
 /// `Ok`-status report (the command ran correctly); never fabricates a list.
 fn live_device_list_blocked(json: bool) {
     if json {
         println!(
-            "{{\"command\":\"devices list --live\",\"fetched\":false,\"status\":\"blocked\",\"blocked_on\":\"identity-gate\",\"reason\":{}}}",
-            json_str(LOGIN_BLOCKED_REASON)
+            "{{\"command\":\"devices list --live\",\"fetched\":false,\"status\":\"no-session\",\"blocked_on\":\"missing-session\",\"reason\":{}}}",
+            json_str(LOGIN_STATUS_REASON)
         );
     } else {
         println!(
-            "devices list --live: NOT fetched — no injected session and a from-scratch login is \
-             blocked by the server-side identity gate."
+            "devices list --live: NOT fetched — no injected session is stored for the live read path."
         );
-        println!("reason: {LOGIN_BLOCKED_REASON}");
+        println!("reason: {LOGIN_STATUS_REASON}");
         println!(
-            "Inject a captured live session into the session store (TASK-0022; see README §6), then \
-             re-run with `--features live` to drive the real device.list."
+            "Inject a captured live session into the session store (TASK-0022; see README §6), \
+             then re-run with `--features live` to drive the real device.list."
         );
     }
 }
 
 /// Resolve the device-list body, then parse it.
 ///
-/// `--live` is blocked: a real fetch needs an authenticated session, which the
-/// server-side identity gate prevents a from-scratch client from obtaining
-/// (ILLEGAL_CLIENT_ID, TASK-0050/0051). It threads through the same signer gate as
-/// the core and surfaces [`Error::BmpTokenPending`] without touching the network
-/// (the signer's un-validated 6th ingredient is its first stop; either way no
-/// session, no fetch). Otherwise the body is read from `--fixture` (default: the
-/// synthetic fixture).
+/// `--live` needs an authenticated session. Without one, the CLI reports an
+/// honest no-session state instead of fabricating a response. Otherwise the body
+/// is read from `--fixture` (default: the synthetic fixture).
 fn load_device_list(source: &DevicesSource) -> Result<DeviceList, Error> {
     if source.live {
-        // No network is touched: a from-scratch client has no session (server-side
-        // identity gate), so there is nothing to fetch. Surface the honest blocked
-        // state. This keeps the "live" wiring real and reviewable without
-        // fabricating a response.
+        // No network is touched without a session. Surface the honest status; keep
+        // the live wiring real and reviewable without fabricating a response.
         return live_device_list();
     }
     let path = source
@@ -606,12 +589,11 @@ fn load_device_list(source: &DevicesSource) -> Result<DeviceList, Error> {
     device::parse_device_list(&body)
 }
 
-/// The live fetch path: blocked, makes no live call. A real fetch needs an
-/// authenticated session that the server-side identity gate denies a from-scratch
-/// client (ILLEGAL_CLIENT_ID, TASK-0050/0051). Uses the default [`PendingBmpToken`]
-/// so it returns [`Error::BmpTokenPending`] the instant a signature would be
-/// required (the signer's un-validated 6th ingredient — NOT the login blocker). The
-/// real fetch runs the moment a captured session is injected (TASK-0022).
+/// The default-build live fetch path: makes no live call. A real fetch needs an
+/// authenticated session and the `live` feature. Uses the default
+/// [`PendingBmpToken`] so it returns [`Error::BmpTokenPending`] the instant a
+/// signature would be required in non-live builds. The real fetch runs the moment
+/// a captured session is injected under `--features live` (TASK-0022).
 fn live_device_list() -> Result<DeviceList, Error> {
     use babymonitor_core::sign::{PendingBmpToken, SigningKeyMaterial};
     // Placeholder material: never read from secrets here, never used to sign

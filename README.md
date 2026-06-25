@@ -5,20 +5,15 @@ Avent "Baby Monitor+", hardware **SCD921 / SCD923**) deeply enough to reimplemen
 software second-screen client in Rust — focused on the two hardest parts: the **live
 video/audio stream** and the **account/device authentication**.
 
-**Status:** the pure-static reverse engineering is **complete and exhausted**; the
-protocol is mapped end-to-end and a tested Rust client is built against it. The wall
-is **not** a missing piece of static analysis — it is a **server-side identity gate**:
-the Tuya cloud rejects a from-scratch client's login at the **client-identity layer,
-before it ever evaluates our request signature** (proven by a controlled
-corrupted-sign differential, TASK-0050). This binds the provisioned `appKey` to the
-genuine packaged app in a way a standalone static client cannot reproduce — see
-[the blocker](#3-the-real-blocker-a-server-side-appkeyapp-binding-proven-sign-insensitive)
-below. **Actually viewing the baby is therefore blocked** (not just login): the video
-path is cloud-brokered and needs an authenticated session. The Rust client is
-**token-injectable but cannot log in or stream on its own today**, and says so
-honestly everywhere — it never fabricates a session or a frame. **One on-device
-capture** (excluded here by the static-only constraint) unblocks the whole chain — see
-[§6](#6-the-single-unblock-one-on-device-capture).
+**Current auth correction (2026-06-25):** the earlier "pure-static auth is
+exhausted / proven identity gate" conclusion is now **superseded**. A fresh static
+review found that the Rust live client did **not** match the APK's login request
+shape: the app posts all signed params in the form body, encrypts `postData` with
+ET=3 AES-GCM before signing, uses epoch-second `time`, and uses UUID-shaped
+`requestId`. The Rust live path has been corrected to build that Java-shaped
+request. A fresh guarded live `token.get` probe is still pending, so do not treat the
+older TASK-0050/0051 `ILLEGAL_CLIENT_ID` differential as proof of an app-attestation
+wall.
 
 ## Scope / authorized use
 
@@ -116,76 +111,43 @@ on-wire identity fields are `ttid = sdk_international@<appKey>` and `channel = o
 note: an **already-paired** camera needs no pairing — only login + device-list +
 camera-config).
 
-> **On the `bmp_token` (the sixth sign ingredient):** it is decoded from
-> `assets/t_s.bmp` by an imath-bignum + Vandermonde-matrix routine
-> (`libthing_security_algorithm.so`) that has been **ported byte-exact**, but the
-> decode also keys off a **runtime JNI SDK-config `byte[]`** (not a static asset), so
-> the production token is not computable under static analysis alone
-> (`re/bmp_token_whitebox.md` §9). **This does not block login.** The TASK-0050
-> corrupted-sign differential (§3) proved the gateway rejects **before** it evaluates
-> the signature at all — so even a perfect `bmp_token` would still hit
-> `ILLEGAL_CLIENT_ID`. The token stays an honest, un-validated candidate the signer
-> carries in an injectable slot; it would only become testable once the identity gate
-> is cleared.
+> **On the `bmp_token` (the sixth sign ingredient):** it remains a real signer input
+> carried by the client in an injectable slot. The prior conclusion that login
+> rejected before signature verification is superseded by the request-shape mismatch:
+> the old probes did not send the APK's encrypted form-body shape, so they cannot
+> prove `bmp_token` irrelevant. The native/JNI key material is now treated as
+> statically reproducible unless a fresh APK-shaped probe proves otherwise.
 
-## 3. The real blocker: a server-side appKey↔app binding (proven sign-insensitive)
+## 3. Current auth status: APK-shaped static login pending fresh probe
 
-The wall is **not** a missing static ingredient. It is a **server-side identity /
-provisioning gate**: the Tuya atop gateway rejects a from-scratch client's
-`token.get` with `ILLEGAL_CLIENT_ID` ("Invalid client;No access") at the
-**client-identity layer, before it ever evaluates our signature**. A standalone
-static client cannot clear it from the recovered material alone. This is the
-reviewer-confirmed central constraint of the project, and it is now **proven**, not
-assumed. The proof chain (all in `re/live_login.md` unless noted):
+The previous "server-side appKey↔app binding" conclusion was based on probes that
+were not byte-faithful to the APK request. Static review of the Java and native path
+found four load-bearing mismatches in the Rust live client:
 
-1. **The appKey is the real provisioned identity, not a wrong/demo key**
-   (TASK-0046, `re/identity_enumeration.md`). R8 **inlined** the exact appKey literal
-   into the production launcher's SDK-init (`SmartApplication.e()`), and
-   `com.thingclips.sample` is Philips' **own** app module
-   (`BuildConfig.APPLICATION_ID = com.philips.ph.babymonitorplus`). There is no
-   encrypted or alternate appKey anywhere in the DEX or native libs. So
-   `ILLEGAL_CLIENT_ID` is **not** a mis-extracted-key problem.
+1. The APK posts **all** ATOP params as `application/x-www-form-urlencoded` fields;
+   `ThingApiParams.getRequestUrl()` supplies an empty query map.
+2. `postData` is ET=3 AES-GCM encrypted before signing and before it is sent on the
+   wire.
+3. `time` is epoch seconds, not milliseconds.
+4. `requestId` is UUID-shaped and is also sent as `x-client-trace-id`.
 
-2. **The reject is sign-INSENSITIVE — it precedes signature verification**
-   (TASK-0050, the decisive differential). The fully-signed `token.get` was sent
-   twice to the **same** host, byte-identical **except** the `sign` value, which the
-   second probe corrupted by flipping exactly one hex nibble (still well-formed
-   32-char lowercase hex, so the gateway parses it and would reach sign-verification).
-   The two responses were **byte-for-byte identical** `ILLEGAL_CLIENT_ID`. A wrong
-   signature changes **nothing** ⇒ the gateway rejects on **client identity before it
-   reads the sign**. This is a controlled A/B differential (the corrupted variant is
-   the negative control), so the verdict is `confirmed`, not a single opaque capture.
-   **Corollary:** this also proves the `bmp_token`/MD5-fold is **not** the blocker —
-   re-attacking the token decode would not move `ILLEGAL_CLIENT_ID`.
+That means the older corrupted-sign differential (TASK-0050) and "final wire diffs"
+task (TASK-0051) were testing the wrong envelope. They remain useful history, but
+they no longer prove a permanent app-attestation or client-identity wall.
 
-3. **Every datacenter gateway rejects, including the newer iotbing cloud**
-   (TASK-0048, `re/regions_decrypt.md`). The EU regionConfig was decrypted offline
-   (pure-Java AES-256-CTR) and its full **24-field** host list enumerated — correcting
-   an earlier 2-of-22 false-exhaustion. The legacy `a1.tuyaeu/us.com` gateways **and**
-   the iotbing `apigw-eu.iotbing.com` / `a1-us.iotbing.com` gateways all return the
-   same `ILLEGAL_CLIENT_ID`. So it is **not** a wrong-datacenter-host problem.
+What is still known:
 
-4. **Every statically-derivable wire field was matched, and it still rejects**
-   (TASK-0051). The last wire differences were closed — corrected
-   `ttid = sdk_international@<appKey>`, `channel = oem`, `appRnVersion`, the
-   `x-client-trace-id` request header, and the body `deviceId` — and the gateway
-   returned the **identical** `ILLEGAL_CLIENT_ID`. Separately, there is **no**
-   `SafetyNet | Play Integrity | attest` attestation code anywhere in the app
-   (a whole-tree grep is empty; the captcha/`verifyToken` machinery is a different
-   service that gates code-sending, not `token.get` — `re/tuya_cloud_auth.md` §8).
+1. The appKey is the real provisioned identity, not a demo key (TASK-0046,
+   `re/identity_enumeration.md`).
+2. Region hosts have been broadly enumerated (TASK-0048, `re/regions_decrypt.md`).
+3. The current Rust live builder now mirrors the APK's form-body/encrypted-postData
+   path and needs one fresh guarded `token.get` probe before login can be called
+   open or blocked.
 
-**Conclusion (confirmed):** `ILLEGAL_CLIENT_ID` is a **server-side appKey↔app
-binding** — a provisioning / package / app-cert / attestation check enforced at the
-identity layer — that a from-scratch static client cannot reproduce. The static
-cloud-login avenue is **airtight-exhausted**: every reachable host, header, identity
-field, and the signature itself have been matched to the app, and the gateway still
-refuses the client. There is no further static field to add. Unblocking now requires
-**one piece of on-device evidence** (§6), not more static analysis.
-
-### What this blocks: the whole goal, not just login
+### What remains blocked without auth: the whole live stream
 
 This is **not** "you cannot log in but could still stream." There is **no working
-video under static-only**:
+video until the client has an authenticated session:
 
 - The video transport is **cloud-brokered WebRTC-over-MQTT**: the 302 signaling
   envelope rides Tuya's MQTT brokers (`User.domain.mobile*MqttUrl`,
@@ -196,8 +158,9 @@ video under static-only**:
   carries device datapoints (DPs), **not** an A/V media stream. It is not an
   alternative way to view the camera.
 
-So clearing the identity gate is a hard prerequisite for the project's actual goal
-(seeing the baby), not merely for a green `auth status`.
+So either a working APK-shaped login or an injected captured session is a hard
+prerequisite for the project's actual goal (seeing the baby), not merely for a green
+`auth status`.
 
 ## 4. What the Rust client does — and does not do
 
@@ -212,24 +175,25 @@ So clearing the identity gate is a hard prerequisite for the project's actual go
 - `babymonitor-cli` — a CLI viewer with `auth` and `devices` subcommands, human + `--json`
   output, and secret/PII fields redacted by default.
 
-It is **complete and token-injectable but CANNOT log in on its own** (the server-side
-identity gate, §3) and so cannot stream unattended today. `auth login` and any live
-fetch **honestly report that login is not available** rather than fabricate a session.
-The session-token slot is **injectable, and the consumer is wired**: `devices list
---live` (gated `--features live`, TASK-0055) **loads an injected `sid`** from the
-on-disk session store and drives a byte-faithful, signed `device.list` request with
-it — **bypassing `password.login`** (the blocked step). With no session injected it
-reports the blocked state honestly. The wiring is test-backed offline
+It is **complete and token-injectable**, and the live login request shape has now been
+corrected, but it still needs a fresh guarded live probe before we can claim login
+works. `auth login` is an offline status command; `auth live-login` is the gated
+network path. The session-token slot is **injectable, and the consumer is wired**:
+`devices list --live` (gated `--features live`, TASK-0055) **loads an injected `sid`**
+from the on-disk session store and drives a byte-faithful, signed `device.list`
+request with it. With no session injected it reports the no-session state honestly.
+The wiring is test-backed offline
 (`injected_sid_rides_device_list_envelope_and_canonical_sign`, no network), and the
 `#[ignore]`d live end-to-end test asserts the honest pending state for the full
-stream. So given one captured live `sid` (§6), the read path runs for real.
+stream. So given one captured live `sid` (§6), or a successful fresh `auth live-login`,
+the read path can run for real.
 
 Build and run (from the repo root, inside the nix shell):
 
 ```sh
 nix-shell --run 'just build'                      # compile the workspace
 nix-shell --run 'just e2e'                         # build + test + clippy -D + fmt-check + stub-grep + offline checks
-nix-shell --run 'just run -- auth login'        # shows the honest "cannot log in" state
+nix-shell --run 'just run -- auth login'        # offline status; no fabricated session
 nix-shell --run 'just run -- auth status'       # reads/clears the on-disk session store (offline)
 nix-shell --run 'just run -- devices list'      # works against a synthetic fixture
 nix-shell --run 'just showcase'                    # run every read-only CLI command (regression tripwire)
@@ -262,30 +226,27 @@ Tooling:
 > docs note that jadx line hints are approximate and drift between runs; the cited
 > **symbol** is authoritative.)
 
-## 6. The single unblock: one on-device capture
+## 6. Alternate unblock: one injected session
 
-The identity gate (§3) is upstream of everything the static analysis recovered, so
-exactly **one** piece of on-device evidence converts the tested client from
-"token-injectable" to "logs in and streams." This is tracked as **TASK-0022** and is
-deliberately **out of scope** for this static-only project — it is documented here so a
-follow-up with a rooted/owned device can finish the chain.
+A fresh APK-shaped login probe is the direct static path. Separately, exactly **one**
+captured session converts the tested client from "token-injectable" to "can drive the
+read path" without solving login first. This is tracked as **TASK-0022** and remains
+useful because the device-list and streaming credentials ride the authenticated
+session.
 
-**What one capture yields.** A single Frida hook or mitmproxy capture of the **genuine
-app** making one authenticated request on the owner's own device gives both halves the
-static client cannot synthesize:
+**What one capture yields.** A single authorized extraction from the genuine app on
+the owner's own device can provide:
 
-1. **The identity element** the gateway binds the `appKey` to — i.e. exactly what makes
-   the genuine app's `token.get` pass `ILLEGAL_CLIENT_ID` (the provisioning header /
-   app-attestation value / cert-pinned channel param). This is what §3 proves is
-   missing and unreproducible statically.
-2. **A live session token** — the `sid` (plus `uid` and the resolved
+1. **A live session token** — the `sid` (plus `uid` and the resolved
    `User.domain.mobileApiUrl`) issued by a real login. The `sid` is the bearer for
    every subsequent atop call **and** for the MQTT broker connection that carries the
    WebRTC 302 signaling.
+2. If the fresh APK-shaped static probe still fails, any extra app/runtime identity
+   element the genuine app presents can be compared against the static request.
 
-Either alone is useful; a captured `sid` is enough to drive the **read path**
-(device-list → camera-config → MQTT signaling) without solving the login identity gate
-at all, because the client's session slot is injectable.
+A captured `sid` is enough to drive the **read path** (device-list → camera-config →
+MQTT signaling) without solving login first, because the client's session slot is
+injectable.
 
 **How to use a captured `sid` with the client.** The client persists a session as JSON
 (`sid`, `uid`, `mobile_api_base`, `expires_at`) in the on-disk **session store** — the
@@ -313,11 +274,10 @@ same file `auth status` reads. To validate the full chain end-to-end:
    With a session in the store this **loads the injected `sid`**, builds a
    byte-faithful signed `device.list` atop request carrying that `sid` (folded into
    the envelope BEFORE signing, so it enters the canonical sign string — `sid` is in
-   the sign whitelist, `re/tuya_cloud_auth.md` §3a), and sends ONE call —
-   **bypassing `password.login`** entirely (the step the identity gate blocks). It
-   reports SHAPE only (`camera_found`, `p2p_type`); the raw response is captured to
+   the sign whitelist, `re/tuya_cloud_auth.md` §3a), and sends ONE call. It reports
+   SHAPE only (`camera_found`, `p2p_type`); the raw response is captured to
    gitignored `secrets/`. With NO session injected (or in the default non-`live`
-   build) it reports the honest identity-gate-blocked state and touches no network.
+   build) it reports the honest no-session/non-live state and touches no network.
    The wiring is proven by the offline test
    `injected_sid_rides_device_list_envelope_and_canonical_sign`
    (`babymonitor-cli/src/live.rs`), which asserts the injected `sid` rides the wire

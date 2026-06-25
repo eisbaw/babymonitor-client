@@ -3,13 +3,13 @@
 //! The mobile login flow has **no OAuth refresh-token rotation**: the session is
 //! the `User.sid` issued by the login response, and on session-invalid the client
 //! RE-LOGINS (`re/tuya_cloud_auth.md` §3). So this store persists the issued
-//! session (`sid`, `uid`, region domain base, and an expiry) to disk and answers
-//! one question the caller needs before every request: *does this session need a
-//! refresh (re-login) before I use it?* — [`Session::needs_refresh`].
+//! session (`sid`, `uid`, optional `ecode`, region domain base, and an expiry) to
+//! disk and answers one question the caller needs before every request: *does this
+//! session need a refresh (re-login) before I use it?* — [`Session::needs_refresh`].
 //!
 //! Persistence target: `~/.local/share/babymonitor/session.json` (XDG data dir
 //! via the `dirs` crate), mirroring the app's on-device MMKV `User` JSON
-//! (`re/tuya_cloud_auth.md` §3). The `sid`/`uid` are **secrets** (CLAUDE.md):
+//! (`re/tuya_cloud_auth.md` §3). The `sid`/`uid`/`ecode` are **secrets** (CLAUDE.md):
 //! this module writes them to the gitignored data dir, never a tracked file, and
 //! redacts them from `Debug`.
 //!
@@ -39,6 +39,10 @@ pub struct Session {
     pub sid: String,
     /// Account user id (`User.uid`). SECRET (account-linked PII).
     pub uid: String,
+    /// User encryption code (`User.ecode`) used by native `getEncryptoKey` on
+    /// session-required encrypted requests. SECRET when present.
+    #[serde(default)]
+    pub ecode: Option<String>,
     /// Datacenter mobile API base URL (`User.domain.mobileApiUrl`), runtime-
     /// resolved at login. Not a secret, but account/region-revealing.
     pub mobile_api_base: String,
@@ -51,11 +55,19 @@ pub struct Session {
 }
 
 impl std::fmt::Debug for Session {
-    /// Redacts `sid`/`uid` so a session never leaks via `{:?}` into logs.
+    /// Redacts `sid`/`uid`/`ecode` so a session never leaks via `{:?}` into logs.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session")
             .field("sid", &"<redacted>")
             .field("uid", &"<redacted>")
+            .field(
+                "ecode",
+                &self
+                    .ecode
+                    .as_ref()
+                    .map(|_| "<redacted>")
+                    .unwrap_or("<none>"),
+            )
             .field("mobile_api_base", &self.mobile_api_base)
             .field("issued_at", &self.issued_at)
             .field("expires_at", &self.expires_at)
@@ -181,6 +193,7 @@ mod tests {
             // SYNTHETIC values only — never a real sid/uid.
             sid: "SYNTH_SID_0000".into(),
             uid: "SYNTH_UID_0000".into(),
+            ecode: Some("SYNTH_ECODE_0000".into()),
             mobile_api_base: "https://example.invalid/api".into(),
             issued_at: issued,
             expires_at: issued + Duration::minutes(ttl_minutes),
@@ -205,6 +218,7 @@ mod tests {
         let loaded = store.load().unwrap().expect("session present after save");
         assert_eq!(loaded.sid, s.sid);
         assert_eq!(loaded.uid, s.uid);
+        assert_eq!(loaded.ecode, s.ecode);
         assert_eq!(loaded.mobile_api_base, s.mobile_api_base);
         assert_eq!(loaded.expires_at, s.expires_at);
     }

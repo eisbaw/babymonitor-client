@@ -7,7 +7,7 @@
 //!   [`SessionStore`] (no network).
 //! - `auth login` — **token-pending**: the client cannot actually log in yet. A
 //!   valid request signature needs the `bmp_token` decoded from `assets/t_s.bmp`
-//!   (TASK-0030). `login` reports that honestly via
+//!   (TASK-0032). `login` reports that honestly via
 //!   [`babymonitor_core::Error::BmpTokenPending`] and NEVER fabricates a session.
 //! - `devices list` / `devices show <id>` — parse + display a device list. The
 //!   OFFLINE path reads a response **body** from a `--fixture` file (default: the
@@ -81,7 +81,7 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum AuthAction {
     /// Attempt account login. TOKEN-PENDING: the client cannot log in yet — a
-    /// valid sign needs the bmp_token (TASK-0030). Reports the pending state
+    /// valid sign needs the bmp_token (TASK-0032). Reports the pending state
     /// honestly; never fabricates a session.
     Login,
     /// Show the on-disk session state (offline; no network).
@@ -113,7 +113,7 @@ struct DevicesSource {
     fixture: Option<PathBuf>,
     /// Attempt the LIVE cloud fetch instead of a fixture. TOKEN-PENDING: returns
     /// the honest pending state (no network is touched) — a valid sign needs the
-    /// bmp_token (TASK-0030).
+    /// bmp_token (TASK-0032).
     #[arg(long)]
     live: bool,
     /// Reveal secret/PII fields (localKey, p2pKey, …) in the output. OFF by
@@ -172,7 +172,7 @@ fn print_info(json: bool) {
     } else {
         println!("babymonitor-cli {cli_version}");
         println!("core: {id}");
-        println!("login: token-pending (cannot log in yet — bmp_token / TASK-0030)");
+        println!("login: token-pending (cannot log in yet — bmp_token / TASK-0032)");
     }
 }
 
@@ -198,13 +198,13 @@ fn auth_login(json: bool) -> Result<(), Error> {
     let pending = Error::BmpTokenPending.to_string();
     if json {
         println!(
-            "{{\"command\":\"auth login\",\"logged_in\":false,\"status\":\"token-pending\",\"reason\":{},\"blocked_on\":\"TASK-0030\"}}",
+            "{{\"command\":\"auth login\",\"logged_in\":false,\"status\":\"token-pending\",\"reason\":{},\"blocked_on\":\"TASK-0032\"}}",
             json_str(&pending)
         );
     } else {
         println!("auth login: NOT logged in — login is token-pending.");
         println!("reason: {pending}");
-        println!("The client cannot authenticate until the bmp_token is ported (TASK-0030).");
+        println!("The client cannot authenticate until the bmp_token is ported (TASK-0032).");
     }
     Ok(())
 }
@@ -246,7 +246,7 @@ fn auth_status(json: bool) -> Result<(), Error> {
                 println!("auth status: no session stored (not logged in).");
                 println!("store: {path}");
                 println!(
-                    "note: login is token-pending (TASK-0030), so no session can be created yet."
+                    "note: login is token-pending (TASK-0032), so no session can be created yet."
                 );
             }
         }
@@ -319,7 +319,7 @@ fn load_device_list(source: &DevicesSource) -> Result<DeviceList, Error> {
 
 /// The live fetch path: token-pending. Uses the default [`PendingBmpToken`] so it
 /// returns [`Error::BmpTokenPending`] the instant a signature would be required —
-/// it never makes a live call. (When TASK-0030 unblocks signing, the real fetch
+/// it never makes a live call. (When TASK-0032 unblocks signing, the real fetch
 /// is wired here behind a rate-limited/single-shot HTTP client.)
 fn live_device_list() -> Result<DeviceList, Error> {
     use babymonitor_core::sign::{PendingBmpToken, SigningKeyMaterial};
@@ -403,7 +403,7 @@ fn print_device_show(dev: &DeviceBean, json: bool, show_secrets: bool) {
         // fetch is token-pending. We surface the seam honestly rather than
         // pretending we have the P2P handles here.
         println!(
-            "p2p: per-camera CameraInfoBean is fetched separately (token-pending, TASK-0030);"
+            "p2p: per-camera CameraInfoBean is fetched separately (token-pending, TASK-0032);"
         );
         println!("     parse one offline with the core `parse_camera_info` + `CameraView::pair`.");
         let _ = CameraView::pair; // documents the intended composition seam.

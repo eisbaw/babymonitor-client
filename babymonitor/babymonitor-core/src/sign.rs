@@ -21,9 +21,11 @@
 //! - [`app_cert_sha256_hex`] — the app-cert SHA-256, computable **offline** from
 //!   the APK signing cert (`META-INF/*.RSA`).
 //!
-//! Pending (the 6th ingredient, TOKEN-PENDING — `re/bmp_token_decode.md`): the
-//! `bmp_token` decoded from `assets/t_s.bmp` by a native white-box table cipher,
-//! not yet ported. Tracked by **TASK-0030**. Until a [`BmpTokenProvider`] yields
+//! Pending (the 6th ingredient, TOKEN-PENDING — `re/tuya_sign_static.md` §5 +
+//! `re/bmp_token_whitebox.md` §8): the `bmp_token` decoded from `assets/t_s.bmp`
+//! by an imath-bignum + matrix decode (sign path:
+//! `fcn.13b5c` → `read_keys_from_content@0x4974` → matrix `fcn.5eb0`), not yet
+//! ported. Tracked by **TASK-0032**. Until a [`BmpTokenProvider`] yields
 //! it, [`Signer::sign`] returns [`Error::BmpTokenPending`].
 //!
 //! # Honest confidence (per `re/tuya_sign_static.md` §7-8)
@@ -32,10 +34,10 @@
 //! `confirmed` (byte-level disassembly). The exact **order** of the underscore
 //! parts and whether the hash input also folds the canonical string (vs only the
 //! key) are `likely` — read from control-flow shape, not executed. A single
-//! differential vector (which needs the bmp_token, TASK-0030) pins them. This
+//! differential vector (which needs the bmp_token, TASK-0032) pins them. This
 //! module exposes both [`assemble_sign_key`] (the `_`-join, `confirmed`) and the
 //! fold choice as an explicit [`SignBody`] so the disambiguation lands in ONE
-//! place when TASK-0030 unblocks the gold vector — it is NOT silently guessed.
+//! place when TASK-0032 unblocks the gold vector — it is NOT silently guessed.
 
 use std::collections::BTreeMap;
 
@@ -154,7 +156,7 @@ pub fn md5_as_base64(bytes: &[u8]) -> String {
 /// out of range. This means EITHER (a) the digest base64 is *not* the direct
 /// `swapSignString` input here, or (b) `md5AsBase64` uses a no-pad / different
 /// encoding yielding 32, or (c) the slice indices differ for postData. This is
-/// an OPEN ambiguity that a real captured vector (TASK-0030 / live) resolves; we
+/// an OPEN ambiguity that a real captured vector (TASK-0032 / live) resolves; we
 /// surface it by returning the typed error if the length is not 32, rather than
 /// silently producing a wrong digest. Callers that hit this should consult the
 /// gold vector before trusting the output.
@@ -204,7 +206,7 @@ pub fn canonical_string(params: &BTreeMap<String, String>) -> String {
 ///
 /// The **order** of these parts is labelled `likely` in the spec (read from
 /// control flow, not executed); this function encodes that documented order in
-/// one place so a single gold vector (TASK-0030) can correct it if wrong, rather
+/// one place so a single gold vector (TASK-0032) can correct it if wrong, rather
 /// than the order being scattered across call sites.
 #[must_use]
 pub fn assemble_sign_key(cert_sha256_hex: &str, bmp_token: &str, app_secret: &str) -> String {
@@ -480,13 +482,13 @@ impl std::fmt::Debug for Redacted {
 /// Supplies the `bmp_token` decoded from `assets/t_s.bmp` — the single
 /// recovered-but-un-ported sign ingredient.
 ///
-/// This is the **injected seam for TASK-0030**: that task's white-box-cipher
-/// port (or a live-captured vector) implements this trait and plugs in WITHOUT
-/// any change to the signer. A provider returns:
+/// This is the **injected seam for TASK-0032**: that task's imath-bignum +
+/// matrix decode (sign path) port (or a live-captured vector) implements this
+/// trait and plugs in WITHOUT any change to the signer. A provider returns:
 /// - `Ok(token)` — the decoded token string (the second `_`-joined key part); or
 /// - `Err(Error::BmpTokenPending)` — the honest "not available yet" state.
 ///
-/// Feed-forward (TASK-0030): your decoder must satisfy exactly this signature:
+/// Feed-forward (TASK-0032): your decoder must satisfy exactly this signature:
 /// `fn bmp_token(&self) -> Result<String, crate::Error>`. Return the decoded
 /// token on success; return [`Error::BmpTokenPending`] (NOT a panic, NOT a fake
 /// value) while the port is incomplete. The token VALUE must go only to
@@ -503,7 +505,7 @@ pub trait BmpTokenProvider {
 /// A [`BmpTokenProvider`] that always reports the token is pending. This is the
 /// DEFAULT, honest provider for the current (TOKEN-PENDING) state: it makes
 /// [`Signer::sign`] fail fast with [`Error::BmpTokenPending`] instead of
-/// fabricating a signature. Swap it for the real TASK-0030 provider when ready.
+/// fabricating a signature. Swap it for the real TASK-0032 provider when ready.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PendingBmpToken;
 
@@ -514,7 +516,7 @@ impl BmpTokenProvider for PendingBmpToken {
 }
 
 /// A provider wrapping a known token string. Intended for TESTS (with a SYNTHETIC
-/// token) and for TASK-0030 to supply a really-decoded token. Construct via
+/// token) and for TASK-0032 to supply a really-decoded token. Construct via
 /// [`StaticBmpToken::new`].
 #[derive(Clone)]
 pub struct StaticBmpToken(String);
@@ -537,7 +539,7 @@ impl BmpTokenProvider for StaticBmpToken {
 /// Which body the keyed MD5 hashes — the `likely`-confidence fold choice from
 /// `re/tuya_sign_static.md` §7 (`MD5(key)` vs `MD5(key || canonical_string)`).
 ///
-/// We make this EXPLICIT rather than guessing: a caller (or the TASK-0030 gold
+/// We make this EXPLICIT rather than guessing: a caller (or the TASK-0032 gold
 /// vector) selects the variant, and the ambiguity is resolved in exactly one
 /// place. Defaults to [`SignBody::KeyAndCanonical`] because the native code
 /// computes MD5 twice (`re/tuya_sign_static.md` §7), consistent with folding the
@@ -592,13 +594,13 @@ impl<P: BmpTokenProvider> Signer<P> {
     ///
     /// # Errors
     /// - [`Error::BmpTokenPending`] if the injected provider has no token (the
-    ///   honest TOKEN-PENDING state — TASK-0030). This is the CURRENT default
+    ///   honest TOKEN-PENDING state — TASK-0032). This is the CURRENT default
     ///   behaviour with [`PendingBmpToken`].
     /// - any error the provider returns.
     ///
     /// # Honesty
     /// A full, byte-valid signature is NOT yet achievable offline: it requires
-    /// the `bmp_token` (TASK-0030). With [`PendingBmpToken`] this method always
+    /// the `bmp_token` (TASK-0032). With [`PendingBmpToken`] this method always
     /// returns [`Error::BmpTokenPending`] — it never returns a fabricated value.
     pub fn sign(&self, params: &BTreeMap<String, String>) -> Result<String, Error> {
         let canonical = canonical_string(params);
@@ -934,14 +936,14 @@ mod tests {
     }
 
     // FULL byte-for-byte differential (AC#1): blocked on the real bmp_token
-    // (TASK-0030) + an INDEPENDENT gold vector (nalajcie tooling or a single
+    // (TASK-0032) + an INDEPENDENT gold vector (nalajcie tooling or a single
     // live capture). We do NOT fabricate a gold vector. This test is #[ignore]d
-    // and will be filled in when TASK-0030 lands; running it now is honest about
+    // and will be filled in when TASK-0032 lands; running it now is honest about
     // the gap rather than asserting a self-derived (circular) value.
     #[test]
     #[ignore = "AC#1 byte-for-byte sign parity is blocked on the real bmp_token \
-                (TASK-0030) + an INDEPENDENT gold vector; do not fabricate one"]
-    fn full_signature_byte_parity_pending_task_0030() {
+                (TASK-0032) + an INDEPENDENT gold vector; do not fabricate one"]
+    fn full_signature_byte_parity_pending_task_0032() {
         // Intentionally empty: there is NO honest assertion to make until the
         // bmp_token is ported and an independent reference vector exists. A
         // self-derived expectation would be circular (forbidden by TESTING.md

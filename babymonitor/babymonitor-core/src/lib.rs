@@ -16,8 +16,9 @@
 //! ## TOKEN-PENDING honesty
 //!
 //! A *full*, byte-valid signature is blocked on one recovered-but-un-ported
-//! input: the `bmp_token` decoded from `assets/t_s.bmp` by a native white-box
-//! table cipher (see `re/bmp_token_decode.md`, filed as **TASK-0030**). Until a
+//! input: the `bmp_token` decoded from `assets/t_s.bmp` by an imath-bignum +
+//! matrix decode (sign path) (see `re/tuya_sign_static.md` §5 +
+//! `re/bmp_token_whitebox.md` §8, filed as **TASK-0032**). Until a
 //! [`sign::BmpTokenProvider`] supplies that token, [`sign::Signer::sign`] returns
 //! [`Error::BmpTokenPending`] — it NEVER fabricates a signature and NEVER panics.
 //! Every *other* ingredient (canonical string, MD5-hex, `_`-join key assembly,
@@ -50,14 +51,15 @@ pub enum Error {
     NotImplemented(&'static str),
 
     /// The signer has every recovered ingredient EXCEPT the `bmp_token`, which
-    /// is decoded by a native white-box table cipher that is not yet ported
-    /// (see `re/bmp_token_decode.md`; tracked by TASK-0030). This is the honest
+    /// is decoded by an imath-bignum + matrix decode (sign path) that is not yet
+    /// ported (see `re/tuya_sign_static.md` §5 + `re/bmp_token_whitebox.md` §8;
+    /// tracked by TASK-0032). This is the honest
     /// TOKEN-PENDING state: a full valid `sign` cannot be produced until a
     /// [`sign::BmpTokenProvider`] supplies the token. We surface this rather
     /// than fabricating a signature, so callers fail fast and loud.
     #[error(
         "tuya sign is token-pending: bmp_token (decoded from assets/t_s.bmp) is \
-         not yet available — blocked on TASK-0030 (white-box port / live vector)"
+         not yet available — blocked on TASK-0032 (imath+matrix decode un-ported / live vector)"
     )]
     BmpTokenPending,
 

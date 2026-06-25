@@ -37,8 +37,9 @@ nix-shell --run 'just run -- --json auth status'
 ## Login status: TOKEN-PENDING (the client cannot log in yet)
 
 > **The client cannot authenticate yet.** A valid Tuya request signature needs
-> the `bmp_token` decoded from `assets/t_s.bmp` by a native white-box table
-> cipher that is **not yet ported** (tracked as **TASK-0030**). Until then,
+> the `bmp_token` decoded from `assets/t_s.bmp` by an **imath-bignum + matrix
+> decode (on the sign path)** that is **not yet ported** (tracked as
+> **TASK-0032**). Until then,
 > `auth login` and any live cloud fetch **honestly report the token-pending
 > state and never fabricate a session or a response.**
 
@@ -62,7 +63,7 @@ The strongest acceptance signal is a live end-to-end run against the real camera
 `auth login` → `devices list` → find the SCD921. It lives in
 `babymonitor-cli/tests/live_e2e.rs` and is **`#[ignore]`d** so it never runs in
 `just e2e` / CI and makes no network call there. Today, when run manually, it
-asserts the **honest token-pending state**; once **TASK-0030** lands it becomes
+asserts the **honest token-pending state**; once **TASK-0032** lands it becomes
 the real login-and-discover assertion.
 
 To run it manually once login is unblocked (single-shot, rate-limited):

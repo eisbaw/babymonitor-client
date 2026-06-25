@@ -53,7 +53,7 @@
 //! [`parse_device_list`] takes a response **body** (injected bytes) so it is
 //! fully testable offline. A real HTTP fetch is intentionally NOT implemented
 //! here: it is blocked on the same TOKEN-PENDING signer state as TASK-0012 (a
-//! valid `sign` needs the `bmp_token`, TASK-0030). [`list_devices`] therefore
+//! valid `sign` needs the `bmp_token`, TASK-0032). [`list_devices`] therefore
 //! threads the signer/session through and returns [`Error::BmpTokenPending`]
 //! when asked to actually sign — it never makes a live call and never fabricates
 //! a response.
@@ -526,7 +526,7 @@ pub fn parse_camera_info(body: &[u8]) -> Result<CameraInfoBean, Error> {
 /// home-detail request, POST it, and [`parse_device_list`] the response.
 ///
 /// **No live call is made in this task.** A valid `sign` is TOKEN-PENDING (it
-/// needs the `bmp_token`, TASK-0030), so this function threads the signer
+/// needs the `bmp_token`, TASK-0032), so this function threads the signer
 /// through and returns [`Error::BmpTokenPending`] the moment a signature is
 /// required — exactly the TASK-0012 discipline. This keeps the request-decoration
 /// wiring real and reviewable without fabricating a response or hitting the
@@ -621,7 +621,7 @@ mod tests {
     }
 
     // With the default pending token provider, list_devices must NOT touch the
-    // network and must surface the honest TOKEN-PENDING state (TASK-0030), the
+    // network and must surface the honest TOKEN-PENDING state (TASK-0032), the
     // same discipline as the signer.
     #[test]
     fn list_devices_is_token_pending_without_token() {

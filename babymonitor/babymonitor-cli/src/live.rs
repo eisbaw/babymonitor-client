@@ -93,10 +93,26 @@ const SDK_VERSION: &str = THING_SDK_VERSION;
 /// representative default. NOT load-bearing for the gateway client check.
 const DEVICE_CORE_VERSION: &str = THING_SDK_VERSION;
 
-/// `channel` (`"channel"` key) — `ThingSmartNetWork.mChannel`, which defaults to
-/// the literal `"sdk"` (`ThingSmartNetWork.java:89 mChannel = "sdk"` /
-/// `CHANNEL_SDK`) unless the app overrides it at init. We use the SDK default.
-const CHANNEL: &str = "sdk";
+/// `channel` (`"channel"` key) — `ThingSmartNetWork.mChannel`, the channel arg
+/// reaching `ThingSmartNetWork.initialize`. RESOLVED statically (TASK-0047,
+/// `re/tuya_cloud_auth.md` §1b): the production init path
+/// `SmartApplication.e()` → `AppInitializer.d` → `j()` →
+/// `ThingSdk.init(6-arg)` routes through the `CHANNEL_OEM` overload
+/// (`ThingSdk.java:1152-1153`), so `mChannel == "oem"`, NOT `"sdk"`. The earlier
+/// `"sdk"` value was the SDK-internal default of the unused 7-arg overload.
+const CHANNEL: &str = "oem";
+
+/// `appRnVersion` (`KEY_APP_RN_VERSION`) — `ThingSmartNetWork.mAppRNVersion`,
+/// emitted by `initUrlParams` ONLY when non-empty
+/// (`ThingApiParams.java`: `if (!TextUtils.isEmpty(mAppRNVersion))`). RESOLVED
+/// statically (TASK-0048): the production init wires it from `RNAPIUtil.a()`
+/// (`AppInitializer.j` → `ThingSdk.init`), which returns the NON-EMPTY public
+/// build constant `BuildConfig.appRNVersion = "5.92"`
+/// (`com/thingclips/smart/rnplugin/rnpluginapi/BuildConfig.java:8`). So the app
+/// DOES send `appRnVersion=5.92` on the wire — we send it too. Non-secret. (The
+/// app may append `.160` in some branch, `RNAPIUtil.a():226-228`; the base
+/// `5.92` is the documented constant and is what we send.)
+const APP_RN_VERSION: &str = "5.92";
 
 /// `osSystem` (`KEY_OS_SYSTEM`) — `Build.VERSION.RELEASE`, the Android OS
 /// version. Device-specific; we use a plausible modern Android release. Purely
@@ -114,6 +130,18 @@ const TIME_ZONE_ID: &str = "UTC";
 /// `cp` (`KEY_CP`) — set to `VALUE_CP_GZIP="gzip"` whenever `et == "3"`
 /// (`ThingApiParams.initUrlParams` ~:1786-1788). Our `et` is always `3`.
 const CP_GZIP: &str = "gzip";
+
+/// The UMENG channel fingerprint that the wire `ttid` rewrite embeds. RESOLVED
+/// statically (TASK-0047): in `AppInitializer.d`, when `ThingSmartNetWork.mSdk`
+/// is its default `true` (`ThingSmartNetWork.java:103`), the channel arg is
+/// rewritten to `"sdk_" + GlobalConfig.b() + "@" + appKey`
+/// (`AppInitializer.java:334-335`); that rewritten string then lands in the
+/// `mTtid` slot via the `CHANNEL_OEM` init overload (see [`wire_ttid`]).
+/// `GlobalConfig.b()` returns the channel set by `GlobalConfig.d(ctx, c(this), z)`
+/// (`AppInitializer.java:333`, BEFORE the rewrite), and `SmartApplication.c()`
+/// reads the `UMENG_CHANNEL` manifest meta-data =
+/// `"international"` (`AndroidManifest.xml:91`). Non-secret.
+const TTID_CHANNEL_FINGERPRINT: &str = "international";
 
 /// token.get action + version (`re/tuya_cloud_auth.md` §2 step 1). The wire `a`
 /// is the `thing.*`→`smartlife.*`-rewritten form (§1a); we sign over the
@@ -381,7 +409,10 @@ fn build_signed_envelope_with(
     envelope.insert("lang".into(), LANG.into());
     envelope.insert("os".into(), OS_ANDROID.into());
     envelope.insert("appVersion".into(), cfg.app_version.clone());
-    envelope.insert("ttid".into(), cfg.material.ttid.clone());
+    // Wire `ttid` is the rewritten `sdk_<channel>@<appKey>` (TASK-0047), NOT the
+    // raw `cfg.material.ttid` (philipsclnightowl) — see [`wire_ttid`]. `ttid` is
+    // a SIGNED whitelist param, so this value enters the canonical string too.
+    envelope.insert("ttid".into(), wire_ttid(&cfg.material.app_key));
     envelope.insert("clientId".into(), cfg.material.app_key.clone());
     envelope.insert("deviceId".into(), cfg.device_id.clone());
 
@@ -401,6 +432,16 @@ fn build_signed_envelope_with(
     envelope.insert("platform".into(), PLATFORM.into());
     envelope.insert("timeZoneId".into(), TIME_ZONE_ID.into());
     envelope.insert("cp".into(), CP_GZIP.into());
+    // appRnVersion: emitted by initUrlParams iff mAppRNVersion is non-empty; the
+    // app wires it from RNAPIUtil.a() = BuildConfig.appRNVersion ("5.92"), which
+    // IS non-empty, so the app sends it — we match (TASK-0048). Not signed.
+    envelope.insert("appRnVersion".into(), APP_RN_VERSION.into());
+    // bizData: matches initUrlParams (customDomainSupport + sdkInt + brand). NOTE
+    // (TASK-0048): initUrlParams ALSO folds ThingSmartNetWork.getCommonParams()
+    // into BOTH bizData and the top-level params — but `addCommonParams` has NO
+    // caller anywhere in the decompiled app, so mCommonParams is empty at
+    // token.get time and getCommonParams() contributes nothing. We therefore add
+    // no commonParams (adding invented ones would diverge from the app).
     envelope.insert("bizData".into(), build_biz_data());
 
     for (k, v) in extra {
@@ -427,6 +468,23 @@ fn build_signed_envelope_with(
     // for the signature — the RAW body rides as the form body.
     envelope.insert("sign".into(), sign);
     Ok((envelope, post_data.to_string()))
+}
+
+/// Build the wire `ttid` value the app actually sends. RESOLVED statically
+/// (TASK-0047, `re/tuya_cloud_auth.md` §1b): the raw `philipsclnightowl`
+/// ttid/scheme (`R.string.b` / `BuildConfig.THING_SMART_TTID`) is passed to
+/// `AppInitializer.d` as `str3`, but that arg only reaches `UrlRouter.o(str3)`.
+/// The value that reaches `ThingSmartNetWork.mTtid` (→ wire `ttid`) is the
+/// REWRITTEN channel: `d()` sets `str4 = "sdk_" + GlobalConfig.b() + "@" + appKey`
+/// when `mSdk==true`, then `j(appKey, appSecret, str4, RNAPIUtil.a(), z)` passes
+/// that `str4` as `j`'s `str3`, which the `ThingSdk.init(6-arg)` overload
+/// (`ThingSdk.java:1152` → forces `CHANNEL_OEM`) routes into the ttid position →
+/// `initThingData` `str3` → `ThingSmartNetWork.initialize(... str3 ...)` →
+/// `mTtid = str3` (`ThingSmartNetWork.java:3873`). Net: wire `ttid =
+/// sdk_<channel>@<appKey>` with `<channel> = "international"`. The appKey is
+/// secret-by-policy, so the ttid is assembled at runtime and NEVER logged.
+fn wire_ttid(app_key: &str) -> String {
+    format!("sdk_{TTID_CHANNEL_FINGERPRINT}@{app_key}")
 }
 
 /// Rewrite a `thing.*` action to its `smartlife.*` wire form
@@ -1186,6 +1244,7 @@ mod tests {
             "timeZoneId",
             "cp",
             "bizData",
+            "appRnVersion",
         ] {
             assert!(
                 envelope.contains_key(k),
@@ -1193,7 +1252,56 @@ mod tests {
             );
         }
         assert_eq!(envelope.get("cp").map(String::as_str), Some("gzip"));
-        assert_eq!(envelope.get("channel").map(String::as_str), Some("sdk"));
+        // TASK-0047: production init routes through the CHANNEL_OEM overload, so
+        // the wire channel is "oem", not "sdk".
+        assert_eq!(envelope.get("channel").map(String::as_str), Some("oem"));
+        // TASK-0048: the app sends appRnVersion (non-empty BuildConfig value).
+        assert_eq!(
+            envelope.get("appRnVersion").map(String::as_str),
+            Some("5.92")
+        );
+    }
+
+    // TASK-0047: the wire `ttid` is the rewritten `sdk_<channel>@<appKey>`, NOT
+    // the raw philipsclnightowl ttid, and because `ttid` is in SIGN_WHITELIST the
+    // rewritten value must enter the canonical sign string.
+    #[test]
+    fn envelope_ttid_is_rewritten_sdk_channel_appkey_form_and_signed() {
+        use babymonitor_core::sign::canonical_string;
+
+        let cfg = synthetic_cfg();
+        let (envelope, _b) = build_signed_envelope(
+            &cfg,
+            TOKEN_GET_ACTION,
+            TOKEN_GET_VERSION,
+            "{}",
+            SignBody::KeyAndCanonical,
+        )
+        .unwrap();
+
+        let expected = format!("sdk_international@{}", cfg.material.app_key);
+        assert_eq!(
+            envelope.get("ttid").map(String::as_str),
+            Some(expected.as_str()),
+            "wire ttid must be sdk_<channel>@<appKey> (TASK-0047)"
+        );
+        // It must NOT be the raw configured ttid (philipsclnightowl-equivalent).
+        assert_ne!(
+            envelope.get("ttid").map(String::as_str),
+            Some(cfg.material.ttid.as_str()),
+            "wire ttid must NOT be the raw material.ttid"
+        );
+        // ttid is whitelisted → the rewritten value is in the canonical string.
+        let canonical = canonical_string(&envelope);
+        assert!(
+            canonical.contains(&format!("ttid={expected}")),
+            "rewritten ttid must appear in the canonical sign string; got: {canonical}"
+        );
+    }
+
+    #[test]
+    fn wire_ttid_helper_form() {
+        assert_eq!(wire_ttid("ABC123"), "sdk_international@ABC123");
     }
 
     // Removing chKey from the envelope MUST change the canonical sign string —

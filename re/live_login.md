@@ -95,6 +95,29 @@ SDK-correct `User-Agent` (`Thing-UA=APP/Android/<appVersion>/SDK/<sdkVersion>`,
 `USER_AGENT` ~:78 + append ~:3897) also returned `ILLEGAL_CLIENT_ID` — so the UA
 is not the gate. Iteration STOPPED there per the "a few calls max" guardrail.
 
+## Host-family re-sweep (TASK-0048) (confidence: likely)
+
+The TASK-0046 review gate caught a host false-exhaustion: only the legacy
+`tuya*.com` `mobileApiUrl` family had been probed. The decrypted EU regionConfig
+(`re/regions_decrypt.md`) exposes un-tried EU-family gateways — most notably the
+newer **iotbing** ("bing"/Smart-Life) cloud, where a correct appKey can be
+provisioned while the legacy `a1.tuyaeu.com` gateway returns `ILLEGAL_CLIENT_ID`.
+TASK-0048 probes the four ranked un-tried hosts with EXACTLY ONE read-only
+`token.get` each (no `password.login`, no retry). A DIFFERENT error than
+`ILLEGAL_CLIENT_ID` (e.g. a sign error or a different routing code) is INFORMATIVE
+— it would mean the host accepted our client identity and reached signature /
+next stage, finally making the sign oracle reachable.
+
+Outcome per host (METHOD + OUTCOME only; no secret values; raw capture in the
+gitignored `secrets/tuya_live_debug.json`):
+
+| rank | host (source field) | method | HTTP status | errorCode | classification |
+|---|---|---|---|---|---|
+| 1 | `apigw-eu.iotbing.com` (EU fusionUrl) | _pending Stage B_ | _–_ | _–_ | _–_ |
+| 2 | `a1-us.iotbing.com` (AZ mobileApiUrl) | _pending Stage B_ | _–_ | _–_ | _–_ |
+| 3 | `px.tuyaeu.com` (EU pxApiUrl) | _pending Stage B_ | _–_ | _–_ | _–_ |
+| 4 | `a3.tuyaeu.com` (EU deviceHttpsPskUrl) | _pending Stage B_ | _–_ | _–_ | _–_ |
+
 ## Validation outcome — signer (confidence: likely)
 
 **Signer validated? NO — the differential could not be taken.** The gold

@@ -172,7 +172,8 @@ def aes_ctr_decrypt(ciphertext: bytes, key: bytes, iv: bytes) -> bytes:
 
 def decrypt_asset(path: str) -> bytes:
     """Decrypt a thing_domains_v1 asset (regions/pins). Returns plaintext bytes."""
-    raw = open(path, "rb").read()
+    with open(path, "rb") as fh:
+        raw = fh.read()
     decode = base64.b64decode(bytes(b for b in raw if b not in b"\r\n \t"))
     key = decode[:32]
     iv = decode[32:48]
@@ -184,6 +185,28 @@ def _unescape_regions_json(pt: bytes):
     txt = pt.decode("utf-8", "replace")
     # The plaintext is a backslash-escaped JSON array string in this build.
     return json.loads(txt.replace('\\\\"', '"').replace('\\"', '"'))
+
+
+def region_host_fields(region_config: dict) -> List[tuple]:
+    """Return EVERY scalar `regionConfig` field as (key, value) pairs, sorted.
+
+    The root-cause of the host false-exhaustion (TASK-0046 review gate) was that
+    this script printed only `mobileApiUrl`/`gwApiUrl`, so 20+ other datacenter
+    host/port fields (fusionUrl, pxApiUrl, deviceHttpsPskUrl, the mqtt/quic
+    brokers, a3, etc.) were never even visible to the host-routing hypothesis.
+    We now emit ALL of them. Every value here is a PUBLIC Tuya datacenter
+    host/port (no account-specific secret), so they may be documented.
+
+    Nested/object fields (if any future build adds them) are skipped — only
+    scalar host/port/string config is returned (that is what a gateway probe
+    needs).
+    """
+    out = []
+    for k in sorted(region_config.keys()):
+        v = region_config[k]
+        if isinstance(v, (str, int, float)) and not isinstance(v, bool):
+            out.append((k, v))
+    return out
 
 
 def main(argv: List[str]) -> int:
@@ -200,13 +223,16 @@ def main(argv: List[str]) -> int:
         print(pt[:200])
         return 1
     print(f"regions decrypted: {len(data)} region(s) (AES-256-CTR, static key/IV from asset header)")
-    # Per-region hosts are PUBLIC Tuya datacenter URLs -- safe to print.
+    # Per-region hosts are PUBLIC Tuya datacenter URLs -- safe to print. Emit
+    # EVERY regionConfig host/port field, not just mobileApiUrl/gwApiUrl, so the
+    # full datacenter-host list is authoritative (TASK-0048 root-cause fix).
     for r in data:
         rc = r.get("regionConfig", {})
         tag = "  [defaultConfig]" if r.get("defaultConfig") else ""
-        print(f"  region={r.get('region')}{tag}")
-        print(f"    mobileApiUrl: {rc.get('mobileApiUrl')}")
-        print(f"    gwApiUrl    : {rc.get('gwApiUrl')}")
+        fields = region_host_fields(rc)
+        print(f"  region={r.get('region')}{tag}  ({len(fields)} host/port fields)")
+        for k, v in fields:
+            print(f"    {k}: {v}")
     return 0
 
 

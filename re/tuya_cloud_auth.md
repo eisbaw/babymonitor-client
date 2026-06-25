@@ -87,7 +87,7 @@ approximate (jadx-run-dependent) — grep the symbol name.
 | `lang` | `KEY_APP_LANG` | device language | `ThingApiParams.initUrlParams` (~:1771) |
 | `os` | `KEY_APP_OS` | `"Android"` | `ThingApiParams.initUrlParams` (~:1771) |
 | `appVersion` | `KEY_APP_VERSION` | app version string | `ThingApiParams.initUrlParams` (~:1771) |
-| `ttid` | `KEY_TTID` | channel TTID (value in `secrets/`) | `ThingApiParams.initUrlParams` (~:1771) |
+| `ttid` | `KEY_TTID` | rewritten `sdk_<channel>@<appKey>` form (NOT raw `philipsclnightowl`) — see §1b | `ThingApiParams.initUrlParams` (~:1771) |
 | `clientId` | `KEY_APP_ID` | the appKey/appId (value in `secrets/`) | `ThingApiParams.initUrlParams` (~:1771) |
 | `deviceId` | `KEY_DEVICEID` | per-install device id (`PhoneUtil.getDeviceID`) | `ApiParams.getRequestBody`/`initUrlParams` |
 | `sign` | `KEY_APP_SIGN="sign"` | the keyed signature | computed last; algorithm in `re/tuya_sign.md` |
@@ -110,6 +110,63 @@ consistent `thing.m.*` literal table in class `pqdbppq`
 `thing.m.user.*` in the DEX, but the value the signer sees / that may go on the
 wire as `a=` is the `smartlife.m.user.*`-rewritten form. The exact on-wire spelling
 must be confirmed against a live capture / Frida hook (TASK-0022) — flagged in §6.
+
+---
+
+### 1b. Wire `ttid` value: the `sdk_<channel>@<appKey>` rewrite (TASK-0047 RESOLVED) (confidence: confirmed)
+
+The wire `ttid` the SDK sends is **`sdk_international@<appKey>`**, NOT the raw
+`philipsclnightowl` ttid/scheme. This was the open question in TASK-0047 (and was
+mis-traced in `re/identity_enumeration.md` §2a, now corrected). RESOLVED by a
+full static dataflow trace through the production init path; ≥2 independent
+methods (the `AppInitializer.d`/`j` body AND the `ThingSdk.init` overload routing
++ `initThingData`/`initialize` assignment), all jadx ground truth:
+
+1. **Production entry** — `SmartApplication.e()`/`onCreate` calls
+   `AppInitializer.d(this, appKey, appSecret, apiConfig, getString(R.string.b),
+   c(this), false)`
+   (`decompiled/jadx/sources/com/smart/app/SmartApplication.java:121`). Here
+   `str3 = R.string.b` is the raw ttid/scheme (`philipsclnightowl`) and
+   `str4 = c(this)` is the channel.
+2. **The channel arg is what gets the `sdk_…@appKey` rewrite, NOT str3** —
+   inside `AppInitializer.d`
+   (`.../com/thingclips/smart/initializer/AppInitializer.java:317-341`):
+   `GlobalConfig.d(MicroContext.b(), str4, z)` first stores the channel (so
+   `GlobalConfig.b()` later returns it), then
+   `if (ThingSmartNetWork.mSdk) { str4 = "sdk_" + GlobalConfig.b() + "@" + str; }`
+   rewrites the **channel arg** `str4` (`:334-335`). The raw `str3`
+   (philipsclnightowl) only flows to `UrlRouter.o(str3)` (`:340`) — a router
+   tag, never the wire ttid.
+3. **The rewritten channel lands in the ttid slot** — `d()` then calls
+   `j(str=appKey, str2=appSecret, str4=rewritten, RNAPIUtil.a(), z)` (`:341`).
+   In `j` (`:1247-1323`) this becomes `j`'s `str3`, passed to
+   `ThingSdk.init(ctx, appKey, appSecret, str3, str4_rn, apiUrlProvider)`
+   (`:1323`). That 6-arg overload
+   (`decompiled/jadx/sources/com/thingclips/smart/sdk/ThingSdk.java:1152-1153`)
+   forwards to `init(..., str3, CHANNEL_OEM, str4_rn, provider)` — i.e. it puts
+   `str3` (the rewritten `sdk_…@appKey`) into the **ttid** position and FORCES the
+   channel to `"oem"`.
+4. **Assignment to `mTtid`** — `initThingData(... str3 ...)`
+   (`ThingSdk.java:1512-1529`) calls
+   `ThingSmartNetWork.initialize(ctx, appKey, appSecret, str3, str4, null, str5, provider)`,
+   which assigns `mTtid = str3`
+   (`.../ThingSmartNetWork.java:3870-3874`) and `mChannel = str4 = "oem"`
+   (`:3892-3895`). `getTtid()` (`:3358`) returns `mTtid` verbatim → wire `ttid`.
+5. **`<channel>` value** — `GlobalConfig.b()`
+   (`.../com/thingclips/stencil/app/GlobalConfig.java:103` returns field `d`, set
+   by `GlobalConfig.d(ctx,str,z)` at `:206`) = the channel `c(this)`, and
+   `SmartApplication.c()` reads the `UMENG_CHANNEL` manifest meta-data =
+   `"international"` (`decompiled/apktool/AndroidManifest.xml:91`). So
+   `<channel> = international`.
+
+**Net wire ttid = `sdk_international@<appKey>`; wire channel = `oem`.** Caveat
+(confidence note): the trace assumes `ThingSmartNetWork.mSdk == true` — its
+default initializer is `true` (`.../ThingSmartNetWork.java:103`) and no setter to
+`false` is reached on the production init path; if a build flag flipped it, the
+ttid would instead be the raw `philipsclnightowl` and channel the original
+`international`. The `mSdk==true` default is the documented production case. The
+appKey is secret, so `re/*` records only the FORM; the assembled value lives at
+runtime in the live path (`babymonitor/babymonitor-cli/src/live.rs` `wire_ttid`).
 
 ---
 

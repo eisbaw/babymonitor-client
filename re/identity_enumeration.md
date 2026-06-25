@@ -65,15 +65,21 @@ jadx reconstruction of the same method.
   branch: `str = BuildConfig.THING_SMART_APPKEY`, `str2 = BuildConfig.THING_SMART_SECRET`.
   The smali shows R8 inlined both literals at this exact branch
   (`decompiled/apktool/smali_classes8/com/smart/app/SmartApplication.smali:551,555`).
-- Wiring: `AppInitializer.d(application, appKey, appSecret, apiConfig, getString(R.string.b), channel, false)`
-  (`decompiled/jadx/sources/com/smart/app/SmartApplication.java:121`)
-  → `AppInitializer.j(appKey, appSecret, channel, RNAPIUtil.a(), z)`
-  (`decompiled/jadx/sources/com/thingclips/smart/initializer/AppInitializer.java:338`)
-  → `ThingSdk.init(ctx, appKey, appSecret, ttid, channel, apiUrlProvider)`
-  (`decompiled/jadx/sources/com/thingclips/smart/initializer/AppInitializer.java:1323`)
-  → `ThingSmartNetWork.initialize(ctx, appKey, appSecret, ttid, channel, …)` which
-  assigns `mAppId = appKey`, `mAppSecret = appSecret`, `mTtid = ttid`
-  (`decompiled/jadx/sources/com/thingclips/smart/android/network/ThingSmartNetWork.java:3872-3874`).
+- Wiring (NOTE the ttid-vs-channel arg routing, see §2a + `re/tuya_cloud_auth.md`
+  §1b): `AppInitializer.d(application, appKey, appSecret, apiConfig,
+  getString(R.string.b)=rawTtid, c(this)=channel, false)`
+  (`decompiled/jadx/sources/com/smart/app/SmartApplication.java:121`). Inside `d`
+  the channel arg is rewritten to `sdk_<channel>@<appKey>` (`:334-335`) and the
+  raw ttid goes only to `UrlRouter.o()` (`:340`), then
+  → `AppInitializer.j(appKey, appSecret, rewrittenChannel, RNAPIUtil.a(), z)`
+  (`decompiled/jadx/sources/com/thingclips/smart/initializer/AppInitializer.java:341`)
+  → `ThingSdk.init(ctx, appKey, appSecret, rewrittenChannel, rnVersion, apiUrlProvider)`
+  (`:1323`); the 6-arg overload forces channel `CHANNEL_OEM` and routes
+  `rewrittenChannel` into the ttid position (`ThingSdk.java:1152-1153`)
+  → `ThingSmartNetWork.initialize(ctx, appKey, appSecret, ttid=rewrittenChannel, channel="oem", …)` which
+  assigns `mAppId = appKey`, `mAppSecret = appSecret`,
+  `mTtid = sdk_international@<appKey>`, `mChannel = "oem"`
+  (`decompiled/jadx/sources/com/thingclips/smart/android/network/ThingSmartNetWork.java:3872-3895`).
 
 No `THING_SMART_APPKEY`/`TUYA_SMART_APPKEY` `<meta-data>` exists in the manifest
 (`decompiled/apktool/AndroidManifest.xml` — only `UMENG_CHANNEL`/`region`), so the
@@ -94,25 +100,50 @@ Two independent sources: the param-key constants + `initUrlParams` body in
 - `channel` ← `ThingSmartNetWork.mChannel` (`KEY_CHANNEL="channel"` :49; put :1789)
 - `chKey` ← `ThingNetworkSecurity.getChKey(mAppContext, mAppId.getBytes())` (:1828)
 
-The live capture (`secrets/tuya_live_debug.json`, request param keys only — no
-values) confirms the wire actually carried exactly:
+The prior live capture (`secrets/tuya_live_debug.json`, request param keys only —
+no values) is OUR client's outgoing request (it shows the param NAMES our
+`live.rs` emits), so it confirms the param-key SET matches initUrlParams but is
+NOT evidence of the APP's param VALUES. The key set carried:
 `a, appVersion, bizData, chKey, channel, clientId, cp, deviceCoreVersion, deviceId,
 et, lang, os, osSystem, platform, requestId, sdkVersion, sign, time, timeZoneId,
-ttid, v` — matching this mapping. `channel` value = `"sdk"` (`CHANNEL_SDK`,
-hardcoded by the 7-arg `initialize` overload,
-`decompiled/jadx/sources/com/thingclips/smart/android/network/ThingSmartNetWork.java:3867,3893`).
+ttid, v`.
 
-### 2a. ttid value nuance (confidence: likely)
+> **CORRECTED by TASK-0048 (the `channel` value).** An earlier revision of this
+> section asserted `channel == "sdk"` (`CHANNEL_SDK`), citing the SDK-internal
+> 7-arg `initialize` overload default
+> (`.../ThingSmartNetWork.java:3867,3893`). That overload is NOT the production
+> path. The production path
+> (`SmartApplication`→`AppInitializer.d`→`j`→`ThingSdk.init` 6-arg) forces
+> `CHANNEL_OEM`, so the app's wire **`channel == "oem"`** and the rewritten
+> `sdk_…@appKey` rides the **`ttid`** instead (full trace: §2a +
+> `re/tuya_cloud_auth.md` §1b). `live.rs` now sends `channel=oem` +
+> `ttid=sdk_international@<appKey>` accordingly.
+
+### 2a. ttid value: RESOLVED — `sdk_international@<appKey>` (TASK-0047) (confidence: confirmed)
+
+> **CORRECTED by TASK-0048.** This section previously concluded the wire ttid was
+> `single-source-traced` / unresolved and implied the raw `philips…owl` might ride
+> the wire. That was wrong: the `sdk_<channel>@<appKey>` rewrite DOES reach the
+> wire ttid (it lands in the ttid slot via the `CHANNEL_OEM` init overload), while
+> the raw `philips…owl` only reaches `UrlRouter.o()`. Full trace +
+> ≥2 independent methods now in `re/tuya_cloud_auth.md` §1b.
+
 `BuildConfig.THING_SMART_TTID` and the `app_scheme` string resource are BOTH the
-same fingerprint ("philips…owl",
+raw fingerprint ("philips…owl",
 `decompiled/apktool/smali_classes8/com/thingclips/sample/BuildConfig.smali:33` +
-`decompiled/apktool/res/values/strings.xml:577`). But `AppInitializer.d` rewrites
-the CHANNEL arg to `"sdk_<ver>@<appKey>"` when `mSdk==true`
-(`decompiled/jadx/sources/com/thingclips/smart/initializer/AppInitializer.java:334-335`),
-so the exact `str3`/`mTtid` reaching `ThingSdk.init` is single-source-traced and
-labelled `likely`. This is SECONDARY: `ILLEGAL_CLIENT_ID` is a clientId-identity
-rejection, not a ttid rejection (`re/live_login.md`), so the ttid value is not the
-gate.
+`decompiled/apktool/res/values/strings.xml:577`) — but that raw value flows only
+to `UrlRouter.o(str3)` (`AppInitializer.java:340`), NOT to `mTtid`. The wire
+`ttid` is the REWRITTEN channel `"sdk_" + GlobalConfig.b() + "@" + appKey`
+(`AppInitializer.java:334-335`, `mSdk==true` by default), routed into the ttid
+position by the `ThingSdk.init` 6-arg→`CHANNEL_OEM` overload
+(`ThingSdk.java:1152-1153`) and assigned `mTtid = str3`
+(`ThingSmartNetWork.java:3873`). `GlobalConfig.b()` = the `UMENG_CHANNEL`
+meta-data `"international"` (`AndroidManifest.xml:91`). **Net wire `ttid =
+sdk_international@<appKey>`, wire `channel = oem`** (full derivation:
+`re/tuya_cloud_auth.md` §1b). This is SECONDARY to the
+`ILLEGAL_CLIENT_ID` gate (a clientId-identity rejection, not a ttid one,
+`re/live_login.md`), but the live request now sends the app-faithful ttid form
+(`babymonitor/babymonitor-cli/src/live.rs` `wire_ttid`).
 
 ---
 
@@ -128,7 +159,7 @@ appKey shape) and 32-char (appSecret shape) lowercase-alnum literals
 |---|---|---|---|---|
 | appKey "…syhm" | 20 | `…/thingclips/sample/BuildConfig.smali:25` + inlined `…/smart/app/SmartApplication.smali:551` | `THING_SMART_APPKEY` → `mAppId` → wire `clientId` | **YES (rank 1)** |
 | appSecret "…58qx" | 32 | `…/thingclips/sample/BuildConfig.smali:29` + inlined `…/smart/app/SmartApplication.smali:555` | `THING_SMART_SECRET` → `mAppSecret` | **YES (rank 1, paired)** |
-| ttid "philips…owl" | — | `…/thingclips/sample/BuildConfig.smali:33` + `res/values/strings.xml:577` (app_scheme) | `THING_SMART_TTID` → `mTtid` → wire `ttid` | wire ttid (rank 1) |
+| ttid "philips…owl" | — | `…/thingclips/sample/BuildConfig.smali:33` + `res/values/strings.xml:577` (app_scheme) | raw ttid/scheme → `UrlRouter.o()` only; the WIRE `ttid` is the rewritten `sdk_international@<appKey>` (§2a) | NOT the wire ttid (raw value) |
 | "…epv8" | 20 | `…/smart/app/ThingNGConfig.smali:68` (`appEncryptKeyProdV2`) | encryptImage/media key | NO — wrong purpose (rank 2) |
 | "…gerk" | 20 | `…/smart/app/ThingNGConfig.smali:64` (`appEncryptKeyCvProdV2`) | camera/CV encrypt-image key | NO — wrong purpose (rank 3) |
 | "vdevo…1961" | — | apktool smali const-string | Tuya `vdevo` virtual-device id (test/demo) | NO — ruled out |
@@ -182,10 +213,14 @@ derivation (`re/bmp_token_whitebox.md`), not an alternate appKey.
   wrong-key hypothesis, which it does; it does not by itself produce a working
   login.
 - The §2a ttid-value resolution (`philips…owl` vs a `sdk_…@appKey` rewrite) is
-  single-source-traced (`likely`); a Frida hook on the wire `ttid`/`sign` or one app
-  capture (TASK-0022) would promote it
-  (`decompiled/jadx/sources/com/thingclips/smart/initializer/AppInitializer.java:334`).
-  Filed as a tangent, not chased inline.
+  now RESOLVED statically (`confirmed`, TASK-0047/0048): wire `ttid =
+  sdk_international@<appKey>` via the full `AppInitializer.d`→`j`→`ThingSdk.init`
+  (6-arg→`CHANNEL_OEM`)→`initialize` dataflow (≥2 methods,
+  `re/tuya_cloud_auth.md` §1b;
+  `decompiled/jadx/sources/com/thingclips/smart/initializer/AppInitializer.java:334-341`,
+  `decompiled/jadx/sources/com/thingclips/smart/sdk/ThingSdk.java:1152-1529`). A
+  live capture would still be the only thing that promotes it from a static trace
+  to an observed-on-wire fact, but the static derivation is unambiguous.
 - Smali addresses/line hints are for THIS build; re-anchor on the symbol landmarks
   (`THING_SMART_APPKEY`, `SmartApplication.e`, `AppInitializer.d/j`,
   `ThingSmartNetWork.initialize`) if the APK version shifts.

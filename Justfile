@@ -54,9 +54,14 @@ test-bmp-decode:
     cd re/scripts && python3 test_bmp_token_aes.py
     cd re/scripts && python3 test_bmp_token_ghidra.py
 
+# Unit-test regions_decrypt.py host enumeration (>2 host fields; TASK-0048).
+[group('test')]
+test-regions:
+    cd re/scripts && python3 test_regions_decrypt.py
+
 # End-to-end gate (build+test+lint+fmt-check+stub-grep+offline). Green before any commit.
 [group('test')]
-e2e: build test lint fmt-check stub-grep assert-offline test-bmp-decode
+e2e: build test lint fmt-check stub-grep assert-offline test-bmp-decode test-regions
 
 # Assert the test suite needs no network (--offline build + enumerate).
 [group('test')]

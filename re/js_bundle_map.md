@@ -67,15 +67,24 @@ config/theme constants.
 > `connect`/`createMediaDevice` verbs whose param is `{deviceId}`-only (per
 > `TUNIIPCCameraManager.json`, the streaming section below) — no sdp/ice/mode
 > media-session fields. The real WebRTC SDP/ICE/DTLS-SRTP machinery is **native**,
-> in `libThingP2PSDK.so` (signaling strings `a=ice-ufrag`/`invalid signaling:
-> type: candidate`, demangled `re/symbols/libThingP2PSDK.dynsym.txt`) and
-> surfaced in Java by `P2PMQTTServiceManager.send302MessageThroughMqtt`
+> in `libThingP2PSDK.so`: the signaling **strings** `a=ice-ufrag` / `invalid
+> signaling: type: candidate` live in the **`.so` binary** (recover with
+> `strings -n5 decompiled/nativelibs/libThingP2PSDK.so`), and the demangled
+> **symbols** that drive ICE — e.g. `imm_p2p_ice_session_add_remote_candidate`,
+> `imm_p2p_ice_session_create` — are in `re/symbols/libThingP2PSDK.dynsym.txt`.
+> (The dynsym is the symbol TABLE, not a string dump: it carries the `imm_p2p_ice_*`
+> exports, not the `a=ice-ufrag` text — so the strings are cited to the `.so`, the
+> symbols to the dynsym.) Surfaced in Java by
+> `P2PMQTTServiceManager.send302MessageThroughMqtt`
 > (`decompiled/jadx/sources/com/thingclips/smart/p2p/utils/P2PMQTTServiceManager.java`).
 > See `re/streaming_mode.md` for the full WebRTC-over-MQTT verdict and its own
-> ICE-false-positive correction. (confidence: confirmed — two independent
-> non-`.md` sources back this: the JS greps over
-> `decompiled/js/assets/kit_js/*.pretty` AND the native+Java WebRTC evidence in
-> `libThingP2PSDK.so` / `P2PMQTTServiceManager.java`.)
+> ICE-false-positive correction. (confidence: confirmed. The two sources are the JS
+> greps over `decompiled/js/assets/kit_js/*.pretty` AND the native WebRTC evidence
+> in `libThingP2PSDK.so`. Candor, borrowing `streaming_mode.md:68`: the `.so` native
+> strings/symbols and the Java `P2PMQTTServiceManager` bridge are **not fully
+> independent** — both are the same Tuya P2P SDK, one its native core and one its
+> Java surface; the genuinely independent corroboration is the JS-kit layer vs the
+> native lib, plus the public Tuya impls cited in `streaming_mode.md`.)
 
 ## The JS↔native bridge mechanism (confidence: confirmed)
 

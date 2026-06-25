@@ -1,9 +1,11 @@
 ---
 id: TASK-0028
 title: Citation-precision nits in js_bundle_map.md WebRTC correction block
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@architect'
 created_date: '2026-06-25 03:00'
+updated_date: '2026-06-25 08:53'
 labels:
   - re
   - citation-hygiene
@@ -20,5 +22,17 @@ From cycle-10 review (both GO, P2). Two tiny accuracy fixes in re/js_bundle_map.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Both citation nits fixed; check-evidence stays green; the confirmed block still has >=2 genuinely independent sources
+- [x] #1 Both citation nits fixed; check-evidence stays green; the confirmed block still has >=2 genuinely independent sources
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. js_bundle_map.md WebRTC block: fix citation — strings a=ice-ufrag/'invalid signaling: type: candidate' live in the .so binary, not the dynsym (which has imm_p2p_ice_* SYMBOLS). Cite decompiled/nativelibs/libThingP2PSDK.so for the strings; cite a dynsym symbol where appropriate. 2. Soften the 'two greps AND native+Java' independence wording, borrowing streaming_mode.md candor (native lib + Java bridge not fully independent).
+<!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+DONE. js_bundle_map.md WebRTC CORRECTION block: (1) the runtime strings a=ice-ufrag / 'invalid signaling: type: candidate' are now cited to the .so BINARY (verified: strings -n5 decompiled/nativelibs/libThingP2PSDK.so yields 3 hits), with an explicit note that the dynsym is the symbol TABLE carrying imm_p2p_ice_session_* SYMBOLS (not those strings) — so strings->. so, symbols->dynsym. (2) Softened the independence wording borrowing streaming_mode.md:68 candor: the .so native strings/symbols and the Java P2PMQTTServiceManager bridge are NOT fully independent (both the same Tuya P2P SDK); the genuinely-independent pair is JS-kit layer vs native lib (+ public Tuya impls). check-evidence stays GREEN; the confirmed block still has >=2 genuinely independent sources (JS *.pretty greps AND the native .so).
+<!-- SECTION:NOTES:END -->

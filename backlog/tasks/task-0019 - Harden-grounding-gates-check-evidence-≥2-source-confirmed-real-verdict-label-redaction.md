@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-06-24 23:16'
-updated_date: '2026-06-24 23:17'
+updated_date: '2026-06-25 00:30'
 labels:
   - phase5
   - rust
@@ -36,3 +36,9 @@ FROM cycle-1 review of TASK-0011 (re/review_gate_findings has context). Three pr
 - [ ] #3 just e2e + just gates-selftest green after changes; no regression to existing self-tests
 - [ ] #4 check-evidence flags a section whose confidence label is confirmed but which has only ONE citation; self-test proves it (confirmed+1 citation -> FLAG, confirmed+2 distinct citations -> PASS)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+CYCLE-2 REVIEW add-ons (fold into this pass, both reviewers GO on tasks 1-4): (a) re/decompile_dex.md:76/:85 — split the blanket 'confidence: confirmed' header so it covers symbol/method PRESENCE only; the inline 'resendOffer => confirms WebRTC' inference should footnote the native dynsym cross-ref (it IS >=2-source) rather than ride the confirmed label. (b) re/decompile_dex.md:88 — '302 = Tuya camera-signaling code' is single-source (Java method names only); downgrade to 'likely' or cite where 302 is decoded. (c) one-line note in each re/ doc that Java :line citations require a local 'just decompile' (jadx tree is gitignored). (d) publish-scrub later: re/native_libs.md:18/:86 leak upstream devs' build paths (not our PII) — note for task-5 AC#5 scope.
+<!-- SECTION:NOTES:END -->

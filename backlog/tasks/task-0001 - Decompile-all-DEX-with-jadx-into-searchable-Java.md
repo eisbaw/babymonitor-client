@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@reverser'
 created_date: '2026-06-24 22:34'
-updated_date: '2026-06-25 00:22'
+updated_date: '2026-06-25 00:30'
 labels:
   - phase2
   - re
@@ -55,6 +55,8 @@ GOTCHA: jadx tail is VERY slow on classes5/8.dex (heaviest obfuscated) - stuck ~
 RESOLVED: 4g heap OOMd (exit 1, ~41.7k files, truncated 80%). Re-ran at -Xmx12g -> clean exit 0, 99% (36685/36686), 51,008 .java files, zero OOM. AC#1 now genuinely met.
 Residual: 1,806 Method-not-decompiled stubs across 1,397 files (R8 obfuscation, flagged inline; no whole-class drops). 18 GB RAM available, 12g heap is the fix.
 GOTCHA for future runs: shell.nix JADX_OPTS=-Xmx4g is too small for this dex set; prefix JADX_OPTS="-Xmx12g" (last -Xmx wins in HotSpot).
+
+Cycle-2 review GO (qa+arch): 51,008 java exact, 2.7% stub figure reproduced, OOM->12g disclosure honest.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

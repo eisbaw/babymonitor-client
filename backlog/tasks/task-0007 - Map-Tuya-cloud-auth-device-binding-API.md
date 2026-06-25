@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@reverser'
 created_date: '2026-06-24 22:36'
-updated_date: '2026-06-25 01:45'
+updated_date: '2026-06-25 01:50'
 labels:
   - phase4
   - re
@@ -47,4 +47,6 @@ WHY (skill phase 3/4): model the request/response contract for account login, to
 
 <!-- SECTION:NOTES:BEGIN -->
 FINAL: AC #1/#3/#4 met (re/tuya_cloud_auth.md, gates green). AC #2/#5 (captured signing vector) NOT met and CANNOT be met statically per TASK-0005 verdict needs-runtime-hook; the doc delivers the vector PLAN (inputs) instead of a fabricated/self-derived vector (AC #5 forbids self-derived). The actual vector is owned by TASK-0022 (Frida, already filed) and validated in TASK-0012 (already depends on TASK-0022). Leaving TASK-0007 In Progress (not Done) because 2 of 5 ACs are honestly blocked on live capture; no new follow-up needed (dep edge TASK-0022->TASK-0012 already exists).
+
+Cycle-7 review: both GO. In-Progress is the honest status (AC#2/#5 = signing vector owned by TASK-0022->TASK-0012, not statically producible). Login flow/envelope/beans/moto_id-absence all verified by reviewers against the decompile. P1 systemic citation line-drift -> TASK-0024 (symbolic anchors). Static-completable portion is DONE; remaining ACs blocked on live Frida capture.
 <!-- SECTION:NOTES:END -->

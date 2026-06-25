@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@reverser'
 created_date: '2026-06-25 03:29'
-updated_date: '2026-06-25 04:12'
+updated_date: '2026-06-25 04:27'
 labels:
   - phase3
   - re
@@ -37,4 +37,6 @@ Residual blocker from TASK-0023 static signer dive (re/tuya_sign_static.md §5).
 
 <!-- SECTION:NOTES:BEGIN -->
 FINAL: partial result delivered + committed (c2298cd). Follow-up filed as TASK-0030 (white-box port OR live-vector contingency). Task stays In Progress — NOT Done — because the decode is only partially ported (framing + independent cross-check), the white-box token producer (fcn.11658) is the un-ported wall.
+
+Cycle-13 review: both GO. Architect reproduced the disassembly (fcn.11658 = white-box table cipher, no AES/imath/pow, disjoint from the matrix). REFUTES TASK-0023 §5 (matrix decodes SDK config blob, NOT the token). White-box wall is honest. Both reviewers: static-only auth is GENUINELY BLOCKED on the bmp_token; handoff justified. P2: bmp_token_decode.md §4 should attribute the 'matrix doesn't apply' conclusion primarily to the disassembly (the nalajcie reader is an unvalidated reconstruction) -> note on TASK-0030.
 <!-- SECTION:NOTES:END -->

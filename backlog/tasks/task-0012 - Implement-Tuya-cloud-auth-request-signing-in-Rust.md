@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@architect'
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 04:43'
+updated_date: '2026-06-25 04:53'
 labels:
   - phase5
   - rust
@@ -91,4 +91,6 @@ GOTCHAS / HONEST LIMITATIONS:
 4. Added flate2 (rust_backend / miniz_oxide, pure-Rust, offline) to inflate the DEFLATE-compressed signature block; keeps the offline gate self-contained.
 
 FEED-FORWARD: appended interface shapes to TASK-0013 (SigningKeyMaterial) and TASK-0030 (BmpTokenProvider). Kept In Progress: AC#1 stays token-pending until TASK-0030 lands the token + an independent gold vector.
+
+Cycle-14 review: both GO. Architect re-derived all 5 recovered sub-steps independently = correct; token-pending honest; cert value confirmed correct (raw-embedded-cert = Android semantics). Non-blocking P1/P2 -> TASK-0031 (cert validation reproducibility + leaf-selection robustness + spec contradiction caveat). AC#1 stays token-pending.
 <!-- SECTION:NOTES:END -->

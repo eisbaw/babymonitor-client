@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@reverser'
 created_date: '2026-06-25 05:42'
-updated_date: '2026-06-25 11:30'
+updated_date: '2026-06-25 11:40'
 labels:
   - wave2
 dependencies: []
@@ -43,6 +43,8 @@ candidate bmp_token written to secrets/bmp_token.txt ONLY (gitignored, unstaged,
 HONESTY: integral-solve is NECESSARY not SUFFICIENT -> label CANDIDATE (integral-solve-consistent); ONE accepted live sign is the sufficient oracle (next).
 GOTCHAS: (a) op2 path (FUN_001054f4) is NOT byte-verified -- it does NOT use the op1 xorstep walk (no bl 0x583c; sequential counter @0x57e0); op2 is out of scope for the real token (selector=1->op1) and has no end-to-end oracle. (b) Ghidra elided the xorstep 3rd arg as a 2-arg call -- r2 disasm was REQUIRED to recover the base+3 / pair_start operands; Ghidra C alone was insufficient for the op1 walk. (c) the synthetic test_synthetic_bmp_full_decode_runs was re-planted to the base+3 layout (it now PINS the corrected walk).
 Tests: 18/18 green (added TestRealInputsIntegralOracle: asserts integral solve + shape on real inputs, value withheld, skips if secrets absent). Gates: just e2e / check-evidence / secret-scan all GREEN. tuya_sign.md ~:25-29 pointer to TASK-0041 (config=appKey) added.
+
+Cycle review: both GO. Architect independently disassembled FUN_00105138 + confirmed BOTH op1 fixes byte-exact (base+3 increments @0x519c/0x5230/0x529c; pair-start XOR @0x5400) + reproduced the integral solve (denom==1, 4x{4,32}); op2 correctly omitted (zero bl 0x583c); candidate not fabricated, no value leaked. Verdict: trustworthy enough for ONE live login validation. Orchestrator fixed the P2 doc-drift (provenance §3 + whitebox §8 now reflect the integral-solve result).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

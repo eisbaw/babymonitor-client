@@ -236,8 +236,15 @@ Ran `re/scripts/bmp_token_ghidra.py:read_keys_from_content(appKey_bytes, t_s.bmp
 - BUT the op1 coefficient reads walk to offsets yielding `alen`/`blen` of 200+ pixel
   bytes per coefficient, and the Vandermonde solve returns non-integral (native `0xb`).
 
-Root cause: the op1 chained-offset arithmetic in the port (`_decode`, the
-`xorstep_583c`-driven walk) is **not byte-exact**. Re-deriving from
+> **SUPERSEDED / RESOLVED by TASK-0032 (→ commit b5f9151):** the op1 offset-walk was
+> corrected — two bugs found via r2 of `FUN_00105138` (start offset `base+3` not `base+1`;
+> per-pair XOR against the pair-START offset, not after-b). With the real appKey config +
+> `t_s.bmp` it now **solves INTEGRAL** (`denom==1`, 4×`{alen=4,blen=32}` → a 64-hex key);
+> the `bmp_token` **candidate** (integral-solve-consistent; live-login-validated next) is in
+> gitignored `secrets/bmp_token.txt`. The pre-fix root-cause text below is retained as history.
+
+Root cause (HISTORICAL, pre-fix — corrected by TASK-0032): the op1 chained-offset arithmetic in the port (`_decode`, the
+`xorstep_583c`-driven walk) was **not byte-exact**. Re-deriving from
 `re/ghidra/decode_op1.c` + `build_mpint_op1.c` + `xorstep_583c.c`:
 - the per-pair offset XOR-step XORs the result with the **pair START offset** `local_68`
   (decode_op1.c lines 99-104), and the op1 start uses

@@ -344,7 +344,9 @@ RESOLVED and it is STATIC.** The `param_6` byte[] is
 already in `secrets/tuya_appkey.json`. With the REAL appKey config the header VALIDATES
 (selector=1, op1, `num_keys=1`, `num_coeffs=4`) — NOT the rejection arbitrary configs
 give. So "needs the runtime SDK-config blob" is now "the config IS the static appKey".
-The remaining residual is narrower: the **op1 offset-walk port is not yet byte-exact**
-(it yields a non-integral Vandermonde solve), and there is no static oracle — so a
-trustworthy bmp_token still needs ONE accepted live sign to validate. See
-`re/bmp_token_provenance.md`.
+The remaining residual is **RESOLVED by TASK-0032 (commit b5f9151)**: the op1 offset-walk was
+corrected (start offset `base+3`; per-pair XOR against the pair-start offset) and now **solves
+INTEGRAL** with the real appKey config + `t_s.bmp`, recovering a `bmp_token` **candidate** to
+gitignored `secrets/bmp_token.txt`. Integral-solve is necessary but not sufficient (no static
+oracle), so the candidate still needs ONE accepted live sign to **validate** (which also
+disambiguates the cmd=1 MD5 fold). See `re/bmp_token_provenance.md`.

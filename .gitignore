@@ -29,8 +29,15 @@ token_store*
 # un-ignored below. `just secret-scan` still scans them. Never place a real
 # capture under this path.
 fixtures/
+# Un-ignore ONLY the two known synthetic fixtures by name (not the whole tree),
+# so a future stray file dropped under tests/fixtures/ is ignore-by-default and
+# cannot be accidentally committed. (secret-scan remains the backstop.)
+# We must (1) un-ignore the dir so git descends into it, (2) re-ignore everything
+# inside it, then (3) re-include exactly the two known fixture files.
 !babymonitor/babymonitor-core/tests/fixtures/
-!babymonitor/babymonitor-core/tests/fixtures/**
+babymonitor/babymonitor-core/tests/fixtures/*
+!babymonitor/babymonitor-core/tests/fixtures/device_list.json
+!babymonitor/babymonitor-core/tests/fixtures/camera_info.json
 
 # Rust
 target/

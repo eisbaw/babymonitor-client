@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "CLI viewer for the Philips Avent Baby Monitor+ (white-labeled Tuya IPC camera). Scaffold only."
+description = "CLI viewer for the Philips Avent Baby Monitor+ (white-labeled Tuya IPC camera)."
 
 [[bin]]
 name = "babymonitor-cli"
@@ -13,3 +13,4 @@ path = "src/main.rs"
 [dependencies]
 babymonitor-core = { path = "../babymonitor-core" }
 clap.workspace = true
+serde_json.workspace = true

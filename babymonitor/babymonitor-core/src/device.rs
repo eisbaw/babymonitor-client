@@ -218,7 +218,15 @@ pub struct DeviceBean {
     #[serde(rename = "productId", default)]
     pub product_id: Option<String>,
     /// Device category — camera is the `sp`/ipc family (`DeviceBean.category`).
-    #[serde(default)]
+    ///
+    /// The wire carries this as `category` AND a sibling `categoryCode`
+    /// (`re/tuya_cloud_auth.md` §5b lists `category`/`categoryCode` together as
+    /// the device-category field). We accept either key into this one field via
+    /// the serde alias so a record that populates only `categoryCode` does not
+    /// silently miss [`is_camera`](DeviceBean::is_camera). Which key the real atop
+    /// response populates is `needs-live` (not observed against a real capture);
+    /// accepting both is the safe static choice.
+    #[serde(default, alias = "categoryCode")]
     pub category: Option<String>,
     /// Cloud online state (`DeviceBean.isOnline`).
     #[serde(rename = "isOnline", default)]
@@ -236,8 +244,14 @@ impl DeviceBean {
     /// (`re/tuya_cloud_auth.md` §5b: "camera = `sp`/ipc family".)
     pub const CATEGORY_CAMERA: &'static str = "sp";
 
-    /// Whether this device is a camera (`sp`/ipc family). A device with no
-    /// category is conservatively NOT treated as a camera.
+    /// Whether this device is a camera. A device with no category is
+    /// conservatively NOT treated as a camera.
+    ///
+    /// `sp` is the grounded camera category (`re/tuya_cloud_auth.md` §5b). The
+    /// `"ipc"` arm is **(inferred)** — it is the common Tuya IPC-family shorthand
+    /// but is NOT grounded by a citation here; it is kept as a lenient extra match
+    /// so a future capture using it still resolves, and should be confirmed (or
+    /// dropped) against a real device-list capture (needs-live).
     #[must_use]
     pub fn is_camera(&self) -> bool {
         matches!(self.category.as_deref(), Some(c) if c == Self::CATEGORY_CAMERA || c == "ipc")
@@ -428,10 +442,18 @@ pub struct CameraView<'a> {
 impl<'a> CameraView<'a> {
     /// Pair a [`DeviceBean`] with its [`CameraInfoBean`].
     ///
+    /// This validates ONLY that `device` is a camera-category device
+    /// ([`DeviceBean::is_camera`]); it does not (and cannot, statically) confirm
+    /// that `info` actually belongs to `device`. Whether
+    /// [`CameraInfoBean::id`] equals [`DeviceBean::dev_id`] for the same camera is
+    /// **unconfirmed** (needs-live: the per-camera config fetch is keyed by
+    /// `devId`, but the response `id` field's relationship to it has not been
+    /// observed against a real device). The caller is responsible for fetching
+    /// `info` for the matched `devId`.
+    ///
     /// # Errors
-    /// [`Error::DeviceMismatch`] if the device is not a camera, or if the
-    /// camera info's `id` (when present) does not correspond to this device —
-    /// we fail loud rather than connecting with mismatched handles.
+    /// [`Error::DeviceMismatch`] if `device` is not a camera-category device — we
+    /// fail loud rather than build a camera view over a non-camera record.
     pub fn pair(device: &'a DeviceBean, info: &'a CameraInfoBean) -> Result<Self, Error> {
         if !device.is_camera() {
             return Err(Error::DeviceMismatch(format!(
@@ -559,6 +581,32 @@ mod tests {
         assert_eq!(t, P2pTransport::Other(99));
         assert!(!t.is_webrtc());
         assert_eq!(t.as_p2p_type(), 99);
+    }
+
+    // ── category / categoryCode alias ──────────────────────────────────────
+    //
+    // The wire may populate `categoryCode` instead of `category` (§5b). The serde
+    // alias must route either into `category` so find_camera_device cannot
+    // silently miss the camera. Prove the alias path bites.
+    #[test]
+    fn category_code_alias_populates_camera_category() {
+        let body = br#"{"deviceList":[{"devId":"d1","categoryCode":"sp"}]}"#;
+        let list = parse_device_list(body).unwrap();
+        let cam = list
+            .find_camera_device()
+            .expect("a categoryCode=sp device must be found as a camera");
+        assert_eq!(cam.dev_id, "d1");
+        assert!(cam.is_camera());
+        assert_eq!(cam.category.as_deref(), Some("sp"));
+    }
+
+    // NEGATIVE: a non-camera categoryCode is not mistaken for a camera (prove the
+    // alias does not over-match).
+    #[test]
+    fn category_code_alias_non_camera_is_not_camera() {
+        let body = br#"{"deviceList":[{"devId":"d1","categoryCode":"cz"}]}"#;
+        let list = parse_device_list(body).unwrap();
+        assert!(list.find_camera_device().is_none());
     }
 
     // ── list_devices service: TOKEN-PENDING discipline ─────────────────────

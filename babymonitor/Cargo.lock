@@ -79,6 +79,7 @@ version = "0.0.0"
 dependencies = [
  "babymonitor-core",
  "clap",
+ "serde_json",
 ]
 
 [[package]]

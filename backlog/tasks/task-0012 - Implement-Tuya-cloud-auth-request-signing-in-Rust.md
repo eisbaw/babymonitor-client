@@ -4,7 +4,7 @@ title: Implement Tuya cloud auth + request signing in Rust
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 01:59'
+updated_date: '2026-06-25 03:29'
 labels:
   - phase5
   - rust
@@ -47,4 +47,6 @@ SIGN: see re/tuya_sign.md (NOT here). String-to-sign reproducible (sort whitelis
 TOKEN MODEL: session=User.sid. No refresh-token; on session-invalid RE-LOGIN. Persist sid+uid to ~/.local/share/babymonitor/ (both SECRET).
 DATACENTER: do NOT hardcode base URL. Use User.domain.mobileApiUrl (+ gwApiUrl, gwMqttUrl, regionCode) from the login response (F5). Bootstrap login against the region candidate, then switch to domain.mobileApiUrl. Pre-login helpers: thing.m.user.region.list, thing.m.app.domain.query.
 LIMITATION: exact on-wire a= spelling + obfuscated device-list action need a live/Frida confirm.
+
+FEED-FORWARD from TASK-0023 (static signer dive, re/tuya_sign_static.md). CORRECTION: the keyed sign primitive is **plain MD5 (32-char lowercase hex)**, NOT HMAC-SHA256 — confirmed at byte level (MD5 IV 0x67452301.. at libthing_security.so@0x76c0; 16-byte digest out @0x194b0; hex table @0x7810). Rust algorithm: sign = MD5_hex_lower(cert_sha256_hex + '_' + bmp_token + '_' + appSecret [+ canonical_str2]); '_'-join confirmed (sep @0x88c4, '_' write @0x14c30); native key-builder @0x13474 MD5s twice. canonical str2 = the sorted-whitelist '||'-joined string from re/tuya_sign.md §1-3 (unchanged). UNBLOCKED parts (no device): (a) MD5/hex/'_'-join; (b) appKey/appSecret in secrets/tuya_appkey.json; (c) app-cert SHA-256 is COMPUTABLE OFFLINE from the APK signing cert META-INF/BNDLTOOL.RSA (method+location in secrets/tuya_appkey.json:app_cert_sha256) — removes the runtime-cert blocker. RESIDUAL BLOCKER: the t_s.bmp -> bmp_token decode is a deterministic imath-bignum+matrix deobfuscation (libthing_security_algorithm.so: read_keys_from_content/parse/transform + mp_int_exptmod, 'inited matrix:' @0x5eb0) — reproducible in principle but UN-PORTED (filed as follow-up TASK for the matrix port). STATIC DIFFERENTIAL VECTOR is possible WITHOUT a device: reference = nalajcie/tuya-sign-hacking re-impl; until bmp_token is ported, a partial differential validates the MD5/'_'-join/cert-hash sub-steps. So AC#1 byte-for-byte is achievable statically ONCE the bmp matrix port lands; AC#3's live-vector fallback is NOT required if that port succeeds. Update AC#1/#2 wording 'HMAC' -> 'MD5'.
 <!-- SECTION:NOTES:END -->

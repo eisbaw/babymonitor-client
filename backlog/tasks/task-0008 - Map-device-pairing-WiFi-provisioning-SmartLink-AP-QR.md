@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@reverser'
 created_date: '2026-06-24 22:36'
-updated_date: '2026-06-25 08:38'
+updated_date: '2026-06-25 08:42'
 labels:
   - wave2
 dependencies:
@@ -25,9 +25,9 @@ WHY: to add a camera the app provisions WiFi (Tuya EZ/AP SmartLink via libThingS
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 re/pairing_flow.md documents: pairing-token request, EZ vs AP SmartLink packet/UDP scheme, the QR payload format, and the bind-confirm polling — evidence+confidence; honestly flags any part only in native code
-- [ ] #2 Identifies which steps are mandatory for an already-paired camera (our case) vs first-time setup, so the Rust client can target the minimal path first
-- [ ] #3 SCOPE NARROWING (already-paired camera): Wave-1 only confirms how an already-bound device appears in device-list and whether re-binding needs anything; defer full EZ/AP SmartLink packet + QR-payload reconstruction to a later wave as its own task
+- [x] #1 re/pairing_flow.md documents: pairing-token request, EZ vs AP SmartLink packet/UDP scheme, the QR payload format, and the bind-confirm polling — evidence+confidence; honestly flags any part only in native code
+- [x] #2 Identifies which steps are mandatory for an already-paired camera (our case) vs first-time setup, so the Rust client can target the minimal path first
+- [x] #3 SCOPE NARROWING (already-paired camera): Wave-1 only confirms how an already-bound device appears in device-list and whether re-binding needs anything; defer full EZ/AP SmartLink packet + QR-payload reconstruction to a later wave as its own task
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -63,4 +63,6 @@ GOTCHAS:
 - STATIC-COMPLETE: EZ packet scheme, smartLink arg order, QR payload, token/AP/bind SHAPES. NEEDS-LIVE: exact AP UDP port, on-wire a= after thing->smartlife rewrite, poll cadence/timeout, byte-exact multicast group derivation.
 
 GATES: just check-evidence GREEN (17 docs, 0 waived); just secret-scan GREEN; just e2e GREEN.
+
+Cycle-24 review: both GO. EZ packet scheme byte-verified vs Ghidra C; already-paired conclusion sound + 2-source confirmed (HomeBean.deviceList + CameraInfoBean); pairing correctly de-scoped (NOT on critical path — already-paired needs only auth+device-list). Orchestrator fixed P1 (5 native-EZ body lines said 'so confirmed' under likely headers — reconciled to likely/single-binary-source) + checked ACs. P2 (Ghidra decompiler artifact gloss) non-blocking.
 <!-- SECTION:NOTES:END -->

@@ -148,7 +148,7 @@ Two independent sources: **Ghidra** headless decompilation of the encoder
 functions (`libThingSmartLink.so@0x110b7c` etc., committed `re/ghidra/smartlink_*.c`,
 image base 0x100000) AND a **radare2** cross-check disassembly of the same
 addresses (`libThingSmartLink.so@0x10b7c` at `laddr 0`, §3c). They agree on the
-structure, so this is `confirmed`. This is the classic Tuya **EZ
+structure, so this is `likely` (single binary source — Ghidra + r2 read the same `.so` = ONE source per TESTING.md). This is the classic Tuya **EZ
 (SmartConfig)** scheme: data is carried in the **length** of otherwise-empty UDP
 datagrams, not in their payload.
 
@@ -161,7 +161,7 @@ then `multicast_body_encode(ssid,pwd,token)`, then `send_data(...)`, then `relea
 ### 3a. Broadcast body — the length-sequence (confidence: likely)
 Two sources: Ghidra C (`re/ghidra/smartlink_broadcast_body_encode.c`, sym
 `_Z21broadcast_body_encodePKcS0_S0_`, `libThingSmartLink.so@0x110b7c`) AND the r2
-disassembly of the same (`libThingSmartLink.so@0x10b7c`, §3c) — so `confirmed`.
+disassembly of the same (`libThingSmartLink.so@0x10b7c`, §3c) — so `likely` (one binary, two tools = one source).
 `broadcast_body_encode(ssid, pwd, token)`:
 
 1. `len = strlen(ssid)+strlen(pwd)+strlen(token)` ; `dataLen = len+2`.
@@ -190,7 +190,7 @@ Two sources: Ghidra C (`re/ghidra/smartlink_multicast_body_encode.c`, sym
 `_Z21multicast_body_encodePKcS0_S0_`, `libThingSmartLink.so@0x111190`) AND the
 exported AES primitive it calls (`AES128_CBC_encrypt_buffer`,
 `libThingSmartLink.so@0x110350`, in `re/symbols/libThingSmartLink.dynsym.txt`) —
-so `confirmed`. `multicast_body_encode(ssid, pwd, token)`:
+so `likely` (single binary source). `multicast_body_encode(ssid, pwd, token)`:
 
 - Computes a **CRC32** (poly `0xEDB88320`, inlined) over each of ssid, pwd, token
   separately.
@@ -212,7 +212,7 @@ so `confirmed`. `multicast_body_encode(ssid, pwd, token)`:
 Two sources: Ghidra C `send_data` (`re/ghidra/smartlink_send_data.c`,
 `libThingSmartLink.so@0x1121e4`) AND Ghidra C `send_data_thread`
 (`re/ghidra/smartlink_send_data_thread.c`, `libThingSmartLink.so@0x1119ac`) —
-two distinct decompiled functions, so `confirmed`.
+two functions in the SAME binary, so `likely` (one source, not two independent ones).
 `send_data(p4,p5,p6,p7,p8)` (sym `_Z9send_dataiiiii`) opens a UDP socket
 (`socket(2,2,0)` = AF_INET/SOCK_DGRAM), clears `thing_quit_flag`, and spawns
 `send_data_thread` (sym `_Z16send_data_threadPv`):
@@ -230,7 +230,7 @@ two distinct decompiled functions, so `confirmed`.
 ### 3d. Ghidra-vs-radare2 cross-check (confidence: likely)
 Two sources: the Ghidra C (`re/ghidra/smartlink_broadcast_body_encode.c`,
 `libThingSmartLink.so@0x110b7c`) AND the independent r2 disassembly
-(`libThingSmartLink.so@0x10b7c`) — same function, two tools, so `confirmed`.
+(`libThingSmartLink.so@0x10b7c`) — same function, two tools (one binary source), so `likely`.
 r2 (`r2 -m 0 … pi @ 0x10b7c`) on `broadcast_body_encode` confirms the Ghidra
 reading: three `bl strlen` (ssid/pwd/token), `bl malloc`, `strb w,[x0],1` writing
 the length-prefix at offset 1, `bl memcpy` of the fields, and the high-bit OR

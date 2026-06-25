@@ -4,7 +4,7 @@ title: 'SPIKE: libThingP2PSDK session + AV framing feasibility'
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:36'
-updated_date: '2026-06-25 03:14'
+updated_date: '2026-06-25 06:22'
 labels:
   - phase4
   - re
@@ -55,4 +55,6 @@ Structs/enums to recover: imm_p2p_rtc_frame_t, imm_p2p_rtc_options, imm_p2p_rtc_
 NOTE: since WebRTC won, the PPCS AV-framing reconstruction is now LOW priority; the verdict (AC#2) should likely steer Wave-2 to WebRTC-over-MQTT and name the SDP-carried AES key / DTLS handshake as the pcap-unblockable bytes.
 
 forward-carried from TASK-0009 review: (1) JNI ThingP2PSDK.connect/disConnect is RTC v1 in libThingP2PSDK, NOT a PPCS entry point (real PPCS=connect4ppcs in libThingCameraSDK) — don't dive it as PPCS. (2) When citing the SDP/ICE machinery, 'field-for-field match' to tuya-rtc-camera-sdk-android is shape-consistent only (not byte-verified statically). (3) re/p2p_triage.md §3 named the OpenH264 decoder CWelsDecoder; actual classes are CWelsH264SVCEncoder + ThingOpenH264Decoder.
+
+DEFERRED to Wave-2 (WebRTC won the transport decision per TASK-0017; the deep PPCS AV-framing spike is only needed if the real SCD921 returns p2pType==2 — gated behind a live device-list call). Not a Wave-1 blocker.
 <!-- SECTION:NOTES:END -->

@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@reverser'
 created_date: '2026-06-25 04:12'
-updated_date: '2026-06-25 06:19'
+updated_date: '2026-06-25 06:22'
 labels:
   - phase3
   - re
@@ -34,6 +34,8 @@ Residual from TASK-0029 (re/bmp_token_decode.md, Decode: partially-ported). The 
 
 <!-- SECTION:NOTES:BEGIN -->
 Script reconciliation (follow-up to commit 8753bf1) completed: re/scripts/bmp_token_decode.py + re/scripts/test_bmp_token_decode.py corrected to the FINAL verified model. Removed the retracted 'white-box table cipher / matrix-doesn-t-apply / no-edge-from-BMP-driver' assertions from the module docstring, thisapp_decode() residual, and the CLI report. thisapp_decode() now raises MatrixResidual (WhiteBoxResidual kept as a back-compat alias) citing the imath+matrix decode of raw t_s.bmp on the sign path (fcn.13b5c->doCommandNative->read_keys_from_content@0x4974->fcn.5eb0), un-ported (no local oracle; nalajcie's older byte-layout mismatches). Tests test_matrix_scheme_does_not_apply -> test_nalajcie_older_layout_does_not_match_this_apk (narrow layout-mismatch fact only) and test_thisapp_decode_is_walled -> test_thisapp_decode_is_unported. 12 decode tests pass; check-evidence/secret-scan/e2e all GREEN. No live retracted-model assertion remains in re/scripts/.
+
+Cycle-18 review: AES finding sound (both reviewers byte-verified); NO-GO on stale bmp_token_decode.py (lying tests + docstring) -> fixed in 31eed22, re-review GO. FINAL settled model: t_s.bmp feeds TWO paths — fcn.11658 AES->cert-pinning (red herring) AND fcn.13b5c->read_keys_from_content->imath+matrix (fcn.5eb0) = the bmp_token on the sign path (corroborates F1). bmp_token = statically-recoverable-in-principle (deterministic) but UN-PORTED, no static oracle. Residual = TASK-0032.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

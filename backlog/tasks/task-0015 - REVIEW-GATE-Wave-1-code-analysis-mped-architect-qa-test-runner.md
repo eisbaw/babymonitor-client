@@ -4,13 +4,12 @@ title: 'REVIEW GATE: Wave-1 code + analysis (mped-architect + qa-test-runner)'
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-24 22:47'
+updated_date: '2026-06-25 06:22'
 labels:
   - phase-gate
   - review
   - wave1
 dependencies:
-  - TASK-0010
   - TASK-0012
   - TASK-0013
   - TASK-0014

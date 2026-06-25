@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@reverser'
 created_date: '2026-06-25 10:54'
-updated_date: '2026-06-25 11:08'
+updated_date: '2026-06-25 11:15'
 labels:
   - phase3
   - wave3
@@ -53,4 +53,6 @@ GOTCHAS:
 VERDICT: config provenance = STATIC (appKey). All signer INPUTS known offline. But trustworthy bmp_token VALUE = needs-live-login for VALIDATION (one accepted sign) OR a finished+oracle'd op1-walk port. Login sign documented byte-exact (ThingApiSignManager.generateSignatureSdk): sorted whitelist key=val joined '||', postData->swapSignString(md5AsBase64(body)), key=cert_sha256_hex_<bmp keys>_appSecret, plain MD5 hex. bmp_token IS required for login (cached key reused).
 
 Gates: check-evidence OK, secret-scan OK, e2e OK (16 port tests pass).
+
+Cycle review: both GO. config=appKey claim VERIFIED at both ends (architect independently traced param_6=mAppId=appKey). Verdict: bmp_token statically recoverable IN PRINCIPLE — debug op1 walk to integral (denom==1, necessary self-oracle) with real appKey config; live login = VALIDATION not bootstrap. P2: tuya_sign.md:28-29 refinement-lag (fold a pointer into next cycle); clientId vs appId -> noted on TASK-0012.
 <!-- SECTION:NOTES:END -->

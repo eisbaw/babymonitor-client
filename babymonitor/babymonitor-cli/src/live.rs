@@ -571,6 +571,20 @@ fn send_atop(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
+    // Form body. App-faithful: `ApiParams.getRequestBody()` puts BOTH `postData`
+    // AND `deviceId` (KEY_DEVICEID="deviceId") into the request body
+    // (`decompiled/.../ApiParams.java:87-89`), even though `deviceId` ALSO rides
+    // the signed URL query (`ApiParams.java:227`, which our envelope already
+    // covers). We mirror that: `deviceId` is added to the body here, while
+    // remaining in the signed query envelope. The sign canonical string is
+    // UNCHANGED — `deviceId` is already a SIGN_WHITELIST param signed from the
+    // envelope map; the wire body form is never part of the sign input. The
+    // body's `deviceId` value is the SAME per-install handle as the envelope's.
+    let mut body_form = format!("postData={}", urlencode(post_data));
+    if let Some(device_id) = envelope.get("deviceId") {
+        body_form.push_str(&format!("&deviceId={}", urlencode(device_id)));
+    }
+
     let mut req = client
         .post(&url)
         .query(&query)
@@ -578,7 +592,18 @@ fn send_atop(
             reqwest::header::CONTENT_TYPE,
             "application/x-www-form-urlencoded",
         )
-        .body(format!("postData={}", urlencode(post_data)));
+        .body(body_form);
+
+    // App-faithful telemetry header: `OKHttpBusinessRequest` UNCONDITIONALLY adds
+    // `x-client-trace-id` = `thingApiParams.getRequestId()`
+    // (`decompiled/.../OKHttpBusinessRequest.java:23,342`; CLIENT_TRACE_ID =
+    // "x-client-trace-id"). `getRequestId()` returns the SAME `requestId` already
+    // in our signed envelope, so we reuse that value verbatim. It is a per-request
+    // handle, not a secret, but we don't log it. It rides as a request HEADER, not
+    // a signed param, so it does not affect the canonical sign string.
+    if let Some(request_id) = envelope.get("requestId") {
+        req = req.header("x-client-trace-id", request_id.clone());
+    }
 
     if let Some(auth) = &cfg.creds.authorization {
         req = req.header(reqwest::header::AUTHORIZATION, auth.clone());

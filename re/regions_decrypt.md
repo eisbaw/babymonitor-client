@@ -119,7 +119,11 @@ not on the regions path). Host recovered.
 
 ## Recovered datacenter hosts (NON-SECRET, public Tuya gateways) (confidence: confirmed)
 
-`regions` decrypts to 4 regions. **EU is the `defaultConfig` region:**
+`regions` decrypts to 4 regions. **EU is the `defaultConfig` region.** The
+account owner's countryCode (DK=45) resolves to EU, so the EU `regionConfig` is
+the authoritative host map for this client.
+
+### Per-region mobile-atop + gateway (the original 2 fields)
 
 | region | mobileApiUrl (atop) | gwApiUrl |
 |---|---|---|
@@ -128,9 +132,68 @@ not on the regions path). Host recovered.
 | IN | `https://a1-in.iotbing.com` | `http://a1-in.iotbing.com/gw.json` |
 | RU | `https://a1.iot334.com` | (none) |
 
+### AUTHORITATIVE full EU `regionConfig` host/port list (TASK-0048) (confidence: confirmed)
+
+The host false-exhaustion (TASK-0046 review gate) happened because earlier work
+saw only `mobileApiUrl`/`gwApiUrl`. `regions_decrypt.py` now emits EVERY
+`regionConfig` scalar field (`region_host_fields`); the EU region has **24**
+host/port fields. All are PUBLIC Tuya datacenter endpoints (no account secret),
+so they are documented here. Reproduce with
+`nix-shell --run 'python3 re/scripts/regions_decrypt.py'`. Two independent
+sources: the decrypted asset itself AND the `test_regions_decrypt.py` real-asset
+cross-check (`just test-regions`, asserts >10 fields incl. fusionUrl/pxApiUrl/
+deviceHttpsPskUrl).
+
+| field | EU value | role |
+|---|---|---|
+| `mobileApiUrl` | `https://a1.tuyaeu.com` | mobile-app atop API (the host already tried) |
+| `gwApiUrl` | `http://a.gw.tuyaeu.com/gw.json` | device gateway API |
+| `fusionUrl` | `https://apigw-eu.iotbing.com` | **iotbing "fusion" API gateway — UN-PROBED, rank-1 TASK-0048 target** |
+| `pxApiUrl` | `http://px.tuyaeu.com` | px API — UN-PROBED TASK-0048 target |
+| `deviceHttpsPskUrl` | `https://a3.tuyaeu.com` | device HTTPS-PSK (`a3.tuyaeu.com`) — UN-PROBED TASK-0048 target |
+| `aispeechHttpsUrl` | `https://aispeech.tuyaeu.com` | AI-speech HTTPS |
+| `aispeechQuicUrl` | `https://i1.tuyaeu.com` | AI-speech QUIC |
+| `mobileMqttsUrl` | `m1.tuyaeu.com` | mobile MQTTS broker |
+| `mobileMqttUrl` | `mq.mb.tuyaeu.com` | mobile MQTT broker |
+| `mobileMediaMqttUrl` | `s.tuyaeu.com` | mobile media MQTT |
+| `mobileQuicUrl` | `https://u1.tuyaeu.com` | mobile QUIC |
+| `gwMqttUrl` | `mq.gw.tuyaeu.com` | gateway MQTT |
+| `mqttQuicUrl` | `q1.tuyaeu.com` | MQTT-over-QUIC |
+| `thingAppUrl` | `app-support.tuyaeu.com` | thing app-support |
+| `tuyaAppUrl` | `app-support.tuyaeu.com` | tuya app-support |
+| `thingImagesUrl` | `images.tuyaeu.com` | thing images CDN |
+| `tuyaImagesUrl` | `images.tuyaeu.com` | tuya images CDN |
+| `regionCode` | `EU` | region code |
+| `httpPort` | `80` | plain HTTP port |
+| `httpsPort` | `443` | HTTPS port |
+| `httpsPskPort` | `443` | HTTPS-PSK port |
+| `mqttPort` | `1883` | MQTT port |
+| `mqttsPort` | `8883` | MQTTS port |
+| `mqttsPskPort` | `8886` | MQTTS-PSK port |
+
+The four un-probed EU-family hosts ranked for the TASK-0048 live probe:
+`apigw-eu.iotbing.com` (fusionUrl), `a1-us.iotbing.com` (AZ-region mobileApiUrl,
+the iotbing cloud's mobile-atop), `px.tuyaeu.com` (pxApiUrl), `a3.tuyaeu.com`
+(deviceHttpsPskUrl). `a1-us.iotbing.com` is the AZ region's `mobileApiUrl`
+(table above), included because the iotbing cloud (newer Smart-Life/"bing"
+datacenter family) is the most likely place a key drawing `ILLEGAL_CLIENT_ID`
+from the legacy `a1.tuyaeu.com` gateway is actually provisioned.
+
 ---
 
-## FEED-FORWARD to TASK-0042 (the live re-attempt) (confidence: confirmed)
+## FEED-FORWARD to TASK-0042 (the live re-attempt) (confidence: likely)
+
+> **CORRECTED / SCOPED by TASK-0048 (host false-exhaustion).** The prior verdict
+> here said the host hypothesis was "REFUTED by ground truth" at `confirmed`.
+> That OVERTURNED claim rested on only the **`mobileApiUrl`** field of the EU
+> regionConfig (`a1.tuyaeu.com`) — i.e. 1 of the 24 EU host fields. The
+> regionConfig also carries `fusionUrl=apigw-eu.iotbing.com`, `pxApiUrl`,
+> `deviceHttpsPskUrl=a3.tuyaeu.com`, and the AZ region's iotbing
+> `mobileApiUrl=a1-us.iotbing.com` (full list above) — NONE of which were ever
+> probed. A confirmed-correct appKey provisioned on the newer iotbing
+> ("bing"/Smart-Life) datacenter family draws `ILLEGAL_CLIENT_ID` from the legacy
+> `a1.tuyaeu.com` gateway. So the host avenue is NOT exhausted; the verdict is
+> downgraded to `likely` and scoped to `mobileApiUrl` only.
 
 Evidence: the decrypted `decompiled/apktool/assets/thing_domains_v1/regions` EU host
 (PART 2) + `babymonitor/babymonitor-cli/src/live.rs` (PART 1); the prior live capture
@@ -139,13 +202,17 @@ Evidence: the decrypted `decompiled/apktool/assets/thing_domains_v1/regions` EU 
 
 1. **clientId wire param is CORRECT** — `live.rs` already sends `clientId=<appKey>` (and
    `time=<epoch_ms>`) on the wire query. No change required.
-2. **EU mobile-atop host = `a1.tuyaeu.com`** — and this is **EXACTLY the host TASK-0042
-   already tried** (`re/live_login.md`: `a1.tuyaeu.com` → `ILLEGAL_CLIENT_ID`).
+2. **EU `mobileApiUrl` = `a1.tuyaeu.com`** — and this is the host TASK-0042 already
+   tried (`re/live_login.md`: `a1.tuyaeu.com` → `ILLEGAL_CLIENT_ID`). This refutes
+   the host hypothesis ONLY for `mobileApiUrl`; the iotbing/px/a3/fusion EU-family
+   gateways are UN-PROBED (TASK-0048 probes them).
 
-**The "wrong datacenter host" hypothesis for `ILLEGAL_CLIENT_ID` is REFUTED by ground
-truth.** The appKey's real EU datacenter IS the legacy `a1.tuyaeu.com` that was already
-rejected. So `ILLEGAL_CLIENT_ID` is NOT a host/routing problem and NOT a clientId-param
-problem. The remaining live hypotheses (for the operator to weigh, NEXT cycle) are:
+**Scoped verdict (confidence: likely): the "wrong datacenter host" hypothesis is
+refuted for `mobileApiUrl` only.** `ILLEGAL_CLIENT_ID` is NOT a clientId-param
+problem. The remaining live hypotheses (for the operator to weigh) are, in order:
+- a **wrong datacenter family** — the appKey may be provisioned on the iotbing
+  cloud (`apigw-eu.iotbing.com` / `a1-us.iotbing.com`), not the legacy
+  `a1.tuya*.com` gateway (TASK-0048 live probe);
 - a **provisioning / app-cert-pin gate**: the public gateway may bind this appKey to the
   packaged app's signing identity (an `Authorization`/channel header or server-side
   app-cert check) that a standalone client cannot reproduce (the CAVEAT in TASK-0043);
@@ -153,6 +220,6 @@ problem. The remaining live hypotheses (for the operator to weigh, NEXT cycle) a
   returning a sign-specific error (e.g. the unvalidated `bmp_token` candidate / MD5
   fold, `re/bmp_token_provenance.md`).
 
-A host change will NOT fix it — do not re-sweep hosts. The single remaining live
-`token.get` (not lockout-sensitive) should instead vary the provisioning surface
-(app-identity header / appKey re-check), not the host.
+Changing `mobileApiUrl` will not fix it — but the iotbing/px/a3 EU-family hosts
+were never tried, so the host avenue is NOT exhausted. TASK-0048 probes those
+un-tried hosts (one `token.get` each) before concluding the host avenue is dead.

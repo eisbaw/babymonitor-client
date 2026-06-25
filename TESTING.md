@@ -53,6 +53,25 @@ decompile, so a `.md` path does not count as a citation token and does not count
 - BAD ("ungrounded"): an adjective ("the app uses a secure handshake") with no citation, a
   confidence label absent, or `confirmed` asserted from a single source.
 
+### Shape vs content, and the verdict-overturn guard (TASK-0021)
+`just check-evidence` validates the **shape** of grounding (a confidence label + a citation token of
+a real form, with `confirmed` needing ≥2 *independent* sources) — it does **NOT** verify that a cited
+file/line actually contains the claimed symbol. A **wrong attribution** (citing a file that does not
+contain the claimed content) passes the shape lint. Full content-validation is **not** implemented:
+it needs the gitignored decompiled tree present (not guaranteed in CI), and jadx line drift makes a
+line-anchored content grep rot. **Attribution accuracy is therefore owned by the human / mped-architect
+review gate**, which has reliably caught these — this is an accepted, documented limitation, not a bug.
+
+The one content-adjacent check the lint **does** enforce mechanically is the **verdict-overturn guard**:
+the recurring failure mode (4×, every time caught by review, never by the lint) was an *overturned*
+verdict surviving as a current claim in a sibling doc. `check_evidence.py` keeps a data-driven table of
+`(old_token → superseded_by)` and **fails** unless every surviving hit of a superseded token sits inside
+a forward-pointer frame — `SUPERSEDED` / `REFUTED` / `CORRECTED` / `RETRACTED` / `HISTORICAL` /
+`OVERTURNED` / `erratum`, a `~~strikethrough~~`, or an option-set `{a | token | b}` menu (incl. the
+enclosing section heading, e.g. `## [HISTORICAL — WRONG] …`). Add a row to that table whenever a spike
+overturns a verdict; the guard then enforces cross-doc reconciliation mechanically. Runs inside
+`just check-evidence`; the `--selftest` proves it goes red on a planted un-framed stale token.
+
 ### Negative feedback (how the system tells us we're wrong)
 - `just check-evidence` — a lint over `re/*.md` that fails if a section making a protocol claim has
   no citation token or no confidence label. If nothing can fail this lint, the docs aren't grounded.

@@ -258,12 +258,18 @@ MATERIAL:**
 (the §8 claim of "no runtime input / static config blob" is **CORRECTED** by the
 Ghidra port: the config blob is a RUNTIME JNI `byte[]`, not a static asset).
 
-## 9. The Ghidra-C BYTE-EXACT port + the runtime-config finding (TASK-0033, confidence: confirmed)
+## 9. The Ghidra-C BYTE-EXACT port + the runtime-config finding (TASK-0033, confidence: likely)
 
-Two independent sources: **Ghidra 11.4.2 headless** C decompilation of all nine
-functions in the decode chain (committed under `re/ghidra/*.c`) AND the radare2
-disassembly of `libthing_security_algorithm.so@0x5138` (used to resolve two
-offset-walk arguments Ghidra elided). The port is `re/scripts/bmp_token_ghidra.py`
+Two-TOOL corroboration of ONE artifact (candor — these are NOT two independent
+sources): **Ghidra 11.4.2 headless** C decompilation of all nine functions in the
+decode chain (committed under `re/ghidra/*.c`) AND the radare2 disassembly, both of
+the SAME binary `libthing_security_algorithm.so@0x5138` (used to resolve two
+offset-walk arguments Ghidra elided). Ghidra and r2 agreeing byte-for-byte raises
+confidence in the *decompilation's correctness* (Wave-1 lesson #4), but they are two
+views of one `.so`, so this is `likely`, not `confirmed`: there is **no independent
+oracle** for the matrix decode (no embedded test vector in the `.so`; the only true
+oracle is a live sign-accept, excluded by scope — see the Verdict below). The port is
+`re/scripts/bmp_token_ghidra.py`
 (+ `test_bmp_token_ghidra.py`, 16 tests). Ghidra invocation that worked:
 
 ```

@@ -1,10 +1,11 @@
 ---
 id: TASK-0021
 title: check-evidence validates citation SHAPE not CONTENT (false-attribution passes)
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@architect'
 created_date: '2026-06-25 01:11'
-updated_date: '2026-06-25 07:09'
+updated_date: '2026-06-25 08:53'
 labels:
   - phase5
   - gates
@@ -22,13 +23,17 @@ From cycle-4 review (mped-architect, P1): check_evidence.py validates that a cit
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Either an opportunistic content-check is added (when cited file exists, verify a claim token near the cited line) with a self-test, OR the limitation is documented in check_evidence.py header + TESTING.md and accepted with rationale
+- [x] #1 Either an opportunistic content-check is added (when cited file exists, verify a claim token near the cited line) with a self-test, OR the limitation is documented in check_evidence.py header + TESTING.md and accepted with rationale
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. Add data-driven verdict-overturn guard to check_evidence.py: list of {old_token, superseded_by} pairs. Grep re/*.md for each old token; a hit FAILS unless the surrounding context carries a SUPERSEDED/REFUTED/CORRECTED/HISTORICAL/erratum forward-pointer frame. 2. Self-test: planted doc asserting old token as current FAILS; framed doc PASSES. 3. Wire into run() so 'just check-evidence' runs it. 4. For content-vs-shape: document the limitation in check_evidence.py header + TESTING.md (cheaper than opportunistic check, gitignored decompile not always present). 5. Run guard over real re/ tree; fix any genuinely un-framed stale token doc.
+<!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-SYSTEMIC FOLLOW-UP (recurring, 2x): when a spike OVERTURNS a prior verdict, the entry/sibling docs that authoritatively assert the OLD verdict are not automatically reconciled, producing a cross-doc contradiction (NO-GO under TESTING.md 'record which won and why'). Recurrences: (1) TASK-0006/F5 (milestone2 sign-sufficiency staleness vs the TASK-0005 spike); (2) TASK-0023 (three docs — tuya_sign.md, review_wave1_analysis.md, milestone2_findings.md, plus tuya_cloud_auth.md found during verification — still asserted needs-runtime-hook after partially-recoverable superseded it). Proposed cheap guard, in scope of this gate's content-vs-shape gap: a checklist/grep step run whenever a verdict changes — e.g. after a spike sets a new verdict token, grep re/ for the OLD token and require each remaining hit to be either in the winning doc as history or to carry a SUPERSEDED pointer. This is a coherence/lint affordance (could be a soft check-evidence advisory), not a P0 wire gate. Keep low priority; do not over-engineer into a full content validator.
-
-STRENGTHENED (TASK-0033, 4th recurrence). The overturn-lag pattern recurred AGAIN: TASK-0033 (Ghidra port) REFUTED the 'bmp_token decode is deterministic / no runtime input / statically-recoverable-in-principle' model (the decode keys off a RUNTIME JNI byte[] SDK-config, doCommandNative param_6) -- but THREE docs still asserted the refuted model as current and a review NO-GO'd: (3a) tuya_sign_static.md §5+§6, (3b) bmp_token_whitebox.md §6/§7 verdict-skim sections, (3c) bmp_token_decode.md + tuya_sign.md banner. Now reconciled manually (TASK-0033 doc-reconciliation commit). This is recurrence #4 (after #1 TASK-0006/F5, #2/#3 TASK-0023's doc set). A grep-guard would have caught ALL FOUR mechanically. WAVE-2 SHOULD IMPLEMENT the verdict-overturn grep-guard: after a spike sets a NEW verdict token, a check greps re/ for the OLD verdict token(s) and FAILS unless each hit is in history/SUPERSEDED/REFUTED context with a forward-pointer to the authoritative section. Make it a real gate step (e.g. an advisory in check-evidence or a dedicated just recipe run in e2e), not just a checklist -- the manual checklist has now failed to prevent 4 recurrences. Per scope this is NOT implemented now (Wave-2).
+DONE. Verdict-overturn guard implemented in check_evidence.py (lint_verdicts), wired into run() so 'just check-evidence' and 'just e2e' enforce it. Data-driven SUPERSEDED_VERDICTS table of (old, superseded_by, pattern): needs-runtime-hook, 'white-box table cipher', 'no runtime input', 'statically-recoverable-in-principle'. Every hit must be framed: FRAME_WORDS (SUPERSEDED/REFUTED/CORRECTED/RETRACTED/HISTORICAL/OVERTURNED/erratum/conservative/pre-disassembly/stale/...) within +-3 lines, OR a frame word in the ENCLOSING SECTION HEADING (section-anchored, catches the '## [HISTORICAL — WRONG]' case 18 lines above the hit), OR a ~~strikethrough~~, OR an option-set {a|token|b} menu (window-joined so it works across wrapped lines). Self-tests prove RED on un-framed stale token + GREEN on banner/heading/strike/option-set framing. RAN OVER REAL re/ TREE: GREEN — all 24 superseded-token hits are genuinely framed (audited each: SUPERSEDED/REFUTED/RETRACTED/OVERTURNED/conservative/option-set; none rely on incidental matches). NO un-framed stale token found in the live tree (the manual reconciliations from TASK-0023/0033 already framed them; the guard now makes it mechanical). GOTCHA: line-window alone missed the [HISTORICAL] heading at distance>window — section-anchored heading check is essential; and option-set braces can wrap lines so OPTION_SET_RE must run on window text not the single line. CONTENT-VS-SHAPE (AC part 2): chose DOCUMENTED-ACCEPTANCE (cheaper than opportunistic check, which would be GREEN-when-decompile-absent=false confidence, and jadx line drift rots a content grep). Documented limitation in check_evidence.py header + TESTING.md 'Shape vs content'; attribution accuracy owned by the review gate.
 <!-- SECTION:NOTES:END -->

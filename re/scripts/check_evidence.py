@@ -59,6 +59,34 @@ THE RULE (pinned; documented here so it is auditable, not a black box):
      mentioning "partially" does NOT satisfy the gate; the verdict must be an
      explicit, machine-checkable label. Zero or many labelled verdicts → fail.
 
+  6. VERDICT-OVERTURN GUARD (TASK-0021). The project's recurring failure mode (4×,
+     each caught by the human/review gate, NEVER by a lint) was "verdict-overturn
+     lag": when a later spike OVERTURNED an earlier verdict, the old verdict token
+     survived as a CURRENT claim in sibling docs. SUPERSEDED_VERDICTS is a small,
+     data-driven table of (old_token, superseded_by); lint_verdicts() greps re/*.md
+     and FAILS on any hit of an old token that is NOT inside a forward-pointer frame
+     (SUPERSEDED/REFUTED/CORRECTED/RETRACTED/HISTORICAL/OVERTURNED/erratum, a
+     strikethrough `~~…~~`, or an option-set `{a|token|b}` menu). This is the
+     mechanical guard that would have caught all four recurrences. Maintain the
+     table: add a row whenever a spike overturns a verdict.
+
+KNOWN LIMITATION — SHAPE, NOT CONTENT (TASK-0021 AC #1; documented + accepted).
+  This lint validates the SHAPE of a citation (it matches a path:line / symbol /
+  named-ref token and a confidence label) but NOT that the cited file/line actually
+  CONTAINS the claimed symbol or content. A WRONG ATTRIBUTION — e.g. citing
+  `dpdqppp.java` for a `nin/nout` topic prefix that file does not contain — passes
+  the gate. Full content-validation is deliberately NOT implemented here because:
+    (1) it needs the gitignored decompiled tree present (`just decompile`), which is
+        not guaranteed in CI / a fresh checkout — an opportunistic grep would be
+        GREEN-when-absent and so flaky/false-confidence; and
+    (2) jadx line numbers drift (TASK-0024), so a line-anchored content grep would
+        rot, and a symbol grep over a 100k-file tree on every lint is costly.
+  Attribution ACCURACY is therefore owned by the human / mped-architect REVIEW GATE
+  (which has reliably caught these), not this static linter. The verdict-overturn
+  guard above is the one CONTENT-adjacent check that earns its keep mechanically
+  (it cross-checks the *coherence* of verdict tokens across docs, not a single
+  citation's truth). See TESTING.md Part 1 "Shape vs content" for the rationale.
+
 Exit status: 0 = all clean; 1 = at least one finding. Findings are printed with
 file:line so a human can jump straight to the offending section.
 
@@ -143,6 +171,7 @@ CITATION_RE = re.compile(
     r"[\w./-]+:\d+"                       # path:NN (decompiled/foo.java:42) — legacy exact
     r"|[\w./-]+\." + SOURCE_EXT + r"(?:\s*~?:\d+)?\b"  # source path + optional ~:NN / :NN hint
     r"|lib[\w.-]*\.so(?:@0x[0-9A-Fa-f]+)?"  # lib*.so optionally @0xHEX
+    r"|[\w./-]*lib[\w.-]*?\.(?:dynsym|dynamic|symbols|syms|rodata|strings)\.txt"  # readelf/nm dump of a .so (TASK-0020 #2)
     r"|assets/[\w./-]+"                   # assets/… path
     r"|https?://[^\s)]+"                  # URL
     r"|\b[\w.-]+/[\w.-]+\b(?=.*\b(?:repo|github|ref|reference)\b)"  # owner/repo near a ref word
@@ -154,6 +183,208 @@ CITATION_RE = re.compile(
 # Stripped when de-duplicating citation tokens so a path cited bare and again with
 # a hint counts once (see distinct_citations).
 LINE_HINT_RE = re.compile(r"\s*~?:\d+$")
+
+# SAME-ARTIFACT COLLAPSE (TASK-0020 #2). Two readelf/nm dumps of the SAME native
+# library — e.g. `re/symbols/libThingP2PSDK.dynsym.txt` (the symbol table) and
+# `re/symbols/libThingP2PSDK.dynamic.txt` (the dynamic section), or the binary
+# `libThingP2PSDK.so` itself — are TWO VIEWS of ONE artifact, not two independent
+# sources. Counting them as 2 would let a `confirmed` claim satisfy the
+# >=2-source rule (rule 4b) from a single binary. We therefore canonicalise any
+# `.so` citation or any per-artifact symbol/section DUMP down to the library's
+# base name so all views of one `.so` collapse to ONE source token.
+#
+# A dump filename is `<libbase>.<view>.txt` where <view> is a readelf/nm section
+# we emit. The set is pinned (not a wildcard): adding a new dump suffix here is a
+# deliberate act. Two DIFFERENT libraries (libFoo.so vs libBar.so) keep distinct
+# base names and remain two independent sources, as intended.
+SO_VIEW_SUFFIXES = ("dynsym", "dynamic", "symbols", "syms", "rodata", "strings")
+# `<libbase>.<view>.txt`  (e.g. libThingP2PSDK.dynsym.txt) — captures libbase.
+_SO_DUMP_RE = re.compile(
+    r"(?:^|/)(lib[\w.-]*?)\.(?:" + "|".join(SO_VIEW_SUFFIXES) + r")\.txt$",
+    re.IGNORECASE,
+)
+# `<path>/libbase.so` (optionally @0xHEX, already stripped before this is applied).
+_SO_BIN_RE = re.compile(r"(?:^|/)(lib[\w.-]*?)\.so$", re.IGNORECASE)
+
+
+def _artifact_key(token: str) -> str:
+    """Collapse a citation token to its underlying ARTIFACT identity.
+
+    For a native lib — whether cited as the `.so` binary or as one of its
+    readelf/nm DUMP views (`lib*.dynsym.txt`, `lib*.dynamic.txt`, …) — the key is
+    the library base name (e.g. `libthingp2psdk`). Every view of one `.so` thus
+    maps to the SAME key and counts as ONE source for the >=2-source `confirmed`
+    rule. All other tokens (source paths, named refs, URLs) are returned
+    unchanged. Input is assumed already casefolded and line-hint-stripped.
+    """
+    m = _SO_DUMP_RE.search(token)
+    if m:
+        return "so:" + m.group(1).casefold()
+    m = _SO_BIN_RE.search(token)
+    if m:
+        return "so:" + m.group(1).casefold()
+    return token
+
+
+# ── Verdict-overturn guard (TASK-0021) ───────────────────────────────────────
+# THE failure mode of this whole project (recurred 4×, every time caught by the
+# human/review gate and NEVER by a lint): "verdict-overturn lag". When a later
+# spike OVERTURNS an earlier verdict, the old verdict token survives as a CURRENT
+# claim in the entry/sibling docs, producing a cross-doc contradiction. The manual
+# checklist failed to prevent 4 recurrences, so this is now a MECHANICAL gate.
+#
+# THE RULE: for each known-superseded verdict token, grep re/*.md. Every hit must
+# sit inside a forward-pointer FRAME — a SUPERSEDED / REFUTED / CORRECTED /
+# RETRACTED / HISTORICAL / OVERTURNED / erratum context that points at the
+# authoritative new verdict — OR be an option-set enumeration (`{a | token | b}`),
+# i.e. listing the token as a menu value, not asserting it. An un-framed hit is a
+# FINDING: the doc still asserts a refuted verdict as current.
+#
+# Data-driven: SUPERSEDED_VERDICTS is the small maintained table of
+# (old_token, superseded_by, pattern). Add a row when a spike overturns a verdict;
+# the guard then enforces reconciliation across re/ mechanically. Keep it honest —
+# a row here is a claim that `old` is dead and `superseded_by` is the live verdict.
+#
+# This is NOT a content validator; it is a coherence lint. It would have caught all
+# four historical recurrences (TASK-0006/F5, TASK-0023's three docs, TASK-0033's
+# three docs).
+
+# Words that, appearing near a superseded-token hit, count as a forward-pointer
+# frame (case-insensitive, whole-word where sensible). Strikethrough `~~…~~` and a
+# brace-enclosed option set are handled separately in _is_framed().
+FRAME_WORDS = [
+    "superseded", "supersede", "supersedes", "superseding",
+    "refuted", "refute", "refutes",
+    "corrected", "correct by", "correction",
+    "retracted", "retract",
+    "historical", "history",
+    "overturned", "overturn", "overturns",
+    "erratum", "errata",
+    "deprecated", "obsolete", "stale",
+    "pre-disassembly", "conservative",  # the documented "kept as history" framings
+    "no longer", "was wrong", "now wrong", "outdated",
+]
+FRAME_RE = re.compile(r"(?:" + "|".join(re.escape(w) for w in FRAME_WORDS) + r")",
+                      re.IGNORECASE)
+# Strikethrough span `~~ … ~~` — a hit inside one is framed as crossed-out history.
+STRIKE_RE = re.compile(r"~~.*?~~", re.DOTALL)
+# An option-set enumeration `{ a | b | c }` — the token is a menu VALUE, not a
+# current assertion (e.g. the per-spike "{recoverable-statically | needs-runtime-hook
+# | needs-live-capture}" token set). Such a hit is exempt.
+OPTION_SET_RE = re.compile(r"\{[^{}]*\|[^{}]*\}")
+
+# How many lines above/below a hit are scanned for a frame word. A forward-pointer
+# is usually on the same line or a banner a couple of lines away (e.g. a `>` quote
+# block above a `Verdict:` line). 3 is generous without swallowing a whole section.
+FRAME_WINDOW = 3
+
+
+@dataclass(frozen=True)
+class SupersededVerdict:
+    old: str            # the dead verdict token (human label)
+    superseded_by: str  # the live verdict that replaced it
+    pattern: str        # ERE/Python regex matching the old token in prose
+
+    @property
+    def regex(self) -> "re.Pattern[str]":
+        return re.compile(self.pattern, re.IGNORECASE)
+
+
+# The maintained table. EACH ROW is a reconciliation contract: `old` is dead,
+# `superseded_by` is live; every surviving `old` hit in re/ must be framed.
+SUPERSEDED_VERDICTS: list[SupersededVerdict] = [
+    SupersededVerdict(
+        old="needs-runtime-hook",
+        superseded_by="partially-recoverable (TASK-0023, tuya_sign_static.md)",
+        pattern=r"needs-runtime-hook",
+    ),
+    SupersededVerdict(
+        old="white-box table cipher (the wall)",
+        superseded_by="AES-128-CBC (TASK-0030, bmp_token_whitebox.md)",
+        pattern=r"white-box table cipher",
+    ),
+    SupersededVerdict(
+        old="no runtime input / static-config-only decode",
+        superseded_by="runtime SDK-config byte[] required (TASK-0033, "
+                      "doCommandNative param_6)",
+        pattern=r"no runtime input",
+    ),
+    SupersededVerdict(
+        old="statically-recoverable-in-principle (bmp_token decode)",
+        superseded_by="runtime SDK-config byte[] required (TASK-0033)",
+        pattern=r"statically-recoverable-in-principle",
+    ),
+]
+
+
+def _enclosing_heading(lines: list[str], idx: int) -> str:
+    """The nearest markdown heading at-or-above line `idx` (0-based), or ""."""
+    for j in range(idx, -1, -1):
+        if HEADING_RE.match(lines[j]):
+            return lines[j]
+    return ""
+
+
+def _is_framed(lines: list[str], idx: int) -> bool:
+    """True iff the hit on line `idx` (0-based) sits inside a forward-pointer frame.
+
+    A hit is framed when ANY of:
+      - a FRAME_WORD appears within ±FRAME_WINDOW lines (the SUPERSEDED/REFUTED/…
+        banner pattern), OR
+      - the ENCLOSING SECTION HEADING carries a frame word (e.g.
+        `## 3. [HISTORICAL — WRONG] …`) — a whole section explicitly marked history
+        frames every line under it, however far down the token sits (section-
+        anchored, robust to line drift — TASK-0020 #3), OR
+      - the hit line is inside a `~~ … ~~` strikethrough (crossed-out history), OR
+      - the hit sits inside a `{ a | b | c }` option-set enumeration (a menu value,
+        not a current assertion). The enumeration may wrap across lines, so the
+        ±window text is checked, not just the single hit line.
+    """
+    lo = max(0, idx - FRAME_WINDOW)
+    hi = min(len(lines), idx + FRAME_WINDOW + 1)
+    window = "\n".join(lines[lo:hi])
+    if FRAME_RE.search(window):
+        return True
+    if FRAME_RE.search(_enclosing_heading(lines, idx)):
+        return True
+    line = lines[idx]
+    if STRIKE_RE.search(line):
+        return True
+    # Option-set enumeration may span lines (`{a |\n b | c}`); check the window.
+    if OPTION_SET_RE.search(window):
+        return True
+    return False
+
+
+def lint_verdicts(re_dir: Path) -> list[Finding]:
+    """Verdict-overturn guard: every superseded-token hit must be framed."""
+    findings: list[Finding] = []
+    md_files = [
+        p for p in sorted(re_dir.glob("*.md")) if p.name not in EXCLUDED_DOCS
+    ]
+    for md in md_files:
+        lines = md.read_text(encoding="utf-8").splitlines()
+        for sv in SUPERSEDED_VERDICTS:
+            rx = sv.regex
+            for i, ln in enumerate(lines):
+                if not rx.search(ln):
+                    continue
+                if _is_framed(lines, i):
+                    continue
+                findings.append(
+                    Finding(
+                        str(md), i + 1,
+                        f"(verdict-overturn guard: '{sv.old}')",
+                        [
+                            f"superseded verdict token asserted WITHOUT a "
+                            f"SUPERSEDED/REFUTED/CORRECTED/HISTORICAL frame — it "
+                            f"was overturned by {sv.superseded_by}; add a "
+                            f"forward-pointer or strike it as history"
+                        ],
+                    )
+                )
+    return findings
+
 
 # ── Baseline waiver ratchet ──────────────────────────────────────────────────
 # Pre-existing grounding debt, locked in so the gate FAILS on regressions while
@@ -293,7 +524,10 @@ def distinct_citations(sec: Section) -> set[str]:
         # the >=2-source `confirmed` rule (rule 4b) by re-citing one file with and
         # without a line. The hint is decoration; the path/symbol is the source.
         tok = LINE_HINT_RE.sub("", m.group(0)).strip().casefold()
-        tokens.add(tok)
+        # Collapse all views of one native artifact (the `.so` and its readelf/nm
+        # dumps) to a single source key (TASK-0020 #2) so two dumps of the SAME
+        # `.so` cannot satisfy the >=2-source `confirmed` rule on their own.
+        tokens.add(_artifact_key(tok))
     for m in NAMED_REF_RE.finditer(txt):
         tokens.add(m.group(0).casefold())
     return tokens
@@ -377,6 +611,9 @@ def run(re_dir: Path) -> int:
     for md in md_files:
         findings.extend(lint_doc(md))
     findings.extend(lint_p2p(re_dir / "p2p_protocol.md"))
+    # Verdict-overturn guard (TASK-0021): the mechanical catch for the project's
+    # recurring "old verdict survives as a current claim" failure mode.
+    findings.extend(lint_verdicts(re_dir))
 
     active: list[Finding] = []
     waived: list[Finding] = []
@@ -659,6 +896,62 @@ def selftest() -> int:
             )
             failures += 1
 
+        # (d2) SAME-ARTIFACT collapse (TASK-0020 #2). A `confirmed` section whose
+        #      two citations are two DUMP VIEWS of the SAME `.so` — the symbol
+        #      table and the dynamic section, OR a dump + the `.so` binary — is
+        #      ONE source, not two, and must FLAG. A `confirmed` section citing two
+        #      DIFFERENT `.so` artifacts must PASS (they are genuinely independent).
+        same_so = tdir / "same_so.md"
+        same_so.write_text(
+            "## Native signaling exports\n\n"
+            "The WebRTC signaling strings carry the `handshake` token "
+            "(confidence: confirmed); see "
+            "re/symbols/libThingP2PSDK.dynsym.txt and "
+            "re/symbols/libThingP2PSDK.dynamic.txt.\n",
+            encoding="utf-8",
+        )
+        if not lint_doc(same_so):
+            print(
+                "SELFTEST FAIL: confirmed section citing TWO dumps of the SAME "
+                ".so (dynsym + dynamic) passed — same-artifact views counted as "
+                "two independent sources (TASK-0020 #2 hole open).",
+                file=sys.stderr,
+            )
+            failures += 1
+
+        same_so_bin = tdir / "same_so_bin.md"
+        same_so_bin.write_text(
+            "## Native signaling exports\n\n"
+            "The signaling strings carry the `handshake` token "
+            "(confidence: confirmed); see re/symbols/libThingP2PSDK.dynsym.txt "
+            "and the binary decompiled/nativelibs/libThingP2PSDK.so.\n",
+            encoding="utf-8",
+        )
+        if not lint_doc(same_so_bin):
+            print(
+                "SELFTEST FAIL: confirmed section citing a .so dump AND the same "
+                ".so binary passed — they are one artifact (TASK-0020 #2).",
+                file=sys.stderr,
+            )
+            failures += 1
+
+        diff_so = tdir / "diff_so.md"
+        diff_so.write_text(
+            "## Two native libs\n\n"
+            "The `handshake` is split across libs (confidence: confirmed); see "
+            "re/symbols/libThingP2PSDK.dynsym.txt and "
+            "re/symbols/libThingCameraSDK.dynsym.txt.\n",
+            encoding="utf-8",
+        )
+        if lint_doc(diff_so):
+            print(
+                "SELFTEST FAIL: confirmed section citing two DIFFERENT .so "
+                "artifacts was flagged — distinct libs must count as two sources: "
+                + "; ".join(f.render() for f in lint_doc(diff_so)),
+                file=sys.stderr,
+            )
+            failures += 1
+
         # (e) `.md` IS NOT A SOURCE (review fix to TASK-0024). A cross-doc `.md`
         # reference is a navigation pointer, not an independent decompiled artifact.
         #   (e1) a `confirmed` section whose two citations are two different `.md`
@@ -702,13 +995,98 @@ def selftest() -> int:
             )
             failures += 1
 
+    # ── Verdict-overturn guard self-test (TASK-0021) ─────────────────────────
+    # The mechanical catch for the project's 4×-recurring failure mode. Prove it
+    # BITES: a doc asserting a superseded token as CURRENT must FAIL; the SAME
+    # token framed as SUPERSEDED/HISTORICAL/struck-out/option-set must PASS.
+    with tempfile.TemporaryDirectory() as td:
+        tdir = Path(td)
+
+        # (vg-a) BAD: a superseded verdict asserted as a CURRENT claim, no frame.
+        stale = tdir / "stale_verdict.md"
+        stale.write_text(
+            "## Sign verdict\n\n"
+            "The signer cannot be reproduced offline; the production token is "
+            "`needs-runtime-hook` and a device is required to proceed.\n",
+            encoding="utf-8",
+        )
+        if not lint_verdicts(tdir):
+            print(
+                "SELFTEST FAIL: an un-framed superseded verdict "
+                "('needs-runtime-hook' asserted as current) was NOT flagged — the "
+                "verdict-overturn guard does not bite (this is the 4×-recurring "
+                "failure mode).",
+                file=sys.stderr,
+            )
+            failures += 1
+        Path(stale).unlink()
+
+        # (vg-b1) GOOD: same token, framed by a SUPERSEDED banner within window.
+        framed_banner = tdir / "framed_banner.md"
+        framed_banner.write_text(
+            "## Sign verdict (SUPERSEDED)\n\n"
+            "> SUPERSEDED by TASK-0023 (`tuya_sign_static.md`): the verdict below "
+            "is kept only as history.\n\n"
+            "Verdict: needs-runtime-hook\n",
+            encoding="utf-8",
+        )
+        if lint_verdicts(tdir):
+            print(
+                "SELFTEST FAIL: a superseded token carrying a SUPERSEDED frame was "
+                "flagged: "
+                + "; ".join(f.render() for f in lint_verdicts(tdir)),
+                file=sys.stderr,
+            )
+            failures += 1
+        Path(framed_banner).unlink()
+
+        # (vg-b2) GOOD: framed by an enclosing [HISTORICAL — WRONG] heading far
+        # above the hit (section-anchored frame, robust to line drift).
+        framed_heading = tdir / "framed_heading.md"
+        framed_heading.write_text(
+            "## 3. [HISTORICAL — WRONG] the old cipher claim\n\n"
+            + "filler line\n" * 12
+            + "The core transform is a white-box table cipher — the wall.\n",
+            encoding="utf-8",
+        )
+        if lint_verdicts(tdir):
+            print(
+                "SELFTEST FAIL: a superseded token under a [HISTORICAL] heading "
+                "(far above the hit) was flagged — section-anchored framing fails: "
+                + "; ".join(f.render() for f in lint_verdicts(tdir)),
+                file=sys.stderr,
+            )
+            failures += 1
+        Path(framed_heading).unlink()
+
+        # (vg-b3) GOOD: framed by strikethrough and by an option-set enumeration.
+        framed_misc = tdir / "framed_misc.md"
+        framed_misc.write_text(
+            "## Verdict menu and crossed-out history\n\n"
+            "Token set for this spike: {recoverable-statically | "
+            "needs-runtime-hook | needs-live-capture}.\n\n"
+            "The old call ~~the core transform is a white-box table cipher~~ is "
+            "retracted.\n",
+            encoding="utf-8",
+        )
+        if lint_verdicts(tdir):
+            print(
+                "SELFTEST FAIL: a superseded token inside an option-set OR a "
+                "strikethrough was flagged: "
+                + "; ".join(f.render() for f in lint_verdicts(tdir)),
+                file=sys.stderr,
+            )
+            failures += 1
+        Path(framed_misc).unlink()
+
     if failures:
         print(f"check-evidence selftest: {failures} failure(s)", file=sys.stderr)
         return 1
     print(
         "check-evidence selftest: OK (bites on bad, passes good, "
         "verdict-gate works, ratchet holds, symbol-anchored cites accepted "
-        "while no-citation claims still fail)"
+        "while no-citation claims still fail, same-artifact .so dumps collapse, "
+        "verdict-overturn guard bites on un-framed stale tokens)"
     )
     return 0
 

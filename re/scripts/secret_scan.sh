@@ -97,15 +97,36 @@ scan_stream() {
         continue
       fi
       # Redact for safe printing (P1-3): NEVER echo the secret value region into
-      # hook/CI logs. Keep only a short fixed-length prefix (enough to locate the
-      # line) then mask the rest as [REDACTED N chars]. The previous `cut -c1-72`
-      # printed up to 72 chars — long enough to leak a whole appKey/token.
-      local prefix_len=5
-      local total prefix
-      total="${#match}"
-      prefix="${match:0:prefix_len}"
-      printf 'SECRET[%s] (%s): %s…[REDACTED %d chars]\n' \
-        "$label" "$rule" "$prefix" "$((total - prefix_len > 0 ? total - prefix_len : 0))" >&2
+      # hook/CI logs. Mask from the matched VALUE, not the first N chars of the
+      # LINE (TASK-0020 #1). The old code kept `match:0:5` — safe only when a
+      # `path:`/`LINE:` prefix happened to lead the line, but a VALUE-LEADING line
+      # (a JWT/email/GPS at column 0, e.g. a raw `eyJ…` token or `victim@…`) would
+      # leak its first 5 chars (header/local-part). Instead, find WHERE the matched
+      # value starts inside the line and mask from there, keeping only the
+      # surrounding non-secret context (path/field-name prefix). The value is
+      # extracted with the SAME pattern via `grep -oiE` so the offset is exact.
+      local value off prefix vlen
+      value="$(printf '%s' "$match" | grep -oiE -m1 -- "$pat" 2>/dev/null)"
+      if [ -z "$value" ]; then
+        # Should not happen (the line matched the pattern), but fail safe: if we
+        # cannot isolate the value, redact the WHOLE line rather than risk a leak.
+        printf 'SECRET[%s] (%s): [REDACTED %d chars — value not isolable]\n' \
+          "$label" "$rule" "${#match}" >&2
+        HITS=$((HITS + 1))
+        continue
+      fi
+      # Byte offset of the value within the line (prefix = everything before it).
+      prefix="${match%%"$value"*}"
+      off="${#prefix}"
+      vlen="${#value}"
+      # Cap the shown prefix so a long path/field-name does not itself become a
+      # leak channel and the locator stays short. The value region is ALWAYS fully
+      # masked regardless of where it sits in the line.
+      if [ "$off" -gt 32 ]; then
+        prefix="…${prefix: -31}"
+      fi
+      printf 'SECRET[%s] (%s): %s[REDACTED %d chars]\n' \
+        "$label" "$rule" "$prefix" "$vlen" >&2
       HITS=$((HITS + 1))
     done < <(grep -anEhi -- "$pat" "$content_file" 2>/dev/null)
   done
@@ -208,6 +229,30 @@ selftest() {
     fails=$((fails + 1))
   else
     echo "selftest: redaction masks the value — full secret NOT printed (output: $out)" >&2
+  fi
+
+  # 1c) VALUE-LEADING redaction (TASK-0020 #1). A line whose secret value sits at
+  #     column 0 (no path:/field: prefix) MUST still be masked from the value, not
+  #     have its leading chars printed. Plant a JWT and an email at line start and
+  #     assert neither distinctive value substring appears in the output. The old
+  #     `match:0:5` redactor leaked the first 5 chars of such lines.
+  local vlead="$td/vlead.txt"
+  {
+    echo "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJsZWFrIn0.zzzleaktoken"  # secret-scan:allow
+    echo "victimleaduser@gmail.com"                                                # secret-scan:allow
+  } > "$vlead"
+  local vout vhits
+  vout="$(scan_stream "selftest-vlead" "$vlead" 2>&1)"
+  vhits="$(printf '%s\n' "$vout" | grep -c 'SECRET\[' || true)"
+  if [ "$vhits" -lt 2 ]; then
+    echo "SELFTEST FAIL: value-leading lines under-detected (got $vhits, want >=2)" >&2
+    fails=$((fails + 1))
+  elif printf '%s' "$vout" | grep -qiE 'eyJhbGci|victimleaduser'; then
+    echo "SELFTEST FAIL: redaction leaked a value-leading secret prefix into output:" >&2
+    echo "  $vout" >&2
+    fails=$((fails + 1))
+  else
+    echo "selftest: value-leading lines masked from the value (output: $vout)" >&2
   fi
 
   # 2) Clean file MUST pass (allowlisted owner email + harmless prose).

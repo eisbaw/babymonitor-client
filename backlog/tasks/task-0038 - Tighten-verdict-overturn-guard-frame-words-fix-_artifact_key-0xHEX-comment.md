@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@architect'
 created_date: '2026-06-25 09:02'
-updated_date: '2026-06-25 09:25'
+updated_date: '2026-06-25 09:31'
 labels:
   - gates
   - review-followup
@@ -50,6 +50,8 @@ GOTCHAS / decisions (TASK-0038):
 - Limitation: the soft+forward-pointer clause is still theoretically gameable by an adversary who writes BOTH an unrelated soft word AND a `see`/`.md` pointer within ±3 lines of a current stale verdict. That is a much more deliberate, review-visible construct than a bare soft word; the human/mped-architect gate remains the backstop (documented limitation, consistent with the shape-not-content stance).
 - P2: _artifact_key previously collapsed `.so@0xHEX` only by a CITATION_RE alternation accident (the `.so\\b` source-path alternative matched first and dropped the offset). Now LINE_HINT_RE also strips `@0x[0-9A-Fa-f]+$`, and _artifact_key + _SO_BIN_RE strip/tolerate the offset themselves (defence in depth) so the collapse is deterministic regardless of future CITATION_RE edits. Self-test asserts `.so@0xHEX`, bare `.so`, and the readelf dump collapse to one key, and that a confirmed claim citing one .so at two offsets flags as one source.
 - Mutation-tested the new self-tests: re-enabling bare soft-word framing turns the 3 adversarial cases RED, proving they bite.
+
+Cycle-27 review: both GO. Bare-soft-word false negative genuinely closed + mutation-proven (re-enabling it turns 3 adversarial selftests RED); real tree green honestly (22/24 strong frames, 1 legit [HISTORICAL] heading); @0xHEX collapse now deterministic. P2 (SOFT+PTR/SOFT-heading still cheaply gameable in this cross-ref-dense corpus) -> TASK-0039 (low); human gate is the documented shape-not-content backstop. STOP gate-tightening recursion here.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

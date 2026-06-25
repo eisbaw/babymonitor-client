@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@architect'
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 05:01'
+updated_date: '2026-06-25 05:07'
 labels:
   - phase5
   - rust
@@ -76,4 +76,6 @@ GROUNDING / HONEST LIMITATIONS:
 - No live fetch: list_devices is token-pending (TASK-0030) — same discipline as TASK-0012. AC#1 fixture-deserialize part is fully met offline; live discovery awaits signing unblock.
 
 GATES (actual): just e2e GREEN (29 core unit + 10 device-fixture tests, 2 ignored; clippy -D warnings clean; fmt-check clean; stub-grep OK; assert-offline OK; bmp-decode OK). just secret-scan OK. just check-evidence OK (14 docs). just showcase OK.
+
+Cycle-15 review: both GO. P1 doc-overclaim (CameraView::pair rustdoc claims an info.id==dev_id check the code doesn't do — code is correct, fix the doc) + P2s (model categoryCode via serde alias to avoid silent-miss; hedge the inferred 'ipc' category literal; narrow the .gitignore fixtures negation to the 2 known files). These device.rs fixes folded into the TASK-0014 cycle (same code area).
 <!-- SECTION:NOTES:END -->

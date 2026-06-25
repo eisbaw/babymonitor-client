@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@architect'
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 05:17'
+updated_date: '2026-06-25 05:21'
 labels:
   - phase7
   - test
@@ -75,6 +75,8 @@ GOTCHAS / honest limitations (TASK-0014):
 - Live gold-oracle test (tests/live_e2e.rs) is #[ignore]d (excluded from just e2e); run with `--ignored --test-threads=1`. Today it asserts the honest token-pending state (panics if someone makes it fake-succeed without TASK-0030). README documents the manual setup + authorized scope.
 - PART A device.rs fixes landed: P1 doc (deleted false id-mismatch clause; camera-category-only + id/dev_id equivalence is needs-live); P2 serde alias categoryCode (+2 tests); P2 ipc-literal hedged "(inferred)"; P2 .gitignore narrowed to the 2 named fixtures (verified: stray file under tests/fixtures/ is now ignore-by-default, known fixtures still tracked).
 - AC#4 (rate-limit/single-shot): no live calls this task; structure supports it (single-shot probe, no retry loop) and README/live-test mandate --test-threads=1 for the future live pass.
+
+Cycle-16 review: both GO, no P0/P1. CLI honest (no fake login; auth login surfaces BmpTokenPending; secrets redacted by default, --show-secrets gated+warns to stderr; #[ignore]d live test asserts token-pending, goes red on faked success). 4 device.rs fixes verified. P2: hand-assembled JSON braces -> consider a #[derive(Serialize)] view struct (low). Rust slice 12/13/14 complete; only the live path is token-pending (TASK-0030).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

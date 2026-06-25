@@ -4,7 +4,7 @@ title: 'RE-PLAN: plan Wave 2 from Wave-1 knowledge (not feature code)'
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 05:15'
+updated_date: '2026-06-25 05:21'
 labels:
   - phase-gate
   - replan
@@ -58,4 +58,6 @@ WHAT WAVE-2 NEEDS (dependency order):
 4. THEN the WebRTC-over-MQTT stream (p2pType=4 / ThingWebRtc on the SCD921): per-camera CameraInfoBean fetch + P2pConfig (ices/relay/session) -> WebRTC negotiation -> decode >=1 video frame + audio. This is the ultimate gold-oracle.
 
 UNCONFIRMED / needs-live to resolve in Wave-2: CameraInfoBean.id vs DeviceBean.dev_id equivalence; which of category/categoryCode the wire populates; the `ipc` category literal (only `sp` grounded).
+
+forward-carried from TASK-0014 review P2: babymonitor-cli hand-assembles JSON object braces around serde-escaped values (main.rs ~:347/382/414) — values are safe+tested, but a Wave-2 hardening pass should switch to a #[derive(Serialize)] view struct so structure is machine-guaranteed.
 <!-- SECTION:NOTES:END -->

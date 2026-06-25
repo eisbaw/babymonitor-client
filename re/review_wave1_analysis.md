@@ -23,8 +23,17 @@ cross-reference is a navigation pointer, not an evidence source — TESTING.md:4
 ## Overall verdict (confidence: confirmed)
 
 **The Wave-1 static foundation is SOUND for the Rust slice (auth → device →
-stream), with ONE must-fix cross-doc contradiction and a short list of lower-
-severity coherence/honesty nits.** Two independent grounds: (1) a spot-check of 12
+stream), with TWO recorded cross-doc contradictions (both traceable to
+`milestone2_findings.md` being the stale entry doc) and a short list of lower-
+severity coherence/honesty nits.** The two contradictions are: (1) the
+streaming-transport one in `js_bundle_map.md` (F1, P0/blocking, TASK-0025), and
+(2) the **sign-sufficiency** one in `milestone2_findings.md` (F5, P1/deferrable,
+TASK-0027) — milestone2 frames the appKey/appSecret as SUFFICIENT to sign,
+which the later TASK-0005 spike (`tuya_sign.md` verdict `needs-runtime-hook`)
+refutes. A prior version of this audit overclaimed "ONE contradiction"; F5 was
+missed and is now recorded below. The SOUND-foundation verdict stands (the gaps
+are honestly flagged and recoverable); only the completeness/ONE-contradiction
+claim was wrong. Two independent grounds: (1) a spot-check of 12
 load-bearing symbols resolved at their EXACT cited paths in the decompiled tree —
 e.g. `ThingApiSignManager.swapSignString`
 (`decompiled/jadx/sources/com/thingclips/sdk/network/ThingApiSignManager.java`),
@@ -36,8 +45,10 @@ and (2) the existing grounding gates pass over all ten docs
 (`re/scripts/check_evidence.py`, `re/scripts/secret_scan.sh` — both GREEN before
 this doc was added). The auth→device→stream contract (atop login envelope, `sid`
 session, `DeviceBean.localKey`/`CameraInfoBean.P2pConfig` device records, 302-MQTT
-WebRTC signaling) is internally consistent **except** the streaming-transport
-evidence in `re/js_bundle_map.md`, corrected below.
+WebRTC signaling) is internally consistent **except** two stale `milestone2`
+framings, both corrected below: the streaming-transport evidence echoed in
+`re/js_bundle_map.md` (F1), and the sign-sufficiency claim in
+`re/milestone2_findings.md` (F5).
 
 The one blocking item is a **factual** defect, not a grounding-label defect: the
 grounding lint validates citation SHAPE, not CONTENT (already filed as TASK-0021),
@@ -60,7 +71,7 @@ and the presence of the real signaling symbol
 
 | Doc | Grounding | Honesty boundary | Verdict |
 |---|---|---|---|
-| `milestone2_findings.md` | OK (canonical labels) | streaming framing is **stale** vs the later TASK-0017 verdict (P2P-first steer) | SOUND, one staleness nit (F3) |
+| `milestone2_findings.md` | OK (canonical labels) | TWO **stale** framings vs later spikes: streaming (P2P-first steer, F3) and **sign-sufficiency** (appSecret-alone "signs every request", F5) | SOUND, two staleness nits (F3, F5) |
 | `decompile_dex.md` | OK — `confirmed` scoped to symbol PRESENCE only, interpretation re-labelled | honest about the 4g OOM partial run + 1,806 undecompiled method bodies | SOUND |
 | `manifest_analysis.md` | OK — component/permission claims cited to manifest lines | service *behavior* (MqttService=signaling) correctly flagged `likely` | SOUND |
 | `js_bundle_map.md` | label OK, but **CONTENT wrong** in one confirmed row | self-refuted by streaming_mode | **DEFECT (F1, blocking)** |
@@ -88,13 +99,19 @@ and the transport enum to `ThingCameraConstants` `P2P_TYPE_THING(4)`
 | **Streaming transport** | "cloud-brokered P2P", libThingP2PSDK = AV channel (stale) | "PlayNetKit … ICE 73 hits" (**WRONG**) | WebRTC-over-MQTT + PPCS fallback | WebRTC-over-MQTT preferred, PPCS fallback (VERDICT) | `CameraInfoBean.P2pConfig` has `ices`/`session` (WebRTC-shaped) | **NO — F1; streaming_mode WINS** |
 | **`p2pType` semantics** | — | — | `skill` in connect_v2 encodes capability | `P2P_TYPE_PPCS(2)`/`P2P_TYPE_THING(4)`, per-device from cloud | `CameraInfoBean.p2pType` int field | YES |
 | **MQTT signaling code 302** | MqttService is signaling candidate | `TUNIMQTTManager` publish | `SendMessageThroughMqtt` string | `send302MessageThroughMqtt`, code 302 | `Domain.*MqttUrl` brokers | YES |
-| **Sign scheme** | "Tuya cloud signs (HMAC)" | atop `apiRequestByAtop` carries sign | `libthing_security` whitebox flagged | (defers to tuya_sign) | atop envelope `sign` param | YES |
+| **Sign scheme** | "Tuya cloud signs (HMAC) with appKey/appSecret" — implies appSecret-alone is **SUFFICIENT** (stale) | atop `apiRequestByAtop` carries sign | `libthing_security` whitebox flagged | (defers to tuya_sign) | atop envelope `sign` param | **milestone2 STALE (sign-sufficiency) — F5; tuya_sign WINS (TASK-0027)** |
 | **Sign verdict** | recovery is next task | — | flagged for task 5 | — | `needs-runtime-hook` (per tuya_sign) | YES |
 | **Datacenter selection** | region config bundled | not in JS (F5) | — | `Domain.*Url` brokers | runtime-from-login `User.domain` (F5) | YES |
 | **Static vs live boundary** | P2P wire = speculative | auth/creds are native/live | no code-offset done | 5 explicit live-only items | §7 live-unknowns table | YES |
 | **Secret handling** | location-only | schema names only, scan clean | symbol/string only | demo-bean values not reproduced | `localKey`/`p2pKey`/`password` = secret, secrets/ only | YES |
 
-**One contradiction (streaming transport).** Everywhere else the docs converge.
+**Two recorded contradictions, both rooted in the stale `milestone2` entry doc:**
+streaming transport (F1, `js_bundle_map` echoes it) and **sign-sufficiency** (F5,
+`milestone2` claims appSecret-alone signs). Everywhere else the spot-checked rows
+converge — but that convergence claim is bounded by the spot-check (see
+Limitations): the SHAPE-not-CONTENT lint gap (F4/TASK-0021) means an
+unspot-checked row could still hide a contradiction, exactly as F5 did until this
+meta-review.
 
 ---
 
@@ -164,6 +181,37 @@ that the lint never compares against. No new task needed — TASK-0021
 ("check-evidence validates citation SHAPE not CONTENT, false-attribution passes")
 already owns this; F1 should be cross-referenced to it as a real instance. Recorded
 here for completeness, not re-filed.
+
+### F5 — `milestone2_findings.md` frames appKey/appSecret as SUFFICIENT to sign; the TASK-0005 spike refutes it (P1, deferrable, filed TASK-0027) (confidence: confirmed)
+
+`re/milestone2_findings.md` "What this means for the reimplementation" point #3
+(~:84) states the embedded Tuya appKey/appSecret are the highest-value artifact
+because "Tuya cloud signs every API request (HMAC) with these; they are required
+to reimplement cloud auth" — framing appSecret as the SUFFICIENT sign key. The
+later TASK-0005 spike (`re/tuya_sign.md`) refutes this: its labelled `Verdict:
+needs-runtime-hook` proves appKey/appSecret ALONE are INSUFFICIENT. **This was
+MISSED by the first version of this audit, which overclaimed "ONE contradiction";
+it is the second.** Two independent grounds (decompiled-artifact, not sibling
+`.md`): (1) the keyed-sign step is native — `pbddddb.bdpdqbp(String)` calls
+`doCommandNative(context, 1, str2…)` (command code 1 = produce request signature)
+in `decompiled/jadx/sources/com/thingclips/sdk/network/pbddddb.java`, and the key
+material (`generateCertificate`/`X509Certificate`/`SHA256`/`t_s.bmp` strings)
+clusters in `lib/arm64-v8a/libthing_security.so` — so the sign KEY is
+`key = [app_cert_SHA256]_[decoded_t_s.bmp_token]_[appSecret]` (review-gate F1),
+and (2) the public mobile-sign write-up `nalajcie/tuya-sign-hacking` documents the
+same cert+BMP+appSecret derivation, NOT a plain-appSecret HMAC. Two of the three
+key ingredients (the app-cert SHA-256, a *runtime* input; the matrix-deobfuscated
+`t_s.bmp` token) plus the keyed-hash routine are NOT statically reproducible
+(`tuya_sign.md` "What is and isn't statically reproducible" table). **Why
+deferrable:** milestone2's point #3 carries no canonical confidence label on the
+sufficiency clause (it predates the spike), so this is a staleness/coherence
+defect — the same class as F3, not a P0 wire-error. A reader hitting milestone2
+first (the entry doc) is steered to believe appSecret alone unblocks cloud auth,
+which the set later reverses. **Winner: `tuya_sign.md`.** **Fix (filed TASK-0027,
+`--dep TASK-0005`/`TASK-0007`):** correct/forward-point milestone2 point #3 to the
+`tuya_sign.md` `needs-runtime-hook` verdict, stating appSecret alone is
+insufficient (also needs the app-cert SHA-256 + decoded `t_s.bmp` token, neither
+statically reproducible).
 
 ### Non-findings (avoided false positives, recorded for the reviewer)
 
@@ -240,13 +288,24 @@ the device/stream record symbols resolve (`DeviceBean`,
 **Gaps a Rust implementer would trip on (all honestly flagged in the docs, none
 hidden):** the byte-exact `sign` is `needs-runtime-hook` (native key derivation,
 `tuya_sign.md`); the on-wire `a=` action names are R8-obfuscated to `n`
-(`tuya_cloud_auth.md` §6); the datacenter host is runtime-from-login. The ONE place
-the contract is internally INCONSISTENT is the streaming-transport evidence in
-js_bundle_map (F1) — fixing it removes the last trap.
+(`tuya_cloud_auth.md` §6); the datacenter host is runtime-from-login. The contract is
+internally INCONSISTENT in TWO places, both stale `milestone2` framings the later
+spikes reverse: the streaming-transport evidence echoed in js_bundle_map (F1,
+TASK-0025) and the sign-sufficiency claim in milestone2 (F5, TASK-0027) — fixing
+both removes the last traps. (The byte-exact `sign` gap above is honestly flagged,
+not a contradiction; F5 is specifically milestone2's *contradicting* framing of it
+as appSecret-sufficient.)
 
 ---
 
-## Triage — blocking vs deferrable
+## Triage — blocking vs deferrable (confidence: confirmed)
+
+Each disposition's underlying finding is grounded in its F-section above; the two
+deferred sign/streaming dispositions in particular rest on resolved decompiled
+symbols — `pbddddb.bdpdqbp(String)` → `doCommandNative(…,1,…)`
+(`decompiled/jadx/sources/com/thingclips/sdk/network/pbddddb.java`) for the F5
+sign-sufficiency call, cross-checked against `nalajcie/tuya-sign-hacking` — not on
+sibling `.md` cross-references.
 
 | Finding | Severity | Filed as | Disposition |
 |---|---|---|---|
@@ -254,19 +313,24 @@ js_bundle_map (F1) — fixing it removes the last trap.
 | F2 — PlayNetKit role overstated | P2 | folded into F1 task | fix with F1 |
 | F3 — milestone2 streaming staleness | P1 | new task `--dep TASK-0017` | **DEFERRABLE** — labelled, not a grounding violation; fix is a one-line forward-pointer; do before re-plan (TASK-0016) |
 | F4 — lint SHAPE-not-CONTENT | P1 | **already TASK-0021** | DEFERRED (open) — F1 is its concrete instance; cross-reference, do not re-file |
+| F5 — milestone2 sign-sufficiency staleness | P1 | new task `--dep TASK-0005`/`TASK-0007` (TASK-0027) | **DEFERRABLE** — staleness/coherence, not a P0 wire-error; fix is a forward-pointer to the `needs-runtime-hook` verdict; do before re-plan (TASK-0016). MISSED by the first audit version — the "ONE contradiction" headline was wrong. |
 
 The wave does not silently advance past F1: it is filed P0/blocking and deps the
-streaming gate. F3 is consciously deferred (low-risk, navigational) with reason.
+streaming gate. F3 and F5 are consciously deferred (low-risk, navigational/coherence)
+with reason, each with a filed fix task (TASK-0026, TASK-0027) due before re-plan.
 
 ---
 
 ## Limitations of this audit (confidence: confirmed)
 
-- **Spot-check, not exhaustive.** 12 of ~100+ citations across the set were
-  resolved; the SHAPE-not-CONTENT gap (F4/TASK-0021) means an unspot-checked
-  citation could still be mis-attributed. The audit reduces but does not eliminate
-  that risk; cited evidence is `re/scripts/check_evidence.py` (passes all 10 docs)
-  + the 12 resolved symbols above.
+- **Spot-check, not exhaustive — and DEMONSTRABLY so.** 12 of ~100+ citations
+  across the set were resolved; the SHAPE-not-CONTENT gap (F4/TASK-0021) means an
+  unspot-checked citation could still be mis-attributed. The first version of this
+  audit proved the point against itself: it overclaimed "ONE contradiction" and
+  MISSED F5 (the milestone2 sign-sufficiency staleness), caught only on
+  meta-review. The convergence claim in the matrix is therefore bounded by the
+  spot-check, not a guarantee. Cited evidence is `re/scripts/check_evidence.py`
+  (passes all 11 docs) + the 12 resolved symbols above.
 - **No code-offset/disassembly** was done here either — native claims
   (`libthing_security.so` cmd=1 sign, `libThingP2PSDK.so` framing) were taken as the
   docs present them (string/symbol level), consistent with the docs' own scope.

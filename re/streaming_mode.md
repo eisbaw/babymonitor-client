@@ -62,7 +62,9 @@ fields); and (2) a precise token grep of the reflowed kit bundles
 
 ## Transport identity: WebRTC-over-MQTT IS present (confidence: confirmed)
 
-Two independent sources agree the new path is WebRTC signaled over MQTT.
+Two SDK layers (native lib + Java bridge — not fully independent, both are the
+Tuya SDK) plus an independent public Tuya implementation (seydx/tuya-ipc-terminal,
+tuya/tuya-rtc-camera-sdk-android) agree the new path is WebRTC signaled over MQTT.
 
 **Source A — native strings in `libThingP2PSDK.so`** (`re/native_libs.md` cites
 the same lib; reproduced by `strings -n5`). The lib carries the complete WebRTC
@@ -102,11 +104,14 @@ a dedicated WebRTC topic. From
 - Inbound: `registerMqtt302(cb)` →
   `homeCamera.registerCameraP2P302Listener(...)` (`:1531`).
 
-**Tuya MQTT topic format** (device-scoped, from
-`decompiled/jadx/sources/com/thingclips/sdk/mqtt/dpdqppp.java`): prefixes
-`nin/` (app→device), `nout/` (device→app), `n/`, `ng/` with the device id
-appended. Public refs document the IPC-specific form as
-`/av/moto/<moto_id>/u/<device_id>` (publish) and `/av/u/<id>` (subscribe).
+**Tuya MQTT topic format** (device-scoped). The local decompile confirms Tuya
+uses device-scoped MQTT topics (`decompiled/jadx/sources/com/thingclips/sdk/mqtt/dpdqppp.java`
+defines per-device prefixes such as `m/…` and `smart/mb/in|out/`), but the IPC AV
+signaling topic form `/av/moto/<moto_id>/u/<device_id>` (publish) / `/av/u/<id>`
+(subscribe) with `nin/`/`nout/` prefixes is documented by the public ref
+(seydx/tuya-ipc-terminal), NOT locally confirmed — the exact device topic for the
+SCD921 needs a live capture. (Correction: an earlier draft mis-attributed the
+`nin/`/`nout/` literals to `dpdqppp.java`; they are not present there.)
 
 **Signaling JSON envelope.** `P2PMQTTServiceManager.handleMqttAnswer`
 (`:991`) parses an `header` object out of the 302 payload and reads
@@ -147,7 +152,9 @@ are NOT reproduced here — see
 `decompiled/jadx/sources/com/thingclips/smart/camera/middleware/p2p/qpppdqb.java:423`).
 Its transport-selecting fields are: top-level `p2pType` (4 = THING/WebRTC here),
 `p2pSpecifiedType`, `p2pPolicy`, `upgradeRelay`, and a nested `skill` JSON string
-carrying a `webrtc` capability integer (a bitmask), `videos[]`/`audios[]` codec
+carrying a `webrtc` capability integer (value `3` in the SDK demo bean;
+bitmask-vs-enum semantics unresolved statically, needs a live record),
+`videos[]`/`audios[]` codec
 descriptors (H264/H265 `codecType`, sample rates), `cloudGW`, and `sdk_version`.
 
 **Mechanism summary.** The cloud device record gives `p2pType` (2=PPCS / 4=WebRTC)

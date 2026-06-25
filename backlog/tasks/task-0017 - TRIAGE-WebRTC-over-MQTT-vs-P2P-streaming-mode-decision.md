@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@reverser'
 created_date: '2026-06-24 22:46'
-updated_date: '2026-06-25 01:03'
+updated_date: '2026-06-25 01:11'
 labels:
   - phase3
   - re
@@ -51,6 +51,8 @@ GOTCHAS / corrections from this triage:
 - Do NOT conflate the P2P 'skill' (capability bitmask) with the VAS 'skill' (security service subscription, com/thingclips/security/vas/skill) - different concept, same word.
 - The populated CameraInfoBean in qpppdqb.java:423 is a hard-coded Tuya DEMO record (demo password/p2pId/device-id 6c3a4212...). NOT a real user secret; referenced by path only, never copied. secret-scan green.
 - THE ONE HYPOTHESIS THAT CAN BE WRONG: whether the real SCD921 firmware returns p2pType=4 (WebRTC) vs 2 (PPCS). Statically we only see the SDK demo bean. Needs one live obtainCameraConfig/device-list call. If it returns 2, the recommendation flips to PPCS.
+
+Cycle-4 review: both GO. Orchestrator fixed P1 (mis-attributed nin/nout topic citation -> now attributed to public ref + corrected) and 2 P2 prose overstatements (layer-independence framing, webrtc 'bitmask' softened). Gate-coverage gap (shape-not-content) -> TASK-0021.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

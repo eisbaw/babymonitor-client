@@ -13,9 +13,14 @@ mini_app_js bundles so the minified one-liners are greppable.
 Citations point at `decompiled/js/assets/...` paths (gitignored, but stable) and
 the public Tuya refs already established for this project.
 
-> Note: these `decompiled/...` paths (and any `decompiled/jadx/.../*.java:line`
+> Note: these `decompiled/...` paths (and any `decompiled/jadx/.../*.java`
 > Java citation) resolve only after a local `just decompile` — the decompiled
 > trees are gitignored and not committed.
+>
+> Citation note (symbol-anchored — TASK-0024): JS evidence is anchored on a stable
+> handle — the **bundle file path** or a **JS symbol/string** (e.g.
+> `TUNIP2pFileManager`, `onTicketSuccess`) — not on drifting jadx line numbers.
+> Any Java `~:NN` hint is approximate; the symbol/path is authoritative.
 
 ## Bundle format verdict (confidence: confirmed) — AC #2
 

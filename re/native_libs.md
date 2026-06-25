@@ -11,10 +11,16 @@ Citation convention: `lib*.so` (+ a representative string) identifies the
 evidence; offsets are not used here because identity comes from symbol names and
 embedded strings, not code addresses.
 
-> Note: any `decompiled/...` or `decompiled/jadx/.../*.java:line` citation in this
+> Note: any `decompiled/...` or `decompiled/jadx/.../*.java` citation in this
 > doc resolves only after a local `just decompile` — those trees are gitignored
 > and not committed. The `re/symbols/` dumps referenced here, by contrast, ARE
 > committed.
+>
+> Citation note (symbol-anchored — TASK-0024): native evidence here is anchored on
+> stable handles — the lib **SONAME**, a **demangled symbol** name, or a literal
+> **string** — and on committed `re/symbols/*.txt` dumps, none of which carry
+> drifting jadx line numbers. Any Java `~:NN` hint that appears is approximate; the
+> symbol is authoritative.
 
 ## Headline (confidence: confirmed)
 This is **Tuya's "ipc-tymedia-sdk"** IPC camera media stack. Two independent

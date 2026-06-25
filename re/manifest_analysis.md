@@ -11,6 +11,13 @@ manifest decode). Component tallies via `grep -cE` over the decoded manifest.
 > Note: the `decompiled/apktool/...:line` citations (and any `decompiled/jadx/`
 > Java `:line` reference) resolve only after a local `just decompile` — those
 > trees are gitignored and not committed.
+>
+> Citation note (symbol-anchored — TASK-0024): the authoritative anchor is the
+> **symbol** — here the manifest `android:name` (permission/activity/service) or a
+> resource `name` (e.g. `thing_jump_scheme`). The `:NN` line is an **approximate
+> hint**: apktool XML line numbers are more stable than jadx Java, but still
+> re-decode-dependent. When a hint drifts, grep the name in
+> `decompiled/apktool/AndroidManifest.xml` / `res/values/strings.xml`.
 
 ## Component tallies (confidence: confirmed)
 
@@ -66,7 +73,7 @@ entry points (login redirect / push-tap routing / diagnostics):
 
 | Scheme / host / path | Line | Target |
 |---|---|---|
-| `philipsclnightowl://com.philips.ph.babymonitorplus/zoundream` | `AndroidManifest.xml:125` | on `com.smart.ThingSplashActivity` (`:94`); `thing_jump_scheme` resolves to `philipsclnightowl` per `decompiled/apktool/res/values/strings.xml:9199` |
+| `philipsclnightowl://com.philips.ph.babymonitorplus/zoundream` | `AndroidManifest.xml:125` | on `com.smart.ThingSplashActivity` (`AndroidManifest.xml` ~:94); `thing_jump_scheme` resolves to the app scheme per the `<string name="thing_jump_scheme">` resource in `decompiled/apktool/res/values/strings.xml` (~:9199) |
 | `philipsclnightowl://com.philips.ph.babymonitorplus/path/lineNotify` | `AndroidManifest.xml:743` | `com.thingclips.smart.message.base.activity.line.LineNotifyActivity` — push/notification tap routing |
 | `module.entrance://netdiagnosis` | `AndroidManifest.xml:511` | `com.thingclips.smart.netdiagnosis.NetDiagnosisModuleEntrance` — net-diagnostics entry |
 

@@ -9,10 +9,12 @@ static analysis alone.
 source lines live ONLY in `secrets/tuya_appkey.json` (gitignored). This doc records
 *location + method*, never values.
 
-> Citation note: `decompiled/jadx/sources/...:line` paths resolve only after a local
-> `just decompile` (the jadx/native trees are gitignored). `lib*.so` citations refer to
-> `lib/arm64-v8a/*.so` unzipped from `extracted/xapk/config.arm64_v8a.apk` into the
-> gitignored `decompiled/nativelibs/`.
+> Citation note (symbol-anchored — TASK-0024): cites name a **symbol**
+> (class/method/field); any `decompiled/jadx/sources/...File.java ~:NN` line is an
+> **approximate hint** for the current `just decompile` tree (jadx line numbers drift
+> between runs — grep the symbol, e.g. `rg 'generateSignatureSdk|swapSignString'`).
+> `lib*.so` citations refer to `lib/arm64-v8a/*.so` unzipped from
+> `extracted/xapk/config.arm64_v8a.apk` into the gitignored `decompiled/nativelibs/`.
 
 ---
 
@@ -25,8 +27,9 @@ needs-live-capture}. The labelled-verdict lint gate keys on `re/p2p_protocol.md`
 this file; the label form is used here for consistency as instructed.)
 
 Two independent sources ground this verdict: the decompiled signer chain
-`decompiled/jadx/sources/com/thingclips/sdk/network/pbddddb.java:200`
-(keyed step delegates to native cmd=1) AND the native key-material evidence in
+(`pbddddb.bdpdqbp(String)`,
+`decompiled/jadx/sources/com/thingclips/sdk/network/pbddddb.java` ~:200;
+keyed step delegates to native cmd=1) AND the native key-material evidence in
 `libthing_security.so` (`generateCertificate`/`X509Certificate`/`SHA256`/`t_s.bmp`
 strings) — together they prove the key derivation is native + runtime-cert-dependent,
 i.e. not byte-reproducible from static analysis alone.
@@ -50,37 +53,37 @@ inline below) AND the public mobile-sign write-up `nalajcie/tuya-sign-hacking`
 sorted-params → MD5 → swap → native-keyed-sign pipeline.
 
 1. **Canonicalize params** — `ThingApiSignManager.generateSignatureSdk(map)`
-   (`decompiled/jadx/sources/com/thingclips/sdk/network/ThingApiSignManager.java:99`):
+   (`decompiled/jadx/sources/com/thingclips/sdk/network/ThingApiSignManager.java` ~:99):
    - take `map.keySet()`, `Collections.sort` (lexicographic ascending);
-   - keep only keys in the fixed whitelist `bdpdqbp`
-     (`ThingApiSignManager.java:66`: `a, v, lat, lon, lang, deviceId, appVersion, ttid,
+   - keep only keys in the fixed whitelist `ThingApiSignManager.bdpdqbp`
+     (~:66: `a, v, lat, lon, lang, deviceId, appVersion, ttid,
      h5, h5Token, os, appId, postData, t, requestId, et, n4h5, sid, chKey, sp`) whose
      value is non-empty;
    - for the `postData` key, replace its value with `postDataMD5Hex(value)` first
-     (`ThingApiSignManager.java:146`);
+     (`map.put(.., postDataMD5Hex(..))` ~:149);
    - join as `key=value` segments separated by the literal **`||`** (NOT `&`):
-     separators are `pbpdpdp = "="` and `pbpdbqp = "||"`
-     (`decompiled/jadx/sources/com/thingclips/sdk/mqtt/pbbppqb.java:26-27`), used at
-     `ThingApiSignManager.java:153-155`.
+     separators are the constants `pbpdpdp = "="` and `pbpdbqp = "||"` in class `pbbppqb`
+     (`decompiled/jadx/sources/com/thingclips/sdk/mqtt/pbbppqb.java` ~:26-27).
    This produces the **string-to-sign** `str2`.
 
-2. **postData digest** — `postDataMD5Hex(str)` (`ThingApiSignManager.java:423`):
+2. **postData digest** — `ThingApiSignManager.postDataMD5Hex(str)` (~:423):
    `swapSignString( MD5Util.md5AsBase64(str) )`. So the POST body is folded into the
    string-to-sign as a swapped MD5-base64, not raw.
 
 3. **swapSignString(s)** — byte permutation of a 32-char MD5-base64
-   (`ThingApiSignManager.java:524`, exact slices at `:567-571`):
+   (`ThingApiSignManager.swapSignString` ~:524, exact slices ~:567-571):
    given `s`, let `A=s[0:8]`, `B=s[8:24]`, `B1=B[0:8]`, `B2=B[8:16]`, `C=s[24:32]`;
    output = `B1 + A + C + B2`. (Deterministic, fully reproducible in Rust.)
 
 4. **Keyed sign (native)** — the string-to-sign `str2` is passed to
-   `pbddddb.bdpdqbp().bdpdqbp(str2)` (`ThingApiSignManager.java:158`), whose body
-   (`decompiled/jadx/sources/com/thingclips/sdk/network/pbddddb.java:200`) calls:
+   `pbddddb.bdpdqbp().bdpdqbp(str2)` (`ThingApiSignManager.java` ~:159), whose body
+   (`pbddddb.bdpdqbp(String)`,
+   `decompiled/jadx/sources/com/thingclips/sdk/network/pbddddb.java` ~:200) calls:
    `ThingNetworkSecurity.doCommandNative(context, 1, str2.getBytes(), null, ThingSmartNetWork.mD)`.
    **Command code `1` = "produce request signature".** The returned String is the `sign`
    query parameter. This is the step whose KEY is not static (see next sections).
 
-   (Note: `getRequestKeyBySorted` at `:235` is a *sibling* helper that does a plain
+   (Note: `getRequestKeyBySorted` ~:235 is a *sibling* helper that does a plain
    `MD5Util.md5AsBase64` of the sorted string with NO native key — it is used for
    cache/request keys, not the wire `sign`. The wire signature is the cmd=1 native path.)
 
@@ -90,12 +93,13 @@ Two independent sources: the Java init wiring AND the native string/symbol evide
 
 - **Java side / init (cmd 0):** the native module is initialized by
   `ThingNetworkSecurity.initJNI(...)`
-  (`decompiled/jadx/sources/com/thingclips/sdk/network/ThingNetworkSecurity.java:360`):
+  (`decompiled/jadx/sources/com/thingclips/sdk/network/ThingNetworkSecurity.java` ~:324;
+  the cmd-0 `doCommandNative` call ~:360):
   `JNICLibrary.doCommandNative(context, 0, ThingSmartNetWork.mAppSecret.getBytes(),
   ThingSmartNetWork.mAppId.getBytes(), mD)` — i.e. **appSecret + appId are pushed into
   native at init**, and the per-request sign is later produced by cmd 1
-  (`pbddddb.java:200`). The native libs loaded are `thing_security_algorithm` then
-  `thing_security` (`JNICLibrary.java:724-725`).
+  (`pbddddb.bdpdqbp(String)` ~:200). The native libs loaded are `thing_security_algorithm`
+  then `thing_security` (`JNICLibrary` `loadLibrary` ~:724-725).
 - **Native side / key material:** `strings`/symbols of
   `lib/arm64-v8a/libthing_security.so` (`libthing_security.so`) show the exact F1 key
   ingredients clustered together: `t_s.bmp` + `t_s_daily.bmp` (the embedded BMP token),
@@ -129,11 +133,12 @@ Two independent sources: the asset itself AND the math library in the algorithm 
 
 Two independent sources: the literal constants AND the wiring that consumes them.
 
-- **Literals:** `decompiled/jadx/sources/com/thingclips/sample/BuildConfig.java:14`
-  (`THING_SMART_APPKEY`, 20-char Tuya appKey format), `:16` (`THING_SMART_SECRET`,
-  32-char appSecret format), `:18` (`THING_SMART_TTID`). Values copied ONLY to
-  `secrets/tuya_appkey.json`.
-- **Wiring:** `com/smart/app/SmartApplication.java:117-118` reads
+- **Literals:** the `BuildConfig` field constants
+  (`decompiled/jadx/sources/com/thingclips/sample/BuildConfig.java`):
+  `THING_SMART_APPKEY` (~:14, 20-char Tuya appKey format), `THING_SMART_SECRET`
+  (~:16, 32-char appSecret format), `THING_SMART_TTID` (~:18). Values copied ONLY to
+  `secrets/tuya_appkey.json` — never reproduced here.
+- **Wiring:** `SmartApplication` (`com/smart/app/SmartApplication.java` ~:117-118) reads
   `BuildConfig.THING_SMART_APPKEY/SECRET` → `ThingSmartSdk.setAppkey/ setAppSecret`
   (`com/thingclips/smart/android/base/ThingSmartSdk.java:779,726`) →
   `ThingSmartNetWork.initialize` sets `mAppId`/`mAppSecret`

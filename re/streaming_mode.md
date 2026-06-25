@@ -5,9 +5,12 @@ cheaper viable path first. Method: **JS-first**, corroborated in decompiled Java
 (`decompiled/jadx/`) and the committed native symbol/string dumps, then
 cross-checked against public Tuya WebRTC projects. Static analysis only.
 
-> Citation note: `decompiled/...` paths (jadx + js trees) and
-> `decompiled/nativelibs/*.so` resolve only after a local `just decompile`
-> (gitignored). The `re/symbols/*.txt` dumps cited here ARE committed.
+> Citation note (symbol-anchored — TASK-0024): cites name a **symbol**
+> (class/method/enum); any `...File.java ~:NN` line is an **approximate hint** for
+> the current `just decompile` tree — jadx line numbers drift, so grep the symbol.
+> `decompiled/...` paths (jadx + js trees) and `decompiled/nativelibs/*.so` resolve
+> only after a local `just decompile` (gitignored). The `re/symbols/*.txt` dumps
+> cited here ARE committed.
 > Native `lib*.so` evidence below is string-grep of
 > `decompiled/nativelibs/libThingP2PSDK.so` /
 > `decompiled/nativelibs/libThingCameraSDK.so`, the same arm64 libs inventoried
@@ -77,12 +80,12 @@ signaling + media machinery:
 - The C++ class `ThingSmartP2PSDK` exports `thing_p2p_rtc_connect_v2`, `thing_p2p_rtc_set_signaling`, `SendMessageThroughMQTT` (demangled from `re/symbols/libThingP2PSDK.dynsym.txt`).
 
 **Source B — Java signaling bridge.** `IThingP2P`
-(`decompiled/jadx/sources/com/thingclips/smart/p2p/api/IThingP2P.java:57`)
-declares `resendOffer(String)`, `setSignaling(String,int)`,
-`setRemoteOnline(String)` — WebRTC offer/SDP signaling verbs. The MQTT side is
-`P2PMQTTServiceManager`
-(`decompiled/jadx/sources/com/thingclips/smart/p2p/utils/P2PMQTTServiceManager.java:1537`,
-implementing `IMqttServiceUtils`): `send302MessageThroughMqtt(boolean byLan, devId, jsonMsg)`
+(`decompiled/jadx/sources/com/thingclips/smart/p2p/api/IThingP2P.java`)
+declares `resendOffer(String)` (~:57), `setSignaling(String,int)` (~:70),
+`setRemoteOnline(String)` (~:68) — WebRTC offer/SDP signaling verbs. The MQTT side is
+`P2PMQTTServiceManager.send302MessageThroughMqtt`
+(`decompiled/jadx/sources/com/thingclips/smart/p2p/utils/P2PMQTTServiceManager.java` ~:1537,
+the class implements `IMqttServiceUtils`): `send302MessageThroughMqtt(boolean byLan, devId, jsonMsg)`
 publishes the signaling JSON over the device MQTT channel with message code **302**.
 
 ---
@@ -93,16 +96,17 @@ Two independent sources (decompiled Java + the public `seydx/tuya-ipc-terminal`
 and Tuya's WebRTC docs) give a consistent shape.
 
 **The carrier is the device's standard Tuya MQTT channel, message code 302** — NOT
-a dedicated WebRTC topic. From
-`decompiled/jadx/sources/com/thingclips/smart/p2p/utils/P2PMQTTServiceManager.java:1550`:
+a dedicated WebRTC topic. From the `homeCamera.publish(...,302,..)` call in
+`P2PMQTTServiceManager`
+(`decompiled/jadx/sources/com/thingclips/smart/p2p/utils/P2PMQTTServiceManager.java` ~:1550):
 
 - Cloud path: `homeCamera.publish(devId, pv, localKey, jsonMsg, 302, cb)` — Tuya
   MQTT publish, protocol version `pv`, AES-encrypted with the device **localKey**,
   message code **302**.
 - LAN path: `homeCamera.lan302Publish(devId, jsonMsg, cb)` — same 302 payload over
   the local network (this is the `lan_mode=1` branch of `connect_v2`).
-- Inbound: `registerMqtt302(cb)` →
-  `homeCamera.registerCameraP2P302Listener(...)` (`:1531`).
+- Inbound: `P2PMQTTServiceManager.registerMqtt302(cb)` (~:1528) →
+  `homeCamera.registerCameraP2P302Listener(...)` (~:1531).
 
 **Tuya MQTT topic format** (device-scoped). The local decompile confirms Tuya
 uses device-scoped MQTT topics (`decompiled/jadx/sources/com/thingclips/sdk/mqtt/dpdqppp.java`
@@ -114,9 +118,9 @@ SCD921 needs a live capture. (Correction: an earlier draft mis-attributed the
 `nin/`/`nout/` literals to `dpdqppp.java`; they are not present there.)
 
 **Signaling JSON envelope.** `P2PMQTTServiceManager.handleMqttAnswer`
-(`:991`) parses an `header` object out of the 302 payload and reads
-`header.type`, `header.trace_id`, `header.from`; `isP2PMqttAnswer` (`:1071`)
-checks `header.type == "answer"`. So the envelope is
+(~:991) parses an `header` object out of the 302 payload and reads
+`header.type`, `header.trace_id`, `header.from`; `P2PMQTTServiceManager.isP2PMqttAnswer`
+(~:1071) checks `header.type == "answer"`. So the envelope is
 `{ "header": { "type": <"offer"|"answer"|"candidate"|...>, "from":.., "to":.., "sessionid":.., "trace_id":.. }, "msg": <sdp-or-candidate-payload>, "token":.. }`.
 The native validator strings corroborate the required header/msg/token fields
 (`invalid signaling: invalid json, no header field` / `… no msg field` /
@@ -135,8 +139,8 @@ The transport is selected **per-device from cloud-provided fields**, surfaced in
 `CameraInfoBean`. Two independent sources: the enum definition + the populated
 bean fixture.
 
-**Source A — the enum.**
-`decompiled/jadx/sources/com/thingclips/smart/camera/api/ThingCameraConstants.java:1611`:
+**Source A — the enum.** `ThingCameraConstants.P2PType`
+(`decompiled/jadx/sources/com/thingclips/smart/camera/api/ThingCameraConstants.java` ~:1611):
 ```
 enum P2PType { P2P_TYPE_PPCS(2), P2P_TYPE_THING(4); }
 ```
@@ -148,8 +152,9 @@ returns the active mode; native `ThingP2PGetConnectionMode` /
 
 **Source B — the populated `CameraInfoBean`.** The SDK ships a sample bean (a
 hard-coded Tuya demo record; its `password`/`p2pId`/device-id are demo values and
-are NOT reproduced here — see
-`decompiled/jadx/sources/com/thingclips/smart/camera/middleware/p2p/qpppdqb.java:423`).
+are NOT reproduced here — the demo bean is the `JSON.parseObject("{…}")` in class
+`qpppdqb`,
+`decompiled/jadx/sources/com/thingclips/smart/camera/middleware/p2p/qpppdqb.java` ~:423).
 Its transport-selecting fields are: top-level `p2pType` (4 = THING/WebRTC here),
 `p2pSpecifiedType`, `p2pPolicy`, `upgradeRelay`, and a nested `skill` JSON string
 carrying a `webrtc` capability integer (value `3` in the SDK demo bean;
@@ -243,8 +248,8 @@ Rust crate map:
 These are statically unprovable and need one session against the user's own
 SCD921 (the gold oracle in `TESTING.md`). Grounded by two committed sources: the
 native signaling strings behind `re/symbols/libThingP2PSDK.dynsym.txt` and the
-device-config Java in
-`decompiled/jadx/sources/com/thingclips/smart/camera/middleware/p2p/qpppdqb.java:423`.
+device-config Java (the demo `CameraInfoBean` parsed in class `qpppdqb`,
+`decompiled/jadx/sources/com/thingclips/smart/camera/middleware/p2p/qpppdqb.java` ~:423).
 
 1. **Whether THIS firmware advertises `webrtc` in its `skill`.** The `p2pType`
    enum and `skill.webrtc` field are confirmed in code, but the only populated
@@ -274,8 +279,8 @@ device-config Java in
 - The `skill.webrtc` bit semantics and the precise PPCS-vs-WebRTC tie-break when
   both are advertised are `likely`, read from one in-app sample bean; a live
   record resolves them.
-- Secret hygiene: the sample `CameraInfoBean` in
-  `decompiled/jadx/sources/com/thingclips/smart/camera/middleware/p2p/qpppdqb.java:423`
+- Secret hygiene: the sample `CameraInfoBean` parsed in class `qpppdqb`
+  (`decompiled/jadx/sources/com/thingclips/smart/camera/middleware/p2p/qpppdqb.java` ~:423)
   contains demo `password`/`p2pId`/device-id values; none are reproduced here —
   reference the decompiled path only. No real account/device identifier or key is
   in this doc; the gate `re/scripts/secret_scan.sh` (`just secret-scan`) reports

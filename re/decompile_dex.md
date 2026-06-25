@@ -6,6 +6,11 @@ jadx decompilation of the 14 multidex files from the base APK
 task greps. Citations below are `decompiled/jadx/sources/<path>` (gitignored but
 stable paths) — strip the `decompiled/jadx/sources/` prefix when reading.
 
+> Citation note (symbol-anchored — TASK-0024): cites name a **symbol**
+> (class/method/field). Any `~:NN` line is an **approximate hint** for the current
+> `just decompile` tree — jadx line numbers drift between runs, so the symbol is
+> authoritative; grep it (`rg 'class Foo|methodName'`).
+
 ## Command (confidence: confirmed)
 
 ```
@@ -121,9 +126,9 @@ Locations are directories under `decompiled/jadx/sources/`.
 
 ### Cloud auth + request signing (forward to task 7)
 (confidence: confirmed for class/method presence — ≥2 independent sources: the
-decompiled signer
-`decompiled/jadx/sources/com/thingclips/sdk/network/ThingApiSignManager.java:69`
-(`generateSignature`), `:524` (`swapSignString`), AND the public mobile-sign
+decompiled signer `ThingApiSignManager`
+(`decompiled/jadx/sources/com/thingclips/sdk/network/ThingApiSignManager.java`;
+`generateSignature` ~:69, `swapSignString` ~:524), AND the public mobile-sign
 write-up `nalajcie/tuya-sign-hacking` (review-gate F1) which documents the same
 swap/MD5 sign shape. NOTE: presence/shape is confirmed; the signing *key
 derivation* remains task-5 work, not confirmed here.)
@@ -162,9 +167,10 @@ derivation* remains task-5 work, not confirmed here.)
 ## What this gives the Rust reimplementation (confidence: likely)
 
 Interpretation of the evidence above; underlying citations are in the per-area
-sections (e.g.
-`decompiled/jadx/sources/com/thingclips/smart/p2p/api/IThingP2P.java:18`,
-`.../p2p/utils/IMqttServiceUtils.java:1`).
+sections (e.g. `IThingP2P.connect`
+`decompiled/jadx/sources/com/thingclips/smart/p2p/api/IThingP2P.java` ~:18,
+and interface `IMqttServiceUtils`
+`decompiled/jadx/sources/com/thingclips/smart/p2p/utils/IMqttServiceUtils.java`).
 
 1. The cloud-auth sign algorithm is statically present in
    `ThingApiSignManager.java` (Java) + the native key source — a real lever for

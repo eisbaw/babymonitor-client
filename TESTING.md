@@ -20,8 +20,29 @@ grounding is an **evidence + confidence discipline**, enforced as a reviewable g
 Every protocol/auth/pairing claim in an `re/*.md` doc carries:
 1. an explicit **confidence** level: `confirmed` (cross-checked against ≥2 independent sources,
    e.g. decompiled Java *and* the JS bundle, or a public Tuya impl), `likely`, or `speculative`; and
-2. an **evidence citation**: `decompiled/...:line`, `lib*.so@0xOFFSET`, JS bundle location, or a
-   named public reference (e.g. tinytuya source).
+2. an **evidence citation** — **symbol-anchored** (see below): the class/method/field/
+   string-constant name, optionally with a `decompiled/...` path and an approximate line hint;
+   `lib*.so@0xOFFSET`; a JS-bundle location; or a named public reference (e.g. tinytuya source).
+
+### Symbol-anchored citations (TASK-0024 — line numbers drift across jadx runs)
+jadx line numbers are **not stable**: they shift between decompile runs and configs (e.g.
+`-Xmx12g --no-debug-info` vs default), so a bare `path:LINE` cite can rot and point into
+obfuscation noise even when the class/field/method is unchanged. Therefore **the symbol is
+authoritative and the line is only a hint.** Cite as:
+
+- `Symbol.member (decompiled/.../File.java ~:NN)` — name the symbol; the `~:NN` is an
+  *approximate* line hint for the current `just decompile` tree (the `~` reads "about here");
+- `decompiled/.../File.java` — a bare source path when the symbol is named in the surrounding
+  prose (no line needed);
+- `decompiled/.../File.java:NN` — the legacy exact-line form is still accepted, but prefer a
+  symbol so a future re-decompile does not silently invalidate the cite.
+
+Rules for authors: every CLAIM's citation must resolve to a **real symbol** in the current
+decompiled tree (verify with `rg 'class Foo|methodName|fieldName' decompiled/...`); fix the line
+hint to the current tree if you give one. State once per doc that **line hints are approximate
+(jadx-run-dependent) and symbols are authoritative**. `just check-evidence` accepts all three
+forms as citation tokens; for `confirmed` (≥2 sources) the same file cited bare and again with a
+hint counts as ONE source — the line hint is decoration, not a second source.
 
 ### Good vs bad (observable)
 - GOOD: a reader can follow a citation to the exact decompiled line / symbol that supports the claim.

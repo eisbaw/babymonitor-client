@@ -19,10 +19,13 @@ Any JSON field that carries a per-device or per-account secret is flagged
 explicitly (see the secret table) and anonymized before it may enter a committed
 fixture, per CLAUDE.md.
 
-> Citation note: `decompiled/jadx/sources/...:line` paths resolve only after a
-> local `just decompile` (the jadx tree is gitignored but the paths are stable).
-> Line numbers index the jadx 1.5.0 `-Xmx12g` output recorded in
-> `re/decompile_dex.md`. The DEX is **R8-obfuscated**: many API-name string
+> Citation note (symbol-anchored — TASK-0024): cites name a **symbol**
+> (class/method/field/string-constant); any `decompiled/jadx/sources/...File.java`
+> path + `~:NN` line number is an **approximate hint** for the current `just
+> decompile` tree, NOT an authority. **jadx line numbers drift between runs**, so
+> the symbol is what to grep for (`rg 'class Foo|methodName|fieldName'`); the `~:`
+> hint is "about here" in the jadx 1.5.0 `-Xmx12g --no-debug-info` output recorded
+> in `re/decompile_dex.md`. The DEX is **R8-obfuscated**: many API-name string
 > constants are runtime-deobfuscated to a placeholder `n`, so some exact wire
 > action names are only confirmable live (flagged inline).
 
@@ -31,9 +34,10 @@ fixture, per CLAUDE.md.
 ## 0. TL;DR contract (confidence: confirmed)
 
 Two independent sources ground the overall shape: the decompiled user-API table
-`decompiled/jadx/sources/com/thingclips/sdk/user/pqdbppq.java:36-106` (the literal
-`thing.m.user.*` action constants) AND the public mobile-SDK write-up
-`nalajcie/tuya-sign-hacking` (review-gate F1, `re/review_gate_findings.md:10-24`),
+class `pqdbppq` (`decompiled/jadx/sources/com/thingclips/sdk/user/pqdbppq.java`,
+the literal `thing.m.user.*` action string-constants, e.g. `dbppbbp =
+"thing.m.user.username.token.get"` ~:52) AND the public mobile-SDK write-up
+`nalajcie/tuya-sign-hacking` (review-gate F1, `re/review_gate_findings.md`),
 which documents the same atop gateway + `a/v/t/sid/sign` envelope.
 
 - **Gateway:** Tuya mobile-app "atop" API gateway (`a.*`/`api.*` family), driven by
@@ -54,45 +58,55 @@ which documents the same atop gateway + `a/v/t/sid/sign` envelope.
 
 ## 1. Request envelope (atop gateway) (confidence: confirmed)
 
-Two independent sources: the param-key constants + `initUrlParams` body in
-`decompiled/jadx/sources/com/thingclips/smart/android/network/ThingApiParams.java:30-77,407-421`
-AND the JS-bridge atop entry
-`decompiled/jadx/sources/com/thingclips/smart/plugin/tuniapirequestmanager/TUNIAPIRequestManager.java:161,225-234`
-(`apiRequestByAtop` takes `api`, `version`, `postData`). These agree on the same
-gateway, so it is `confirmed`.
+Two independent sources: the `ThingApiParams.KEY_*` param-key string-constants +
+the `ThingApiParams.initUrlParams` body
+(`decompiled/jadx/sources/com/thingclips/smart/android/network/ThingApiParams.java`;
+`KEY_API="a"` ~:33, `initUrlParams` ~:1771) AND the JS-bridge atop entry
+`TUNIAPIRequestManager.apiRequestByAtop`
+(`decompiled/jadx/sources/com/thingclips/smart/plugin/tuniapirequestmanager/TUNIAPIRequestManager.java`
+~:161; takes `api`, `version`, `postData`). These agree on the same gateway, so it
+is `confirmed`.
 
 A request is a set of **URL/GET params** (the signed envelope) plus a **`postData`**
 body. The envelope keys (constant → wire name) are:
 
 | Wire param | Const (`ThingApiParams`) | Value / source | Notes |
 |---|---|---|---|
-| `a` | `KEY_API` | the action name (e.g. `thing.m.user.email.password.login`) | rewritten `thing*`→`smartlife*` on wire by `checkAPIName()` (`ThingApiParams.java:185-191`) — see §1a |
+All cells below cite symbols in
+`ThingApiParams.java`/`LoginBusiness.java`/`ApiParams.java`; `~:NN` line hints are
+approximate (jadx-run-dependent) — grep the symbol name.
+
+| Wire param | Const (`ThingApiParams`) | Value / source | Notes |
+|---|---|---|---|
+| `a` | `KEY_API` (~:33) | the action name (e.g. `thing.m.user.email.password.login`) | rewritten `thing*`→`smartlife*` on wire by `ThingApiParams.checkAPIName()` (~:192) — see §1a |
 | `v` | `KEY_VERSION` | per-call version string (e.g. `"1.0"`,`"4.0"`) | from the `ApiParams` ctor |
-| `t` / `time` | `KEY_TIMESTAMP="time"` | server-synced epoch (`TimeStampManager.getCurrentTimeStamp()`) | added in the sign/body path `ThingApiParams.java:307` |
-| `sid` | `KEY_SESSION="sid"` | the session token (empty pre-login) | injected from `IBaseUser.getSid()` (`ApiParams.java:getSession`) |
-| `requestId` | `KEY_REQUEST_ID` | `UUID.randomUUID()` per request | `ThingApiParams.java:418` |
-| `et` | `KEY_ET` | `"3"` (default ET version) | `ThingApiParams.java:421` |
-| `lang` | `KEY_APP_LANG` | device language | `:413` |
-| `os` | `KEY_APP_OS` | `"Android"` | `:411` |
-| `appVersion` | `KEY_APP_VERSION` | app version string | `:412` |
-| `ttid` | `KEY_TTID` | channel TTID (value in `secrets/`) | `:416` |
-| `clientId` | `KEY_APP_ID` | the appKey/appId (value in `secrets/`) | `:410` |
-| `deviceId` | `KEY_DEVICEID` | per-install device id (`PhoneUtil.getDeviceID`) | `ApiParams.java:getRequestBody`/`initUrlParams` |
+| `t` / `time` | `KEY_TIMESTAMP="time"` | server-synced epoch (`TimeStampManager.getCurrentTimeStamp()`) | added in the body path, `ThingApiParams.java` `KEY_TIMESTAMP` put ~:1408 |
+| `sid` | `KEY_SESSION="sid"` | the session token (empty pre-login) | injected from `IBaseUser.getSid()` (`ApiParams.getSession`) |
+| `requestId` | `KEY_REQUEST_ID` | `UUID.randomUUID()` per request | `ThingApiParams.initUrlParams`, `KEY_REQUEST_ID` put ~:1782 |
+| `et` | `KEY_ET` | `"3"` (`ET_VERSION_3`, ~:31) | set in `initUrlParams` |
+| `lang` | `KEY_APP_LANG` | device language | `ThingApiParams.initUrlParams` (~:1771) |
+| `os` | `KEY_APP_OS` | `"Android"` | `ThingApiParams.initUrlParams` (~:1771) |
+| `appVersion` | `KEY_APP_VERSION` | app version string | `ThingApiParams.initUrlParams` (~:1771) |
+| `ttid` | `KEY_TTID` | channel TTID (value in `secrets/`) | `ThingApiParams.initUrlParams` (~:1771) |
+| `clientId` | `KEY_APP_ID` | the appKey/appId (value in `secrets/`) | `ThingApiParams.initUrlParams` (~:1771) |
+| `deviceId` | `KEY_DEVICEID` | per-install device id (`PhoneUtil.getDeviceID`) | `ApiParams.getRequestBody`/`initUrlParams` |
 | `sign` | `KEY_APP_SIGN="sign"` | the keyed signature | computed last; algorithm in `re/tuya_sign.md` |
 | `postData` | `KEY_POST="postData"` | JSON body (per-action fields) | folded into the sign as swapped-MD5 (`re/tuya_sign.md` §2-3) |
-| `lat`/`lon` | `KEY_LAT`/`KEY_LON` | optional, only if location switch on | `ApiParams.java:getUrlParams` |
+| `lat`/`lon` | `KEY_LAT`/`KEY_LON` | optional, only if location switch on | `ApiParams.getUrlParams` |
 
 Defaults set in the `ThingApiParams` ctor: `sessionRequire=true`,
-`locationRequire=true`, `apiVersion="*"`, `ET_VERSION="3"`
-(`ThingApiParams.java:111-145`). Login token-create explicitly sets
-`setSessionRequire(false)` (`LoginBusiness.java:907`) because there is no sid yet.
+`locationRequire=true`, `apiVersion="*"`, `ET_VERSION="3"` (`ThingApiParams`
+ctors ~:114-176). Login token-create explicitly sets `setSessionRequire(false)`
+(`LoginBusiness.y(...)`, ~:903-909) because there is no sid yet.
 
 ### 1a. `thing.*` → `smartlife.*` wire rewrite (confidence: confirmed)
 
-`checkAPIName()` (`ThingApiParams.java:185-191`) rewrites any `apiName` that
-`startsWith("thing")`: it maps the leading `thing` token to `smartlife`. Two
-sources: the method body itself AND the consistent `thing.m.*` literal table in
-`pqdbppq.java:36-106`. **Consequence for the Rust client:** the constants read as
+`ThingApiParams.checkAPIName()`
+(`decompiled/jadx/sources/com/thingclips/smart/android/network/ThingApiParams.java`
+~:192) rewrites any `apiName` that `startsWith("thing")`: it maps the leading
+`thing` token to `smartlife`. Two sources: the method body itself AND the
+consistent `thing.m.*` literal table in class `pqdbppq`
+(`decompiled/jadx/sources/com/thingclips/sdk/user/pqdbppq.java`). **Consequence for the Rust client:** the constants read as
 `thing.m.user.*` in the DEX, but the value the signer sees / that may go on the
 wire as `a=` is the `smartlife.m.user.*`-rewritten form. The exact on-wire spelling
 must be confirmed against a live capture / Frida hook (TASK-0022) — flagged in §6.
@@ -111,7 +125,8 @@ Tuya mobile login is a **two-step ticket/token flow** (the "onTicketSuccess" ste
 carried forward from TASK-0005):
 
 **Step 1 — get the login ticket + RSA key** (`LoginBusiness.y(...)`,
-`LoginBusiness.java:873-909`):
+`decompiled/jadx/sources/com/thingclips/smart/login/skt/business/LoginBusiness.java`
+~:873; the `thing.m.user.username.token.get` `ApiParams` is built ~:903):
 - action `thing.m.user.username.token.get` v`2.0`; postData `countryCode`,
   `username`, `isUid` (bool); `setSessionRequire(false)`.
 - returns a **`TokenBean`** (`com/thingclips/sdk/user/bean/TokenBean.java`) with
@@ -121,38 +136,42 @@ carried forward from TASK-0005):
   on `TokenBean` success the UI proceeds to submit credentials.
 
 **Step 2 — submit credentials + ticket** (credential-type-specific):
-- **email + password:** `LoginBusiness.s(...)` (`:451-460`) → action
+- **email + password:** `LoginBusiness.s(...)` (~:451; `ApiParams` built ~:452) → action
   `thing.m.user.email.password.login` v`GwBroadcastMonitorService.mVersion`
   (a build-version constant); postData `countryCode`, `email`, `passwd`
   (RSA-encrypted with the step-1 key when `ifencrypt`), `token` (ticket),
   `ifencrypt` (0/1), and an MFA blob `{"group":1,"mfaCode":"…"}`. Returns **`User`**.
-- **mobile + password:** `LoginBusiness.r(...)` (`:423-447`) → action
+- **mobile + password:** `LoginBusiness.r(...)` (~:423; `ApiParams` built ~:440) → action
   `thing.m.user.mobile.passwd.login` v`4.0`; postData `countryCode`, `mobile`,
   `passwd`, `token`, `ifencrypt`, MFA blob. Returns `User`.
 - **email code login:** action `thing.m.user.email.code.login`
-  (`pqdbppq.java:42`); **uid+password:** `thing.m.user.uid.password.login`
-  (`:43`); **uid token create:** `thing.m.user.uid.token.create` (`:66`).
+  (`pqdbppq` ~:42); **uid+password:** `thing.m.user.uid.password.login`
+  (~:43); **uid token create:** `thing.m.user.uid.token.create` (~:66).
 
-**Credential types supported** (from the action table `pqdbppq.java:36-106`):
+**Credential types supported** (from the action-constant table in class `pqdbppq`,
+`decompiled/jadx/sources/com/thingclips/sdk/user/pqdbppq.java`; each is a named
+`thing.m.user.*` string-constant, e.g. `email.code.login` ~:42,
+`uid.password.login` ~:43):
 email+password, email+code, mobile+password, mobile+code, uid+password,
-uid+token, QR-token, SSO ticket (`thing.m.user.sso.ticket.user.get`, `:88`), and
+uid+token, QR-token, SSO ticket (`thing.m.user.sso.ticket.user.get`, ~:88), and
 third-party (wx/qq/facebook/twitter/google/instagram). The baby-monitor app's
 primary path is **email/uid + region**, which is the `username.token.get` →
 `email.password.login` pair above.
 
 **`region` / country selection at login:** the `countryCode` postData field and
 the third `ApiParams(api, ver, region)` ctor arg
-(`LoginBusiness.java:452`, `ApiParams(String,String,String)`
-`ThingApiParams.java:165`) carry the region into the request; the response
+(`LoginBusiness.s` ~:452; the 3-arg ctor `ThingApiParams(String,String,String)`
+~:172) carry the region into the request; the response
 `User.domain` pins the datacenter (§4).
 
 ### 2a. JS-bridge / RN path (confidence: confirmed)
 
 Two sources: `TUNIAPIRequestManager.apiRequestByAtop`
-(`.../tuniapirequestmanager/TUNIAPIRequestManager.java:161,233-234` builds a
-`MiniAtopApiParams(api, version, ctx)` + `setPostData(...)`) AND the RN login
-manager `.../tuniloginmanager/TUNILoginManager.java` (carries a `TicketModel`,
-matching the ticket flow). The React-Native mini-apps reach the SAME atop gateway
+(`decompiled/jadx/sources/com/thingclips/smart/plugin/tuniapirequestmanager/TUNIAPIRequestManager.java`
+~:161; builds `MiniAtopApiParams(api, version, ctx)` + `setPostData(...)` ~:233)
+AND the RN login manager `TUNILoginManager.onTicketSuccess`
+(`decompiled/jadx/sources/com/thingclips/smart/plugin/tuniloginmanager/TUNILoginManager.java`;
+carries a `TicketModel`, matching the ticket flow). The React-Native mini-apps reach the SAME atop gateway
 through this bridge, so a Rust client that speaks the native atop envelope (§1)
 covers both the native and RN code paths.
 
@@ -160,22 +179,22 @@ covers both the native and RN code paths.
 
 ## 3. TOKEN / session model (confidence: confirmed)
 
-Two independent sources: the `User` bean fields
-`decompiled/jadx/sources/com/thingclips/smart/android/user/bean/User.java:34-57`
-AND the on-device persistence
-`decompiled/jadx/sources/com/thingclips/sdk/user/qdddbpp.java:16,44-47`. They agree
+Two independent sources: the `User` bean fields (class `User`,
+`decompiled/jadx/sources/com/thingclips/smart/android/user/bean/User.java`)
+AND the on-device persistence (class `qdddbpp`,
+`decompiled/jadx/sources/com/thingclips/sdk/user/qdddbpp.java`). They agree
 that the session is the `User.sid` string persisted as JSON, so this is `confirmed`.
 
-- **Session token = `User.sid`** (`User.java:49`, getter `:157`). The login
-  response `User` also carries `uid` (`:53`), `ecode` (`:36`, an encrypt code used
-  for some encrypted endpoints), `domain` (`:35`, the datacenter — §4),
-  `timezoneId`, `email`, `username`, `partnerIdentity`, `publicSession`. The `sid`
-  is then injected into every subsequent request as the `sid` envelope param
-  (`ApiParams.getSession` → `IBaseUser.getSid`).
+- **Session token = `User.sid`** (`User.sid` field ~:255, getter `User.getSid()`
+  ~:1297). The login response `User` also carries `uid` (~:259), `ecode` (~:242, an
+  encrypt code used for some encrypted endpoints), `domain` (~:241, the datacenter
+  — §4), `email` (~:243), `username` (~:263), `timezoneId`, `partnerIdentity`,
+  `publicSession`. The `sid` is then injected into every subsequent request as the
+  `sid` envelope param (`ApiParams.getSession` → `IBaseUser.getSid`).
 - **Storage on device:** the `User` (including `sid`) is serialized to JSON and
   stored via MMKV-backed `UserPreferenceUtil`
-  (`ThingUserStorageMMKV` = `qdddbpp.java:44-47`:
-  `UserPreferenceUtil.putString(key, JSON.toJSONString(user))`; load at `:16-23`).
+  (`qdddbpp.store(...)`: `UserPreferenceUtil.putString(key, JSON.toJSONString(user))`
+  ~:160; load via `UserPreferenceUtil.getString` ~:19).
   For the Rust client the equivalent is a token file under
   `~/.local/share/babymonitor/` (per TESTING.md / skill phase 5) — the `sid`+`uid`
   are the minimum to persist; both are **secrets**.
@@ -198,12 +217,13 @@ that the session is the `User.sid` string persisted as JSON, so this is `confirm
 
 ## 4. DATACENTER / region selection — runtime-from-login (confidence: confirmed)
 
-This reconciles review-gate **F5** (`re/review_gate_findings.md:53`) and the
-encrypted-regions analysis (`re/tuya_cloud_config.md:11-48`). Two independent
-sources: the `Domain` bean carried inside the login `User`
-(`decompiled/jadx/sources/com/thingclips/smart/android/user/bean/Domain.java:35-54`)
+This reconciles review-gate **F5** (`re/review_gate_findings.md`) and the
+encrypted-regions analysis (`re/tuya_cloud_config.md`). Two independent
+sources: the `Domain` bean carried inside the login `User` (class `Domain`,
+`decompiled/jadx/sources/com/thingclips/smart/android/user/bean/Domain.java`;
+`mobileApiUrl` ~:191, `gwApiUrl` ~:187, `regionCode` ~:197)
 AND the absence of any plaintext datacenter host in assets/DEX/JS
-(`re/tuya_cloud_config.md:26-31`). Together they confirm the base URLs are
+(`re/tuya_cloud_config.md`). Together they confirm the base URLs are
 **chosen at runtime and delivered by the login response**, not read statically.
 
 The login `User.domain` is a `Domain` object whose fields ARE the datacenter base
@@ -230,34 +250,35 @@ login against Tuya's publicly-known regional mobile gateway candidate for the
 user's region and then switch to `User.domain.mobileApiUrl` for all subsequent
 calls, or (b) reproduce the native `getConfig` decrypt (needs the native key — see
 `re/tuya_sign.md`). The user can also seed the region from a single login capture.
-A pre-login helper action `thing.m.user.region.list` / `thing.m.app.domain.query`
-(`pqdbppq.java:46,102`) enumerates regions/domains.
+A pre-login helper action `thing.m.user.region.list` (`pqdbppq` ~:102) /
+`thing.m.app.domain.query` (~:46) enumerates regions/domains.
 
 ---
 
 ## 5. DEVICE LIST + camera record shape (confidence: confirmed for bean shape)
 
-Two independent sources for the device-list container: `HomeBean`
-(`decompiled/jadx/sources/com/thingclips/smart/home/sdk/bean/HomeBean.java`, fields
-`deviceList` + `sharedDeviceList`, keyed by `homeId`) AND `DeviceBean`
-(`decompiled/jadx/sources/com/thingclips/smart/sdk/bean/DeviceBean.java:29-157`).
+Two independent sources for the device-list container: class `HomeBean`
+(`decompiled/jadx/sources/com/thingclips/smart/home/sdk/bean/HomeBean.java`; fields
+`deviceList` ~:24 + `sharedDeviceList` ~:38, keyed by `homeId`) AND class `DeviceBean`
+(`decompiled/jadx/sources/com/thingclips/smart/sdk/bean/DeviceBean.java`).
 The bean shape is `confirmed`; the exact wire **action name** that returns the home
 detail is obfuscated to `n` in the DEX and is `likely`/needs-live (see §6).
 
 ### 5a. Device-list container
-- `HomeBean.getDeviceList()` returns `List<DeviceBean>`; `getSharedDeviceList()`
+- `HomeBean.getDeviceList()` returns `List<DeviceBean>` (~:168); `getSharedDeviceList()`
   returns devices shared into the home. Populated from a home-detail / device-list
-  atop call via `IThingHomePlugin.getDataInstance().getHomeDeviceList(homeId)`.
+  atop call via `IThingHomePlugin.getDataInstance().getHomeDeviceList(homeId)` (~:169).
 - The home-detail action name is R8-obfuscated (`thing.m.n` placeholders in
   `com/thingclips/sdk/home/*`); the canonical Tuya mobile action is the
   `*.app.location.*` / `*.home.*` family but the exact `a=` value here is
   **needs-live-capture** (§6).
 
 ### 5b. `DeviceBean` core fields (the device record) (confidence: confirmed)
-Two independent sources: the `DeviceBean` field declarations
-(`decompiled/jadx/sources/com/thingclips/smart/sdk/bean/DeviceBean.java:29-157`)
-AND the device-list secrets call-out in `re/review_gate_findings.md:81`
-(`localKey` / P2P creds are secrets). Selected fields (`DeviceBean.java:29-157`):
+Two independent sources: the `DeviceBean` field declarations (class `DeviceBean`,
+`decompiled/jadx/sources/com/thingclips/smart/sdk/bean/DeviceBean.java`; `devId`
+~:49, `localKey` ~:106, `secKey` ~:159, `uuid` ~:192, `productId` ~:131)
+AND the device-list secrets call-out in `re/review_gate_findings.md`
+(`localKey` / P2P creds are secrets). Selected fields:
 
 | Field | Type | Role | Secret? |
 |---|---|---|---|
@@ -277,13 +298,17 @@ AND the device-list secrets call-out in `re/review_gate_findings.md:81`
 | `iconUrl`, `uiType`, `ui`, `bv`, `gwType` | String | UI/gateway metadata | no |
 
 `localKey` and `secKey` are the device-list secrets called out by review-gate
-(`re/review_gate_findings.md:81`). For the Rust models (TASK-0013) treat both as
+(`re/review_gate_findings.md`, `DeviceBean.localKey`/`DeviceBean.secKey`). For the
+Rust models (TASK-0013) treat both as
 secret; the device-list fixture must be anonymized before it enters any committed
 file.
 
 ### 5c. Camera P2P / WebRTC record — `CameraInfoBean` (confidence: confirmed)
-Two independent sources: the bean
-`decompiled/jadx/sources/com/thingclips/smart/camera/ipccamerasdk/bean/CameraInfoBean.java:9-26,140-175`
+Two independent sources: the bean (class `CameraInfoBean` + nested
+`CameraInfoBean.P2pConfig`,
+`decompiled/jadx/sources/com/thingclips/smart/camera/ipccamerasdk/bean/CameraInfoBean.java`;
+top-level fields `p2pId` ~:19, `password` ~:23, `sessionTid` ~:24; nested
+`P2pConfig` class ~:1459)
 AND a Tuya **example config payload** embedded in the camera middleware
 `decompiled/jadx/sources/com/thingclips/smart/camera/middleware/pqpbpqd.java`
 (a `JSON.parseObject("{… p2pId … p2pType … skill …}")` demo string). The bean and
@@ -311,8 +336,9 @@ fields the WebRTC/P2P path needs:
 | `p2pConfig` | JSONObject | nested `P2pConfig` | mixed |
 | `panoramicInfo` | String | fisheye/panoramic params | no |
 
-Nested `CameraInfoBean.P2pConfig` (`CameraInfoBean.java:140-175`) — the WebRTC/P2P
-credential handles:
+Nested `CameraInfoBean.P2pConfig` (`CameraInfoBean.java`, `P2pConfig` ~:1459;
+`p2pKey` ~:1462, `initStr` ~:1461, `ices` ~:1460, `session` ~:1463) — the
+WebRTC/P2P credential handles:
 
 | Field | Type | Role | Secret? |
 |---|---|---|---|

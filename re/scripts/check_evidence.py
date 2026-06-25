@@ -15,6 +15,17 @@ THE RULE (pinned; documented here so it is auditable, not a black box):
   2. Fenced code blocks (``` ... ```) are stripped before lexicon matching so a
      pasted snippet does not, by itself, turn a section into a "claim section".
 
+  2b. SYMBOL-ANCHORED CITATIONS (TASK-0024). jadx line numbers drift across
+      decompile runs, so a citation's authoritative anchor is the SYMBOL
+      (class/method/field/string-constant name); the line number is an OPTIONAL
+      hint. The accepted forms are:
+        - `Symbol.member (decompiled/.../File.java ~:NN)` — symbol + path + hint
+        - `decompiled/.../File.java`                      — bare source path
+        - `decompiled/.../File.java:NN`                   — legacy exact-line form
+      A `~:NN` (tilde) hint reads as "approximate". The lint counts the source
+      PATH as the citation token; the line hint is stripped when de-duplicating
+      sources for rule 4b so one file cited twice (bare + hinted) is ONE source.
+
   3. CLAIM LEXICON (pinned, whole-word, case-insensitive):
        endpoint | HMAC | sign | token | magic | offset | packet | frame
        | handshake | port | AES | key
@@ -103,17 +114,40 @@ NAMED_REF_RE = re.compile(
 )
 
 # Evidence citation forms.
+#
+# SYMBOL-ANCHORED CITES (TASK-0024). jadx line numbers DRIFT between decompile
+# runs/configs, so the authoritative anchor is the SYMBOL (class/method/field/
+# string-constant name) and the line is an OPTIONAL hint. The convention is
+#
+#     Symbol.member (decompiled/.../File.java ~:NN)     # ~:NN = approximate hint
+#     decompiled/.../File.java                          # bare source path, symbol in prose
+#     decompiled/.../File.java:NN                       # legacy exact-line form (still ok)
+#
+# So this regex must accept a decompiled/jadx SOURCE PATH *with or without* a
+# trailing line hint, and must tolerate a `~:NN` (tilde) hint as well as `:NN`.
+# The legacy `path:NN` alternative is kept verbatim so nothing already-green
+# regresses; the new SOURCE_PATH alternative additionally accepts a *bare* source
+# path (no line) and a `~:NN` hint. This widening is minimal: it only adds source
+# files as a citation token, it does NOT relax the requirement that a claim
+# section carry a confidence label AND >=1 citation (nor the >=2-source confirmed
+# rule) — see lint_doc().
+SOURCE_EXT = r"(?:java|kt|kts|smali|so|xml|json|js|ts|bmp|cfg|properties|md)"
 CITATION_RE = re.compile(
     r"(?:"
-    r"[\w./-]+:\d+"                       # path:NN (decompiled/foo.java:42)
+    r"[\w./-]+:\d+"                       # path:NN (decompiled/foo.java:42) — legacy exact
+    r"|[\w./-]+\." + SOURCE_EXT + r"(?:\s*~?:\d+)?\b"  # source path + optional ~:NN / :NN hint
     r"|lib[\w.-]*\.so(?:@0x[0-9A-Fa-f]+)?"  # lib*.so optionally @0xHEX
     r"|assets/[\w./-]+"                   # assets/… path
-    r"|[\w./-]+\.(?:js|ts)\b"            # JS/TS bundle path
     r"|https?://[^\s)]+"                  # URL
     r"|\b[\w.-]+/[\w.-]+\b(?=.*\b(?:repo|github|ref|reference)\b)"  # owner/repo near a ref word
     r"|github\.com/[\w./-]+"             # explicit github ref
     r")"
 )
+
+# Trailing line hint on a citation: `:NN` or `~:NN` (with optional whitespace).
+# Stripped when de-duplicating citation tokens so a path cited bare and again with
+# a hint counts once (see distinct_citations).
+LINE_HINT_RE = re.compile(r"\s*~?:\d+$")
 
 # ── Baseline waiver ratchet ──────────────────────────────────────────────────
 # Pre-existing grounding debt, locked in so the gate FAILS on regressions while
@@ -247,7 +281,13 @@ def distinct_citations(sec: Section) -> set[str]:
     txt = section_text(sec)
     tokens: set[str] = set()
     for m in CITATION_RE.finditer(txt):
-        tokens.add(m.group(0).casefold())
+        # Normalise away the (optional) line hint so the SAME source path cited
+        # twice — once bare, once with a `:NN`/`~:NN` hint — counts as ONE source,
+        # not two. Otherwise the symbol-anchored convention (TASK-0024) could game
+        # the >=2-source `confirmed` rule (rule 4b) by re-citing one file with and
+        # without a line. The hint is decoration; the path/symbol is the source.
+        tok = LINE_HINT_RE.sub("", m.group(0)).strip().casefold()
+        tokens.add(tok)
     for m in NAMED_REF_RE.finditer(txt):
         tokens.add(m.group(0).casefold())
     return tokens
@@ -534,12 +574,92 @@ def selftest() -> int:
             )
             failures += 1
 
+    # Symbol-anchored citation self-test (TASK-0024): the new cite forms — a bare
+    # source path and a `Symbol (path ~:NN)` hinted form — must be ACCEPTED as a
+    # valid citation, while a claim with NO citation must still FAIL. Also prove
+    # the `confirmed` >=2-source rule is NOT gamed by citing one file twice (bare
+    # + hinted): that is still ONE source and must flag.
+    with tempfile.TemporaryDirectory() as td:
+        tdir = Path(td)
+
+        # (a) symbol + hinted-path cite, likely → must PASS.
+        hinted = tdir / "sym_hint.md"
+        hinted.write_text(
+            "## API name rewrite\n\n"
+            "The `a=` action is rewritten thing→smartlife by "
+            "`ThingApiParams.checkAPIName` "
+            "(decompiled/jadx/sources/com/x/ThingApiParams.java ~:192) "
+            "(confidence: likely).\n",
+            encoding="utf-8",
+        )
+        if lint_doc(hinted):
+            print(
+                "SELFTEST FAIL: symbol-anchored hinted cite "
+                "'(...File.java ~:192)' was NOT accepted as a citation.",
+                file=sys.stderr,
+            )
+            failures += 1
+
+        # (b) bare source path (symbol named in prose, no line) → must PASS.
+        bare = tdir / "sym_bare.md"
+        bare.write_text(
+            "## Session token\n\n"
+            "The session token is the `User.sid` field declared in "
+            "decompiled/jadx/sources/com/x/User.java (confidence: likely).\n",
+            encoding="utf-8",
+        )
+        if lint_doc(bare):
+            print(
+                "SELFTEST FAIL: bare source-path cite '(...User.java)' was NOT "
+                "accepted as a citation.",
+                file=sys.stderr,
+            )
+            failures += 1
+
+        # (c) NEGATIVE: a claim section naming a symbol but with NO citation at
+        # all (no path, no ref) must STILL FAIL — the widening must not let a bare
+        # symbol name masquerade as evidence.
+        nocite = tdir / "sym_nocite.md"
+        nocite.write_text(
+            "## API name rewrite\n\n"
+            "The `a=` action token is rewritten thing→smartlife by the "
+            "checkAPIName method (confidence: likely).\n",
+            encoding="utf-8",
+        )
+        nf = lint_doc(nocite)
+        if not any("evidence citation" in m for f in nf for m in f.missing):
+            print(
+                "SELFTEST FAIL: a claim naming a symbol but citing NO path/ref "
+                "was accepted — the citation rule does not bite.",
+                file=sys.stderr,
+            )
+            failures += 1
+
+        # (d) `confirmed` with the SAME file cited bare + hinted is ONE source →
+        # must flag (rule 4b not gamed by the line-hint normalisation).
+        gamed = tdir / "sym_confirmed_one.md"
+        gamed.write_text(
+            "## Sign envelope\n\n"
+            "The envelope keys carry the `sign` token (confidence: confirmed); "
+            "see decompiled/jadx/sources/com/x/ThingApiParams.java and again "
+            "decompiled/jadx/sources/com/x/ThingApiParams.java ~:407.\n",
+            encoding="utf-8",
+        )
+        if not lint_doc(gamed):
+            print(
+                "SELFTEST FAIL: confirmed section citing ONE file twice (bare + "
+                "hinted) passed — the >=2-source rule was gamed by the line hint.",
+                file=sys.stderr,
+            )
+            failures += 1
+
     if failures:
         print(f"check-evidence selftest: {failures} failure(s)", file=sys.stderr)
         return 1
     print(
         "check-evidence selftest: OK (bites on bad, passes good, "
-        "verdict-gate works, ratchet holds)"
+        "verdict-gate works, ratchet holds, symbol-anchored cites accepted "
+        "while no-citation claims still fail)"
     )
     return 0
 

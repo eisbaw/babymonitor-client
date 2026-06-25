@@ -4,7 +4,7 @@ title: Implement device list/binding models + service in Rust
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 01:44'
+updated_date: '2026-06-25 04:44'
 labels:
   - phase5
   - rust
@@ -34,15 +34,5 @@ WHY: lets the client discover the SCD921 under the Tuya account - prerequisite f
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-[from TASK-0007: re/tuya_cloud_auth.md sections 5a-5c]
-DEVICE-LIST CONTAINER: HomeBean{homeId, deviceList: List<DeviceBean>, sharedDeviceList: List<DeviceBean>}. Populated via home-detail atop call (action obfuscated to 'n' in DEX -> exact a= needs live capture).
-DeviceBean record fields (src com/thingclips/smart/sdk/bean/DeviceBean.java:29-157):
-  devId(String), name(String, may be PII), localKey(String) SECRET, secKey(String) SECRET, uuid(String, anonymize), pv(String), productId(String), productVer(String), schema/schemaMap, skills(Map), category/categoryCode (camera=sp/ipc family), dps/dpCodes/dpName(Map, may be sensitive), mac/ip/lat/lon (lat/lon = PII), iconUrl/uiType/ui/bv/gwType.
-  -> SECRET fields: localKey, secKey. Anonymize devId/uuid/name/lat/lon in any fixture.
-CAMERA P2P/WebRTC record - CameraInfoBean (per-devId config, separate fetch; src camera/ipccamerasdk/bean/CameraInfoBean.java:9-26,140-175):
-  id(String), p2pId(String, sensitive handle), p2pType(int), p2pSpecifiedType(int), p2pPolicy(int), password(String) SECRET, sessionTid(String) SECRET, skill(String JSON: videos[]/audios[]/p2p/cloudGW/localStorage/sdk_version/video_num), mediaConsumerSkill(String), vedioClarity(int)/vedioClaritys(int[]), audioAttributes{hardwareCapability[],callMode[]}, p2pConfig(nested), panoramicInfo(String).
-  Nested P2pConfig: p2pKey(String) SECRET, initStr(String) SECRET, ices(List, WebRTC ICE servers), session(Object) SECRET, tcpRelay/udpRelay(Object, relay descriptors).
-  -> SECRET fields: password, sessionTid, p2pKey, initStr, session.
-IMPORTANT: moto_id does NOT exist in this app. The P2P credential handles are p2pId + P2pConfig.p2pKey + initStr/session/ices/relays (WebRTC-shaped, corroborates F2 WebRTC-over-MQTT).
-NEGATIVE TEST (per review gate): parser must REJECT a camera record missing the P2P handle (p2pId / p2pKey) and assert required-field invariants. Anonymize all real values before any committed fixture; localKey/p2pKey/password/sessionTid/initStr/session are secrets -> secrets/ only.
+FEED-FORWARD from TASK-0012 (signer/auth, commit c60d2fc): build the device-list/service request decoration on babymonitor-core::sign::SigningKeyMaterial — { app_key:String (wire clientId), app_secret:String (sign-key part only), app_cert_sha256_hex:String (64-hex, sign-key part), ttid:String (wire ttid) }. It has a redacting Debug (never logs secret values). Load it ONCE from secrets/ (app_cert_sha256_hex via sign::app_cert_sha256_hex_from_apk on the extracted APK) and pass &SigningKeyMaterial into request building — do NOT re-read secrets per call. Session state comes from babymonitor-core::session::{Session, SessionStore}: Session.sid is the wire 'sid' param, Session.mobile_api_base is the datacenter base URL (User.domain.mobileApiUrl); call Session::needs_refresh() before using a session. NOTE: a full valid 'sign' is still TOKEN-PENDING (Signer::sign returns Error::BmpTokenPending until TASK-0030); plan request decoration to thread the signer through but expect signing to be unavailable offline until then.
 <!-- SECTION:NOTES:END -->

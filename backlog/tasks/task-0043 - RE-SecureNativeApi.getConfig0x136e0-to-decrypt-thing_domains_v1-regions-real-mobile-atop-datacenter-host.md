@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@reverser'
 created_date: '2026-06-25 12:16'
-updated_date: '2026-06-25 12:40'
+updated_date: '2026-06-25 12:46'
 labels:
   - phase3
   - wave3
@@ -48,4 +48,6 @@ RECOVERED EU host (non-secret, public): mobileApiUrl=https://a1.tuyaeu.com (EU i
 GOTCHA / feed-forward to TASK-0042: the EU host IS a1.tuyaeu.com == EXACTLY the host TASK-0042 already tried and got ILLEGAL_CLIENT_ID. So the 'wrong datacenter host' hypothesis is REFUTED by ground truth. ILLEGAL_CLIENT_ID is neither a host problem nor a clientId-param problem. Remaining live hypotheses: (a) provisioning / app-cert-pin / app-identity gate the standalone client cannot reproduce, or (b) a still-wrong sign (unvalidated bmp_token candidate / MD5 fold). Do NOT re-sweep hosts next cycle - vary the provisioning surface instead.
 
 Docs: re/regions_decrypt.md (new), re/tuya_cloud_config.md (superseded note), re/ghidra/getconfig/*.c (Ghidra C).
+
+Cycle review: both GO on the committed RE (regions=pure-Java AES-256-CTR, key+IV in asset header, reproduced via python+openssl; EU host=a1.tuyaeu.com = SAME host that failed -> host hypothesis REFUTED; clientId wire param already correct; no secret). BUT architect found the SMOKING GUN: our login request is MISSING chKey — a native-derived per-app channel-auth token (ThingNetworkSecurity.getChKey -> JNICLibrary.getChKey @0x16000), which is BOTH a wire param AND in the sign whitelist; absent from our request = strongest ILLEGAL_CLIENT_ID explanation. HOLD the live re-attempt until chKey is recovered+added (TASK-0044). Also: the 'ILLEGAL_CLIENT_ID is before sign-eval' claim is UNPROVEN (server-opaque) — soften it (chKey being signed means a corrected request changes both identity+sign). P2: live_login.md:121-124 stale native-getConfig regions note -> add superseded pointer.
 <!-- SECTION:NOTES:END -->

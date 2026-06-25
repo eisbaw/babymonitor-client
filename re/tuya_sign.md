@@ -22,9 +22,12 @@ source lines live ONLY in `secrets/tuya_appkey.json` (gitignored). This doc reco
 
 > **SUPERSEDED by `re/tuya_sign_static.md` (TASK-0023).** The heavy static
 > **radare2** dive (TASK-0023; the `t_s.bmp` matrix port was later done in
-> **Ghidra** under TASK-0033) recovered the signer — the verdict is now
-> **partially-recoverable** (NO device needed; only the `t_s.bmp` token-decode
-> port, filed as TASK-0029, remains). Concretely the static dive proved the keyed
+> **Ghidra** under TASK-0033) recovered the signer. **CORRECTED (TASK-0033, see
+> `re/bmp_token_whitebox.md` §9):** the "only the `t_s.bmp` token-decode port
+> remains" residual is stale — the matrix IS ported; the real residual is the
+> **runtime SDK-config `byte[]`** (`doCommandNative param_6`), so the BMP token is
+> **NOT static-only achievable** and the signer is not fully statically recoverable.
+> Concretely the static dive proved the keyed
 > hash is **plain MD5** (not HMAC-SHA256; MD5 IV constants in
 > `libthing_security.so@0x76c0`) and the app-cert SHA-256 is **computable offline**
 > from the APK signing cert (`META-INF/BNDLTOOL.RSA`), removing the runtime-cert

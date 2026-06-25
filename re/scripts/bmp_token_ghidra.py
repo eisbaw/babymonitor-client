@@ -75,10 +75,14 @@ UNCHANGED and corroborated; only the cmd-number that triggers the decode differs
 ------------------------------------------------------------------------------
 VALIDATION STATUS: fully-ported-unvalidated.
 There is NO embedded static oracle (no test vector / expected token in the .so).
-The decode is deterministic + device-independent, so it runs offline and emits a
-candidate key list from the real t_s.bmp -- but the ONLY true oracle is a live
-sign-accept (EXCLUDED by scope). A wrong constant fails silently. Any produced
-value goes to secrets/ ONLY; never a tracked file.
+The matrix machinery is deterministic + device-independent and runs offline.
+HOWEVER (see re/bmp_token_whitebox.md §9 -- REFUTED static-only): the production
+token is NOT static-only -- read_keys_from_content's `config` arg is a RUNTIME JNI
+byte[] (doCommandNative param_6), which selects the pixel offset AND the
+header-validity branch. So the matrix runs offline, but emitting the REAL key list
+additionally requires the runtime SDK-config blob (or one live sign vector); the
+ONLY true oracle is a live sign-accept (EXCLUDED by scope). A wrong constant fails
+silently. Any produced value goes to secrets/ ONLY; never a tracked file.
 ------------------------------------------------------------------------------
 """
 from __future__ import annotations

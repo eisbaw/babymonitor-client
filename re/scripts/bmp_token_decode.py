@@ -286,10 +286,14 @@ def nalajcie_decode(bmp_raw: bytes, client_id: bytes) -> Optional[bytes]:
 # (3) THIS-APP decode -- the residual (un-ported imath+matrix on the sign path)
 # ---------------------------------------------------------------------------
 class MatrixResidual(NotImplementedError):
-    """Raised to mark the un-ported imath+matrix sign-token decode
-    (read_keys_from_content@0x4974 -> matrix fcn.0x5eb0). The token is
-    deterministic + device-independent but has no local oracle; nalajcie's older
-    byte-layout does not match this APK's specific bytes."""
+    """Raised to mark the imath+matrix sign-token decode
+    (read_keys_from_content@0x4974 -> matrix fcn.0x5eb0). The matrix is now ported
+    (TASK-0033, re/scripts/bmp_token_ghidra.py); the matrix machinery is
+    deterministic + device-independent but has no local oracle, and -- CORRECTED by
+    re/bmp_token_whitebox.md §9 (REFUTED static-only) -- the production token
+    additionally requires the RUNTIME JNI byte[] SDK-config (doCommandNative
+    param_6), so it is NOT static-only achievable. nalajcie's older byte-layout
+    does not match this APK's specific bytes."""
 
 
 # Backwards-compat alias (the historical name; the residual is a matrix decode, not
@@ -299,18 +303,22 @@ WhiteBoxResidual = MatrixResidual
 
 def thisapp_decode(assets_dir: str) -> bytes:
     """What this APK actually does for the signer's bmp_token. The framing is
-    recovered, but the token itself is UN-PORTED: it is the imath+matrix decode of
-    the raw t_s.bmp bytes on the sign path -- not produced here."""
+    recovered and the imath+matrix decode of the raw t_s.bmp bytes on the sign path
+    is now ported (TASK-0033) -- but the REAL token is NOT produced here: it
+    additionally needs the runtime JNI byte[] SDK-config (see §9). Raises."""
     raise MatrixResidual(
         "this APK's signer bmp_token = the imath+matrix decode "
         "(libthing_security_algorithm.so read_keys_from_content@0x4974 / matrix "
         "fcn.0x5eb0) of the RAW t_s.bmp bytes on the sign path (fed via "
         "libthing_security.so fcn.0x13b5c -> doCommandNative fcn.0x13ef4 @0x1466c). "
-        "It is deterministic + device-independent but UN-PORTED: no local oracle, and "
+        "The matrix is now ported (TASK-0033); the matrix machinery is deterministic "
+        "+ device-independent but has no local oracle, and -- CORRECTED by §9 (REFUTED "
+        "static-only) -- the production token additionally needs the RUNTIME JNI byte[] "
+        "SDK-config (doCommandNative param_6), so it is NOT static-only achievable. "
         "nalajcie's older byte-layout doesn't match this APK's specific bytes. The "
         "AES path (fcn.0x11658) is the SEPARATE cert-pinning consumer of t_s.bmp, a "
         "red herring (ported in re/scripts/bmp_token_aes.py). "
-        "See re/bmp_token_whitebox.md §8."
+        "See re/bmp_token_whitebox.md §9 (and §8 for the trace)."
     )
 
 

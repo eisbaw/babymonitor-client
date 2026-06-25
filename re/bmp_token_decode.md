@@ -38,7 +38,11 @@ relates to the public reference `nalajcie/tuya-sign-hacking`, and the precise wa
 >    spike reasoning.
 
 **Decode (cert-pinning AES path): fully-ported-validated. Signer bmp_token:
-partially (un-ported, imath matrix).** The AES transform (`fcn.11658`) is byte-exact
+matrix ported (TASK-0033); production token needs the runtime SDK-config `byte[]`
+— not static-only achievable (see `re/bmp_token_whitebox.md` §9).** The earlier
+"partially (un-ported, imath matrix)" label is doubly stale: the matrix IS now
+ported, and the residual is the **runtime JNI `byte[]` SDK-config**
+(`doCommandNative param_6`), not the port. The AES transform (`fcn.11658`) is byte-exact
 and validated, but its OUTPUT is the cert-pinning config — NOT the signer's
 `bmp_token`. The signer's `bmp_token` is produced on the OTHER `t_s.bmp` consumer
 (`fcn.13b5c` → imath matrix), characterized end-to-end but un-ported

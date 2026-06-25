@@ -205,14 +205,19 @@ the imath/matrix exports of `libthing_security_algorithm.so`.
   calls) — a **linear-algebra / modular-exponentiation deobfuscation** of the BMP
   pixel data into the token. This is the embedded-BMP + matrix mechanism F1 /
   `nalajcie/tuya-sign-hacking` (`re/review_gate_findings.md:18`) reverses.
-- **Reproducibility:** the decode is fully **deterministic** — it depends ONLY on the
+- **Reproducibility:** ~~the decode is fully **deterministic** — it depends ONLY on the
   static `assets/t_s.bmp` and the embedded matrix constants, with **no runtime
-  input**. So it *can* be ported to Rust/python in principle (re-implement imath
-  bignum + the matrix `transform`, or emulate these ~6 functions). It is NOT defeated
-  by anti-debug or device binding. But it is non-trivial (full bignum + matrix port,
-  exact constant extraction) and was not completed within this spike → the single
-  residual that keeps the verdict at `partially-recoverable`. Filed as a follow-up
-  task.
+  input**.~~ **REFUTED / CORRECTED (TASK-0033, `re/bmp_token_whitebox.md` §9):** the
+  Ghidra port shows the decode ALSO keys off a **runtime JNI `byte[]` SDK-config**
+  (the `config` arg to `read_keys_from_content` is `param_6` of `doCommandNative`,
+  read via `GetByteArrayElements`/`GetArrayLength`), which selects the pixel offset
+  AND the header-validity branch — so the decode is **NOT static-only achievable**.
+  The matrix machinery itself *can* be (and now HAS been, TASK-0033) ported to
+  Rust/python — re-implementing the imath bignum + the matrix `transform` — and it is
+  NOT defeated by anti-debug or device binding; but the **production token additionally
+  requires the runtime SDK-config blob** (or one captured live sign vector). The matrix
+  port was the residual this spike named; per §9 it is done, and the real residual is
+  the runtime config blob. See `re/bmp_token_whitebox.md` §9.
 
 ## 6. What is / isn't statically reproducible (confidence: confirmed — scoping summary)
 
@@ -223,12 +228,16 @@ the imath/matrix exports of `libthing_security_algorithm.so`.
 | Keyed-hash primitive | **YES — plain MD5 (hex)** | MD5 IV `libthing_security.so@0x76c0`; 16-byte out `@0x194b0`; hex `@0x7810`; §3 |
 | Key-combine order/separator | **YES — `_`-joined** | `"_"` `@0x88c4`; `'_'` write `@0x14c30`; §4 |
 | App-cert SHA-256 (key part) | **YES — offline from APK cert** | `META-INF/BNDLTOOL.RSA` + openssl/`MessageDigest("SHA256")` strings `@0x38bfc/0x38c4a`; §4 |
-| `t_s.bmp` token decoded value | **NO (not ported)** but deterministic & reproducible-in-principle | imath `mp_int_*` + matrix `@0x5eb0`, `SignFileDecoder@0x199d8`; §5 |
+| `t_s.bmp` token decoded value | **matrix-ported (TASK-0033) BUT production token needs the runtime SDK-config `byte[]` — NOT static-only achievable; needs the runtime config blob OR one live sign vector** (`re/bmp_token_whitebox.md` §9) | imath `mp_int_*` + matrix `@0x5eb0`, `SignFileDecoder@0x199d8`; §5 |
 
-Because 5 of 6 ingredients are statically recovered/portable and only the BMP-token
-decode remains (deterministic, device-independent, but un-ported), the verdict is
-**partially-recoverable**, not `not-statically-recoverable` and not yet
-`recoverable-statically`.
+Because 5 of 6 ingredients are statically recovered/portable, the verdict was
+historically **partially-recoverable** with the BMP-token decode as the lone residual.
+**CORRECTED (TASK-0033, `re/bmp_token_whitebox.md` §9):** the BMP-token decode is NOT
+static-only — the matrix is now ported, but the production token additionally requires
+a **runtime JNI `byte[]` SDK-config blob** (`doCommandNative param_6`). So the residual
+is NOT "port the matrix" (done) but "obtain the runtime SDK-config blob (or one live
+sign vector)"; the BMP-token value is therefore **not statically recoverable**. See
+`re/bmp_token_whitebox.md` §9.
 
 ## 7. Precise algorithm for the Rust port (TASK-0012) (confidence: likely)
 

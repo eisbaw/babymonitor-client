@@ -40,7 +40,9 @@ FIPS-197 known-answer cross-check (`github.com/usnistgov/ACVP`) reproduced in
   AES/cert-pinning finding stands, AND the signer's `bmp_token` lives on a separate,
   still-unported path. The signer (TASK-0012) is therefore **not yet offline-unblocked
   by a *confirmed value*** — but the path IS statically characterized end-to-end
-  (deterministic, device-independent); see §6 + the feed-forward.
+  (the matrix is now ported, TASK-0033). **NOTE — see §9 (REFUTED static-only):** the
+  decode additionally keys off a **runtime SDK-config `byte[]`** (`doCommandNative
+  param_6`), so it is NOT static-only achievable; see §6 + §9 + the feed-forward.
 
 > **ERRATUM (TASK-0030, this revision).** An earlier version of this doc (and the
 > commit-`5967f77` message) claimed `t_s.bmp` has **exactly ONE** code xref (the AES
@@ -159,13 +161,16 @@ Consequences for the request signer (TASK-0012):
   matrix** deobfuscation (`fcn.4b28` → `fcn.5138`/`fcn.54f4` → matrix `fcn.5eb0`,
   "inited matrix:") that decodes the SDK-config blob into the labelled key list, which
   then feeds the cmd=1 MD5 key-builder (`fcn.13474`). Full JOB-1 trace below in §8.
-- **BmpToken: partially (statically-recoverable-in-principle, not yet ported).** The
-  decode is fully **deterministic and device-independent** — it depends only on the
-  static `t_s.bmp` pixels + the static config blob + the embedded matrix constants,
-  with no runtime/network input. So it CAN be ported offline, but doing so requires
-  porting the imath bignum + the matrix `transform` (the same residual already
-  characterized in `re/tuya_sign_static.md` §5). This is the original F1 "imath
-  matrix" model — now confirmed to be on the t_s.bmp sign path.
+- **BmpToken — see §9: REFUTED, needs runtime SDK-config `byte[]`.** ~~Partially
+  (statically-recoverable-in-principle, not yet ported); the decode is fully
+  deterministic and device-independent — depends only on static `t_s.bmp` pixels +
+  static config blob + matrix constants, no runtime input.~~ **CORRECTED by §9
+  (TASK-0033):** the matrix IS now ported, but the `config` blob is a **runtime JNI
+  `byte[]`** (`doCommandNative param_6`), NOT a static asset — so the decode is **NOT
+  static-only achievable**. The imath bignum + matrix `transform` port (the residual
+  this section named) is done; the real residual is the runtime SDK-config blob. This
+  is the original F1 "imath matrix" model on the t_s.bmp sign path — corrected for the
+  runtime-config dependency. See §9.
 
 **What WOULD shortcut the port:** one captured/accepted live sign (the TASK-0012 AC#3
 contingency) pins the middle `_`-part in one place
@@ -191,11 +196,13 @@ Two independent sources: the per-claim disassembly anchors in the table below
 | decrypted blob = cert-pin JSON | `{"securityOpen",…,"data":[2×sha256]}`; §6 | confirmed |
 | blob == signer's bmp_token | NO — they are on different `t_s.bmp` consumers (ERRATUM, §6, §8) | confirmed |
 | signer bmp_token = raw-`t_s.bmp` → imath matrix decode | `fcn.13b5c`→`read_keys_from_content`→matrix `fcn.5eb0`; §8 | confirmed |
-| signer bmp_token ported offline | imath bignum + matrix un-ported (deterministic, device-independent) | **partially** |
+| signer bmp_token ported offline | matrix IS ported (TASK-0033); but production token needs the runtime SDK-config `byte[]` (`doCommandNative param_6`) — **see §9, REFUTED static-only** | **needs runtime config** |
 
 Decode (cert-pinning AES path): fully-ported-validated. BmpToken (signer middle
-`_`-part): partially (statically-recoverable-in-principle; imath-bignum + matrix
-un-ported) — see §8.
+`_`-part): **see §9 — REFUTED static-only; the imath-bignum + matrix IS ported
+(TASK-0033) but the production token needs the runtime SDK-config `byte[]`
+(`doCommandNative param_6`), so it is NOT static-only achievable** — see §8 (trace)
+and §9 (correction).
 
 ## 8. JOB-1: the SECOND `t_s.bmp` consumer — the sign path (confidence: confirmed)
 

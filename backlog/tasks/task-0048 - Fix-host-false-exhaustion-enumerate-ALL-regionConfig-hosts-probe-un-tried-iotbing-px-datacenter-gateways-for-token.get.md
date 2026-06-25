@@ -3,11 +3,11 @@ id: TASK-0048
 title: >-
   Fix host false-exhaustion: enumerate ALL regionConfig hosts + probe un-tried
   iotbing/px datacenter gateways for token.get
-status: In Progress
+status: Done
 assignee:
   - '@implementer'
 created_date: '2026-06-25 14:42'
-updated_date: '2026-06-25 15:01'
+updated_date: '2026-06-25 15:02'
 labels:
   - phase3
   - wave3
@@ -65,3 +65,25 @@ Per-host outcomes (one token.get each for reachable hosts; raw -> gitignored sec
 
 Budget: 2 token.get spent (hosts 1+2), 0 password.login, 2FA not reached. Verdict: static host avenue GENUINELY EXHAUSTED. ILLEGAL_CLIENT_ID is an identity/provisioning gate (app-attestation / appKey<->package binding), NOT a host/sign/ttid problem. Filed follow-up TASK-0049. Gates green: e2e, secret-scan, check-evidence, live clippy/tests (20 pass).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Root-caused the ILLEGAL_CLIENT_ID host false-exhaustion (review-gate finding) and probed the un-tried EU datacenter gateways. Outcome: the static host avenue is GENUINELY EXHAUSTED — ILLEGAL_CLIENT_ID is an identity/provisioning gate, not a host/sign/ttid problem.
+
+STAGE A (static):
+- regions_decrypt.py now emits EVERY regionConfig host/port field (region_host_fields); EU has 24. New test_regions_decrypt.py (>2-field assertion + real-asset cross-check) wired into just e2e via test-regions. Full EU host list recorded in re/regions_decrypt.md (public Tuya gateways).
+- Downgraded over-claimed verdicts confirmed->likely, scoped to mobileApiUrl-only, inside CORRECTED frames (verdict-overturn guard stays green): regions_decrypt.md "REFUTED", live_login.md "do not re-sweep hosts".
+- TASK-0047 RESOLVED statically (>=2 methods): wire ttid = sdk_international@<appKey>, channel = oem. The sdk_<ver>@appKey rewrite hits the CHANNEL arg in AppInitializer.d:334-335; the ThingSdk.init 6-arg->CHANNEL_OEM overload routes it into the ttid slot (mTtid). Recorded re/tuya_cloud_auth.md §1b; corrected identity_enumeration.md §1/§2a; TASK-0047 closed.
+- live.rs reconciled to ThingApiParams.initUrlParams: wire_ttid() ttid (signed) + channel=oem + appRnVersion=5.92 (app emits it). getCommonParams NOT folded (addCommonParams has zero callers; mCommonParams empty) — documented, not invented.
+
+STAGE B (live, guardrails held):
+- Added run_token_get_probe + `auth live-login --probe-only --host <h>`: ONE token.get to ONE host, STOP, never password.login (--host required). Needed because run_live_login chains into login.
+- Probes: apigw-eu.iotbing.com -> 200 ILLEGAL_CLIENT_ID; a1-us.iotbing.com -> 200 ILLEGAL_CLIENT_ID; px.tuyaeu.com -> DNS NXDOMAIN (not a public atop host); a3.tuyaeu.com -> HTTPS-PSK (not an atop host). 2 token.get spent, 0 password.login, no 2FA.
+
+VERDICT: every reachable EU gateway rejects the confirmed-real appKey identically with the fully app-faithful envelope -> app-attestation/provisioning gate upstream of sign verification. Sign oracle still unreachable; bmp_token+fold un-validated. Follow-up TASK-0049 (decide on-device capture vs local-pairing pivot).
+
+Gates: just e2e, secret-scan, check-evidence all green; live-feature clippy clean + 20 live tests pass.
+
+Risks/limits: per-host verdict is likely (one live capture each); the app-attestation conclusion is inferred (no positive proof of the exact attestation header) — TASK-0049 captures it. px/a3 could not be token.get-probed (not public atop hosts), so they are eliminated by reachability, not by a token.get response.
+<!-- SECTION:FINAL_SUMMARY:END -->

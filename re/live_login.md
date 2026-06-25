@@ -18,6 +18,57 @@ OUTCOME, never a value.
 
 ---
 
+## Final wire-fidelity probe — every static field matched, still rejected (TASK-0051) (confidence: confirmed)
+
+**The last two statically-derivable wire differences between our `token.get` and
+the real app were closed, and the gateway STILL returns the identical
+`ILLEGAL_CLIENT_ID`. The static cloud-login avenue is now AIRTIGHT-EXHAUSTED.**
+
+The post-0050 architect request-shape sweep found exactly TWO remaining
+statically-derivable differences; both were judged very unlikely to move a
+sign-insensitive reject, but were closed to remove the last wire-level doubt:
+
+1. **`x-client-trace-id` request HEADER** = `requestId` — the app adds it
+   unconditionally (`OKHttpBusinessRequest.java`: `CLIENT_TRACE_ID =
+   "x-client-trace-id"` @:23, `addHeader(CLIENT_TRACE_ID, getRequestId())` @:342).
+   Our CLI omitted it; now `send_atop` adds it, reusing the `requestId` already in
+   the signed envelope. It is a header, not a signed param.
+2. **`deviceId` in the POST BODY** — the app's `ApiParams.getRequestBody()` puts
+   `KEY_DEVICEID="deviceId"` into the request body (`ApiParams.java`:87-89), in
+   addition to the signed query (`ApiParams.java`:227, which we already sent).
+   Now added to the form body too. `deviceId` is a `SIGN_WHITELIST` param signed
+   from the envelope map, so the canonical sign string is UNCHANGED.
+
+Both land in the single `send_atop` path
+(`babymonitor/babymonitor-cli/src/live.rs`). EXACTLY ONE signed `token.get` was
+then fired against `a1.tuyaeu.com` (`--probe-only --host a1.tuyaeu.com`, no
+`--corrupt-sign`, no `password.login`):
+
+| probe | wire delta vs 0050 | HTTP | errorCode | errorMsg |
+|---|---|---|---|---|
+| TASK-0051 (`--probe-only`) | +`x-client-trace-id` header, +body `deviceId` | 200 | `ILLEGAL_CLIENT_ID` | `Invalid client;No access` |
+
+(raw capture in gitignored `secrets/tuya_live_debug.json`; the captured
+`request_param_keys` confirm `deviceId`+`requestId` in the envelope — the body
+`deviceId` and header are added downstream in `send_atop`.)
+
+**Probe budget:** exactly **1** signed `token.get` (this task). ZERO
+`password.login` (across ALL cycles). 2FA NOT reached. Not `Accepted`.
+
+**Verdict (confidence: confirmed):** the reject is unchanged. Combined with the
+TASK-0050 corrupted-sign differential (the reject is sign-INSENSITIVE / returned
+BEFORE sign-verification) and the TASK-0048 host re-sweep (every EU-family gateway
+rejects), EVERY statically-derivable identity field, header, host, and the sign
+itself have now been matched to the app, and the public atop gateway STILL returns
+`ILLEGAL_CLIENT_ID`. The blocker is therefore a server-side identity/provisioning
+gate (app-attestation / app-cert-pin / appKey↔package binding) that a standalone
+static client cannot reproduce from the recovered material alone. The static
+cloud-login avenue is exhausted; unblocking now requires on-device evidence
+(Frida/proxy capture of a real app request, TASK-0022) or additional material
+from the owner — NOT another static field to add.
+
+---
+
 ## Corrupted-sign differential — `ILLEGAL_CLIENT_ID` is sign-INSENSITIVE (TASK-0050) (confidence: confirmed)
 
 **The decisive test ran. `ILLEGAL_CLIENT_ID` is returned BEFORE the gateway

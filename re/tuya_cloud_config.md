@@ -11,6 +11,15 @@ confidence label and an evidence citation per TESTING.md Part 1.
 > `decompiled/jadx/sources/...` and `decompiled/apktool/...` paths resolve only
 > after a local `just decompile` (those trees are gitignored).
 
+> **UPDATE (TASK-0043) — the `regions`/`pins` blob IS now decrypted (STATICALLY).**
+> The encrypted-but-not-enumerable claim below is SUPERSEDED: the regions/pins decrypt
+> is **AES-256-CTR with the key+IV embedded in the asset's own 48-byte header** (pure-Java
+> `DomainHelper.parseDomainsConfig` → `AESCTRUtil.decrypt`), so it is fully static —
+> no runtime input, no appKey, no native call. The native `SecureNativeApi.getConfig`
+> @0x136e0 is the decryptor for a DIFFERENT asset (`t_cdc.tcfg`, the unshipped
+> custom-domain override; AES-128-GCM keyed on appKey/appSecret). Recovered EU host =
+> `a1.tuyaeu.com`. See `re/regions_decrypt.md` + `re/ghidra/getconfig/`.
+
 ## Datacenter domains are NOT static plaintext — they are encrypted in an asset (confidence: confirmed)
 
 The candidate datacenter domains are shipped **encrypted** in the asset bundle

@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-06-24 23:16'
-updated_date: '2026-06-25 00:49'
+updated_date: '2026-06-25 00:55'
 labels:
   - phase5
   - rust
@@ -72,6 +72,8 @@ CYCLE-2 doc nits: decompile_dex.md confirmed headers scoped to PRESENCE; resendO
 GOTCHA 4 (scope creep, honest): the new >=2-source rule surfaced PRE-EXISTING single-citation `confirmed` sections in 3 OTHER docs (decompile_dex, js_bundle_map, native_libs). I added genuine second sources rather than weaken the lint. This is correct but means TASK-0019 touched more docs than its title implies.
 
 WHY ONE COMMIT: emptying BASELINE_WAIVERS (0018) requires the baseline docs already rewritten AND the stricter lint present; splitting would leave an intermediate commit with stale waivers / failing check-evidence. Atomic commit keeps every gate green per-commit.
+
+Cycle-3 review: both GO. Gates verified genuinely stronger (live-proven bites), relabels honest, NUL-byte grep -a fix increases detection. P2 nits -> TASK-0020 (low).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

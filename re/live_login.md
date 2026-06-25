@@ -20,26 +20,32 @@ OUTCOME, never a value.
 
 ## Outcome (confidence: likely)
 
-**The live sign oracle was UNREACHABLE: the public atop gateway rejected our
-request with `ILLEGAL_CLIENT_ID` ("Invalid client; No access") — a
-client-identity / provisioning rejection.** Whether this is returned strictly
-BEFORE the gateway evaluates our `sign` is a **server-opaque** assertion we
-cannot prove from one capture: `ILLEGAL_CLIENT_ID` is an identity-layer code, but
-the request we sent was ALSO missing `chKey` (a SIGNED identity param) and the
-SDK-fidelity params, so a corrected request changes BOTH the identity surface AND
-the canonical sign at once. We therefore do NOT claim the sign was never reached;
-we claim only that the `token.get` SIGN was neither explicitly accepted nor
-explicitly rejected by an error code, so the `bmp_token` candidate + MD5 fold are
-NEITHER validated NOR refuted by this run. `password.login` was NOT attempted
-(zero lockout-sensitive calls consumed); 2FA was NOT reached.
+**The live sign oracle remains UNREACHABLE: with the chKey-corrected request the
+public atop gateway STILL rejected our `token.get` with `ILLEGAL_CLIENT_ID`
+("Invalid client;No access", HTTP 200, `success=false`, no `result`) — the SAME
+client-identity / provisioning rejection as the pre-chKey attempt.** Whether this
+is returned strictly BEFORE the gateway evaluates our `sign` is a **server-opaque**
+assertion we cannot prove from the capture: `ILLEGAL_CLIENT_ID` is an
+identity-layer code. The `token.get` SIGN was neither explicitly accepted nor
+explicitly rejected by a sign-error code, so the `bmp_token` candidate + MD5 fold
+are STILL NEITHER validated NOR refuted. `password.login` was NOT attempted (zero
+lockout-sensitive calls consumed across BOTH cycles); 2FA was NOT reached.
 
-> **Wave-3 update (TASK-0044):** the recovered `chKey` (native getChKey@0x16000 =
-> HMAC-SHA256(appId, packageName_"_"_certHex), STATIC — `re/chkey_static.md`) +
-> the SDK-fidelity params (`channel`, `sdkVersion`, `deviceCoreVersion`,
-> `osSystem`, `platform`, `timeZoneId`, `bizData`, `cp=gzip`) are now in the
-> live request (`live.rs`); `chKey` is signed (it is in `SIGN_WHITELIST`). The
-> NEXT-cycle single `token.get` re-attempt tests whether this corrected request
-> clears `ILLEGAL_CLIENT_ID`.
+> **Wave-3 RESULT (TASK-0044 → TASK-0042 single re-attempt):** the recovered
+> `chKey` (native getChKey@0x16000 = HMAC-SHA256(appId, packageName_"_"_certHex),
+> STATIC — `re/chkey_static.md`) + the SDK-fidelity params (`channel`,
+> `sdkVersion`, `deviceCoreVersion`, `osSystem`, `platform`, `timeZoneId`,
+> `bizData`, `cp=gzip`) were added to the live request and the corrected request
+> was sent ONCE. The captured request param-keys (`secrets/tuya_live_debug.json`)
+> confirm `chKey`, `clientId`, `time`, `sign`, and every SDK-fidelity param rode
+> the wire, and `chKey` is signed (it is in `SIGN_WHITELIST`). **chKey did NOT
+> clear `ILLEGAL_CLIENT_ID`** — so chKey/the SDK-fidelity params were not the
+> (sole) gate. Remaining live hypotheses (server-opaque): (a) a provisioning /
+> app-cert-pin / app-attestation identity gate a standalone client cannot
+> reproduce; (b) a still-wrong `chKey` (the §3a key/msg ordering is single-source)
+> or an un-modelled signed identity input. The owner decides next (provide more
+> material / authorize broader on-device capture, e.g. a Frida `getChKey` /
+> request hook on the authorized device).
 
 > **Regions/host note (TASK-0043):** the runtime `getConfig` native host-decrypt
 > hypothesis (§"Likely cause") is SUPERSEDED — the `thing_domains_v1/regions`

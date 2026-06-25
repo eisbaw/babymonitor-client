@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@reverser'
 created_date: '2026-06-25 12:46'
-updated_date: '2026-06-25 13:09'
+updated_date: '2026-06-25 13:22'
 labels:
   - phase3
   - wave3
@@ -50,4 +50,6 @@ GOTCHAS:
 - chKey is secret-by-policy (derived from appKey+cert): value only in secrets/chkey.txt (gitignored, 0600), computed from inputs in code; an operator-pinned secrets/chkey.txt overrides re-derivation.
 - SDK-fidelity params channel=sdk (mChannel default), cp=gzip (et==3); sdkVersion/deviceCoreVersion/osSystem/platform/timeZoneId/bizData are runtime/device values -> app defaults used (representative, NOT signed, so no sign impact). Only chKey is whitelisted/signed.
 - chKey NOT proven to be THE ILLEGAL_CLIENT_ID fix (server-opaque); it is a SIGNED identity param so it corrects wire+sign together. NEXT cycle single token.get decides.
+
+Cycle review: both GO. Architect INDEPENDENTLY traced register routing + UPGRADED the chKey ordering likely->CONFIRMED: chKey=lowercasehex(HMAC-SHA256(key=appId, msg=packageName_"_"_certHex)); appId=key, packageName_certHex=msg (FUN_001179f8 arg routing: x24/x23 to ipad/opad setup, x21/x20 to message update). HMAC port RFC-4231-validated; chKey in sign+wire. Confident enough to spend the single live token.get. P2 (non-blocking): doc §3a should say confirmed not likely; commit getChKey Ghidra dump for provenance; add --features live leg to e2e.
 <!-- SECTION:NOTES:END -->

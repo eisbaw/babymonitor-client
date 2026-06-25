@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@architect'
 created_date: '2026-06-25 11:40'
-updated_date: '2026-06-25 13:10'
+updated_date: '2026-06-25 13:28'
 labels:
   - phase3
   - wave3
@@ -48,4 +48,8 @@ GUARDRAILS: password.login AT MOST ONCE; no retry-spam; READ-only; all values to
 
 <!-- SECTION:NOTES:BEGIN -->
 FEED-FORWARD (TASK-0044): chKey + SDK-fidelity params are now IN the live request, ready for the single token.get re-attempt. chKey = HMAC-SHA256(appId, packageName_"_"_certSha256Hex) recovered STATIC from native getChKey@0x16000 (re/chkey_static.md); computed in live.rs::load_config from appKey+manifest-package+offline-cert-hash, persisted to secrets/chkey.txt (gitignored). It is added to the atop envelope BEFORE signing (chKey is in SIGN_WHITELIST), so it rides the wire query AND enters the canonical sign. Also added the SDK-fidelity wire params the real initUrlParams sends: channel=sdk, sdkVersion, deviceCoreVersion, osSystem, platform, timeZoneId, bizData, cp=gzip (these are NOT signed; app defaults used for device-ish values). This was the likely ILLEGAL_CLIENT_ID cause (chKey was previously omitted from BOTH wire+sign). NEXT-cycle action: spend exactly ONE token.get with the corrected request; if ILLEGAL_CLIENT_ID clears, the bmp_token+MD5-fold sign oracle finally becomes reachable. NB the chKey key/message ordering is likely (not confirmed) — a token.get rejection could also be a wrong chKey ordering, not only a wrong sign.
+
+RESUMING the single live token.get with the CORRECTED request: host a1.tuyaeu.com (TASK-0043, refuted as the issue), clientId/time wire params (already correct), chKey HMAC-SHA256 confirmed-ordering in wire+sign (TASK-0044), SDK-fidelity params, bmp_token candidate, most-likely MD5 fold. This is THE validation attempt.
+
+SINGLE LIVE token.get RE-ATTEMPT (chKey-corrected request) — OUTCOME: still ILLEGAL_CLIENT_ID. The one corrected token.get was sent ONCE against a1.tuyaeu.com; the wire carried chKey+clientId+time+sign + all SDK-fidelity params (verified via captured request_param_keys in secrets/tuya_live_debug.json). Server: HTTP 200, success=false, errorCode=ILLEGAL_CLIENT_ID, errorMsg='Invalid client;No access', no result. Classified as non-sign Server error -> STOPPED before password.login per guardrail (zero lockout-sensitive calls; no retry; no host/fold sweep; 2FA not reached). chKey did NOT clear ILLEGAL_CLIENT_ID, so chKey/SDK-fidelity were not the (sole) gate; the bmp_token candidate + MD5 fold remain NEITHER validated NOR refuted (sign oracle still unreachable). Remaining server-opaque hypotheses: (a) provisioning/app-cert-pin/app-attestation identity gate a standalone client cannot reproduce; (b) a still-wrong chKey ordering (single-source) or an un-modelled signed identity input. Owner decides next (more material / authorized on-device Frida getChKey+request capture). Leak-hardening this cycle: routed probe_host's reqwest error through scrub_url_secrets so EVERY reqwest-error path is URL-redacted; ran with RUST_LOG unset (no reqwest/hyper debug). Captured to secrets/ only: tuya_live_debug.json (gitignored). Docs: re/live_login.md outcome updated (no values); re/chkey_static.md §3a strengthened (register re-trace) but kept 'likely' (one binary artifact, two views = one source per evidence rubric). Gates: e2e GREEN (live gated out), check-evidence GREEN, secret-scan GREEN.
 <!-- SECTION:NOTES:END -->

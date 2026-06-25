@@ -142,17 +142,32 @@ This CONTRASTS with the request `sign`, which is plain MD5 (`re/tuya_sign_static
 
 ### 3a. Key vs message ordering (confidence: likely)
 
-`likely` — a single native source (the call-site arg order); only a live
-server-accepted request or a captured device chKey would make it `confirmed`.
-Source: the native call-site argument order in `libthing_security.so@0x16000`
-(getChKey) into `FUN_001179f8` (`libthing_security.so@0x179f8`).
+`likely` — grounded by ONE native artifact (read two ways, which the evidence
+rubric correctly collapses to a single source): only a live server-accepted
+request or a captured device chKey would promote it to `confirmed`. The decompiler
+arg-order AND an independent arm64 register re-trace of the SAME binary agree
+(`x24`/`x23` carry the appId into the HMAC ipad/opad key-setup, `x21`/`x20` carry
+the `packageName_"_"_certHex` string into the message `update`) — which raises
+internal confidence, but two views of one `libthing_security.so` are still ONE
+source, so the label stays `likely`. The single live `token.get` that COULD have
+promoted it instead returned `ILLEGAL_CLIENT_ID` (see the NB below), so no live
+promotion is available. Source: the native call-site argument order in
+`libthing_security.so@0x16000` (getChKey) into `FUN_001179f8`
+(`libthing_security.so@0x179f8`).
 
 In `getChKey`, `FUN_001179f8(ctx, appIdPtr, appIdLen, keyStr, keyLen, out)` passes
 the **appId** as `param_2/param_3` → consumed FIRST by the HMAC key-setup
-(`FUN_00117780(&ctx, param_2, param_3)`) → so **appId is the HMAC KEY**. The
-built `packageName_"_"_certHex` string is `param_4/param_5` → consumed by the
-inner `update` → so it is the HMAC **MESSAGE**. The Rust port + a dedicated unit
-test (`ch_key_key_message_order_is_load_bearing`) pin this ordering.
+(`FUN_00117780(&ctx, param_2, param_3)`, regs `x24`/`x23`) → so **appId is the
+HMAC KEY**. The built `packageName_"_"_certHex` string is `param_4/param_5` (regs
+`x21`/`x20`) → consumed by the inner `update` → so it is the HMAC **MESSAGE**. The
+Rust port + a dedicated unit test (`ch_key_key_message_order_is_load_bearing`) pin
+this ordering.
+
+> NB — even with the ordering correct, chKey is NOT THE `ILLEGAL_CLIENT_ID` fix:
+> the single live `token.get` re-attempt with chKey present STILL returned
+> `ILLEGAL_CLIENT_ID` (`re/live_login.md`). A correctly-ordered chKey did not clear
+> the gate, so the ordering's correctness and chKey's role in the gate are two
+> independent open questions — neither resolved by this run.
 
 ## 4. Rust port + wiring (confidence: likely)
 
@@ -188,9 +203,11 @@ cert-hash ingredient).
 
 - The HMAC primitive, the `_` separator, and the package-name + cert-hash message
   parts are `confirmed` (byte-level Ghidra + the RFC 4231 differential). The
-  key/message ORDERING (§3a) is `likely` — read from the call-site arg order on a
-  single native source; only a server-accepted request or a captured device chKey
-  promotes it. The other `likely` risk is whether the cert-SHA-256 our offline
+  key/message ORDERING (§3a) is `likely` — grounded by ONE binary artifact read
+  two ways (Ghidra arg order + an arm64 register re-trace, which agree but are not
+  two independent sources); the live `token.get` that could have promoted it
+  returned `ILLEGAL_CLIENT_ID` instead. The other `likely` risk is whether the
+  cert-SHA-256 our offline
   extractor lifts byte-for-byte matches the device's `signatures[0]` — that is the
   SAME ingredient the request `sign` depends on, cross-checked against `openssl`
   in `sign.rs` (the `real_app_cert_matches_openssl_reference` ignored test).

@@ -1001,10 +1001,17 @@ fn probe_host(host: &str) -> Result<(), LiveError> {
         .map_err(|e| LiveError::Network(format!("build probe client: {e}")))?;
     // A bare GET to the host root with no signed params is not an account call;
     // any HTTP response (even 4xx) proves reachability + TLS.
+    //
+    // SECRET-LEAK HARDENING (TASK-0042): although this probe URL carries NO signed
+    // query (no clientId/sign/chKey), we STILL route the error through
+    // `scrub_url_secrets` so EVERY reqwest-error path in this module is uniformly
+    // URL-redacted — a defence-in-depth invariant (no error path may ever embed a
+    // request URL), not a per-call judgement that this one is safe.
     match client.get(format!("https://{host}/")).send() {
         Ok(_) => Ok(()),
         Err(e) => Err(LiveError::Network(format!(
-            "host {host} not reachable: {e}"
+            "host {host} not reachable: {}",
+            scrub_url_secrets(&e)
         ))),
     }
 }

@@ -1,10 +1,10 @@
 ---
 id: TASK-0036
 title: 'Wave-2 DEEP RE-PLAN: run phase2-backlog-snowball for Wave-2 in a fresh session'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-25 07:14'
-updated_date: '2026-06-25 08:38'
+updated_date: '2026-06-25 17:42'
 labels:
   - phase-gate
   - replan
@@ -30,4 +30,6 @@ Terminal re-plan for Wave-1 (snowball discipline). Wave-1 (static RE) is COMPLET
 FEED-FORWARD from TASK-0008 (pairing flow mapped): A Rust PAIRING module is LOW PRIORITY for Wave-2. The user's camera is ALREADY PAIRED -> pairing is NOT on the critical path: an already-bound device appears in HomeBean.deviceList as a normal DeviceBean (carrying localKey/p2pId for the stream) and the device-list + CameraInfoBean fetch require only the login sid — NO pairing token, NO SmartLink. The critical path is the SAME auth+device-list spine the stream already depends on (TASK-0032 bmp_token + TASK-0035 auth decision + TASK-0012/0013). 
 
 IF a future 'add a new camera' feature is wanted, the pairing protocol is mapped to implementable depth in re/pairing_flow.md (EZ packet-length scheme Ghidra-confirmed under re/ghidra/smartlink_*.c; AP {ssid,passwd,token,ccode}; QR {p,s,t}; token thing.m.device.token.create v2.0; bind-confirm poll thing.m.device.list.token v5.0). Only a few constants are live-gated (exact AP UDP port ~6669, on-wire action spelling, poll cadence). Recommendation: do NOT schedule a pairing crate in Wave-2 unless 'pair a new device' becomes an explicit goal; it adds UDP-broadcast/multicast-socket + soft-AP-join complexity for zero benefit to the already-paired view path.
+
+Moot under the OWNER STOP decision (2026-06-25): no Wave-2 deep re-plan; the project ships the static RE writeup + token-injectable client. Re-open only if the owner revisits the one-capture unblock.
 <!-- SECTION:NOTES:END -->

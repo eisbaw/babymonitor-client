@@ -3,9 +3,10 @@ id: TASK-0035
 title: >-
   Wave-2 DECISION: unblock auth — runtime SDK-config byte[] OR one live sign
   vector (relaxes static-only)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-25 07:14'
+updated_date: '2026-06-25 17:42'
 labels:
   - phase3
   - wave2
@@ -27,3 +28,9 @@ REVIEWER-CONFIRMED TERMINAL FINDING (TASK-0033): the bmp_token decode keys off a
 <!-- AC:BEGIN -->
 - [ ] #1 User decides (a)/(b)/(c); if (a) or (b), capture the artifact to secrets/ and wire it through the BmpTokenProvider; the differential then validates the signer
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+OWNER DECISION (2026-06-25): STOP static, SHIP the RE writeup. On-device capture / any dynamic unblock NOT authorized. Static cloud-login is airtight-exhausted (TASK-0046/0048/0050/0051): appKey confirmed-real, reject proven SIGN-INSENSITIVE (identity-layer), all gateways + last wire fields matched -> server-side appKey<->app binding a static client cannot satisfy. Closing as decided; the one-capture unblock path remains documented (TASK-0022) if ever revisited.
+<!-- SECTION:NOTES:END -->

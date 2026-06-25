@@ -5,12 +5,20 @@ Avent "Baby Monitor+", hardware **SCD921 / SCD923**) deeply enough to reimplemen
 software second-screen client in Rust — focused on the two hardest parts: the **live
 video/audio stream** and the **account/device authentication**.
 
-**Status:** the pure-static reverse engineering is **complete**; the protocol is
-mapped end-to-end and a tested Rust client is built against it. **Actually viewing
-the baby is blocked on a single live capture that this project deliberately excludes**
-(static analysis only) — see [the blocker](#3-the-honest-blocker-the-runtime-bmp_token-confirmed-in-ghidra)
-below. The Rust client therefore **cannot log in or stream today** and says so
-honestly everywhere — it never fabricates a session or a frame.
+**Status:** the pure-static reverse engineering is **complete and exhausted**; the
+protocol is mapped end-to-end and a tested Rust client is built against it. The wall
+is **not** a missing piece of static analysis — it is a **server-side identity gate**:
+the Tuya cloud rejects a from-scratch client's login at the **client-identity layer,
+before it ever evaluates our request signature** (proven by a controlled
+corrupted-sign differential, TASK-0050). This binds the provisioned `appKey` to the
+genuine packaged app in a way a standalone static client cannot reproduce — see
+[the blocker](#3-the-real-blocker-a-server-side-appkeyapp-binding-proven-sign-insensitive)
+below. **Actually viewing the baby is therefore blocked** (not just login): the video
+path is cloud-brokered and needs an authenticated session. The Rust client is
+**token-injectable but cannot log in or stream on its own today**, and says so
+honestly everywhere — it never fabricates a session or a frame. **One on-device
+capture** (excluded here by the static-only constraint) unblocks the whole chain — see
+[§6](#6-the-single-unblock-one-on-device-capture).
 
 ## Scope / authorized use
 
@@ -92,38 +100,104 @@ recovered to byte level: the MD5 IV constants, the 16-byte digest width, and the
 separator are all confirmed in `libthing_security.so`. **Five of the six ingredients
 are statically recovered:** the canonical string-to-sign construction, the `_`-join,
 the MD5 primitive, the appKey/appSecret (in the DEX → `secrets/`), and the app-cert
-SHA-256 (computable **offline** from the APK signing cert — no device). See
-`re/tuya_sign_static.md` and `re/review_gate_findings.md` (F1). Cloud-auth envelope,
-login flow, and device/camera bean shapes are in `re/tuya_cloud_auth.md`; first-time
-pairing in `re/pairing_flow.md` (and the decisive note: an **already-paired** camera
-needs no pairing — only login + device-list + camera-config).
+SHA-256 (computable **offline** from the APK signing cert — no device). The sixth,
+`bmp_token`, remains an **un-validated static candidate** — see the note below; it is
+**not** what blocks login. See `re/tuya_sign_static.md` and
+`re/review_gate_findings.md` (F1). The recovered identity tuple is also confirmed:
+the `appKey` is the **real Philips-provisioned key** (R8-inlined into the production
+`SmartApplication.e()` init path; the `com.thingclips.sample` module is Philips' own
+app module — its `BuildConfig` carries `APPLICATION_ID=com.philips.ph.babymonitorplus`
+— so it is not a Tuya demo key; TASK-0046, `re/identity_enumeration.md`), and the
+on-wire identity fields are `ttid = sdk_international@<appKey>` and `channel = oem`
+(the `sdk_<channel>@<appKey>` rewrite reaches the `ttid` slot via the production
+`CHANNEL_OEM` init overload; `re/tuya_cloud_auth.md` §1b, `re/identity_enumeration.md`
+§2a). Cloud-auth envelope, login flow, and device/camera bean shapes are in
+`re/tuya_cloud_auth.md`; first-time pairing in `re/pairing_flow.md` (and the decisive
+note: an **already-paired** camera needs no pairing — only login + device-list +
+camera-config).
 
-## 3. The honest blocker: the runtime `bmp_token` (confirmed in Ghidra)
+> **On the `bmp_token` (the sixth sign ingredient):** it is decoded from
+> `assets/t_s.bmp` by an imath-bignum + Vandermonde-matrix routine
+> (`libthing_security_algorithm.so`) that has been **ported byte-exact**, but the
+> decode also keys off a **runtime JNI SDK-config `byte[]`** (not a static asset), so
+> the production token is not computable under static analysis alone
+> (`re/bmp_token_whitebox.md` §9). **This does not block login.** The TASK-0050
+> corrupted-sign differential (§3) proved the gateway rejects **before** it evaluates
+> the signature at all — so even a perfect `bmp_token` would still hit
+> `ILLEGAL_CLIENT_ID`. The token stays an honest, un-validated candidate the signer
+> carries in an injectable slot; it would only become testable once the identity gate
+> is cleared.
 
-The **sixth ingredient — `bmp_token`** — is the one that does **not** yield to pure
-static analysis.
+## 3. The real blocker: a server-side appKey↔app binding (proven sign-insensitive)
 
-`bmp_token` is decoded from the embedded `assets/t_s.bmp` by an **imath-bignum +
-Vandermonde-matrix** routine in `libthing_security_algorithm.so`. The matrix algorithm
-**has been ported byte-exact** (Ghidra-primary, radare2-confirmed, with unit tests).
-**But** the Ghidra decompilation revealed that the decode also keys off a `config`
-input that is a **runtime JNI `byte[]` SDK-config blob** (`doCommandNative`'s
-`param_6`, read via `GetByteArrayElements`) — **not a static asset**. That config
-selects the pixel offset and the header-validity branch, and for arbitrary/static
-config strings the validator rejects. So the **production token is not computable under
-static analysis alone**. See `re/bmp_token_whitebox.md` §9 (the Ghidra port + the
-runtime-config finding) and `re/tuya_sign_static.md`.
+The wall is **not** a missing static ingredient. It is a **server-side identity /
+provisioning gate**: the Tuya atop gateway rejects a from-scratch client's
+`token.get` with `ILLEGAL_CLIENT_ID` ("Invalid client;No access") at the
+**client-identity layer, before it ever evaluates our signature**. A standalone
+static client cannot clear it from the recovered material alone. This is the
+reviewer-confirmed central constraint of the project, and it is now **proven**, not
+assumed. The proof chain (all in `re/live_login.md` unless noted):
 
-**What ONE live artifact would unblock it** (both excluded here by the static-only
-constraint):
+1. **The appKey is the real provisioned identity, not a wrong/demo key**
+   (TASK-0046, `re/identity_enumeration.md`). R8 **inlined** the exact appKey literal
+   into the production launcher's SDK-init (`SmartApplication.e()`), and
+   `com.thingclips.sample` is Philips' **own** app module
+   (`BuildConfig.APPLICATION_ID = com.philips.ph.babymonitorplus`). There is no
+   encrypted or alternate appKey anywhere in the DEX or native libs. So
+   `ILLEGAL_CLIENT_ID` is **not** a mis-extracted-key problem.
 
-1. a **single accepted live sign vector** (pins the token in one place, end-to-end), or
-2. a **one-time runtime-config dump** (the `byte[]` SDK-config that `doCommandNative`
-   is called with).
+2. **The reject is sign-INSENSITIVE — it precedes signature verification**
+   (TASK-0050, the decisive differential). The fully-signed `token.get` was sent
+   twice to the **same** host, byte-identical **except** the `sign` value, which the
+   second probe corrupted by flipping exactly one hex nibble (still well-formed
+   32-char lowercase hex, so the gateway parses it and would reach sign-verification).
+   The two responses were **byte-for-byte identical** `ILLEGAL_CLIENT_ID`. A wrong
+   signature changes **nothing** ⇒ the gateway rejects on **client identity before it
+   reads the sign**. This is a controlled A/B differential (the corrupted variant is
+   the negative control), so the verdict is `confirmed`, not a single opaque capture.
+   **Corollary:** this also proves the `bmp_token`/MD5-fold is **not** the blocker —
+   re-attacking the token decode would not move `ILLEGAL_CLIENT_ID`.
 
-Either closes the gap. No static oracle exists in the binary (there is no embedded test
-vector), so a self-derived token is unverifiable — this is the central, reviewer-confirmed
-constraint of the whole project.
+3. **Every datacenter gateway rejects, including the newer iotbing cloud**
+   (TASK-0048, `re/regions_decrypt.md`). The EU regionConfig was decrypted offline
+   (pure-Java AES-256-CTR) and its full **24-field** host list enumerated — correcting
+   an earlier 2-of-22 false-exhaustion. The legacy `a1.tuyaeu/us.com` gateways **and**
+   the iotbing `apigw-eu.iotbing.com` / `a1-us.iotbing.com` gateways all return the
+   same `ILLEGAL_CLIENT_ID`. So it is **not** a wrong-datacenter-host problem.
+
+4. **Every statically-derivable wire field was matched, and it still rejects**
+   (TASK-0051). The last wire differences were closed — corrected
+   `ttid = sdk_international@<appKey>`, `channel = oem`, `appRnVersion`, the
+   `x-client-trace-id` request header, and the body `deviceId` — and the gateway
+   returned the **identical** `ILLEGAL_CLIENT_ID`. Separately, there is **no**
+   `SafetyNet | Play Integrity | attest` attestation code anywhere in the app
+   (a whole-tree grep is empty; the captcha/`verifyToken` machinery is a different
+   service that gates code-sending, not `token.get` — `re/tuya_cloud_auth.md` §8).
+
+**Conclusion (confirmed):** `ILLEGAL_CLIENT_ID` is a **server-side appKey↔app
+binding** — a provisioning / package / app-cert / attestation check enforced at the
+identity layer — that a from-scratch static client cannot reproduce. The static
+cloud-login avenue is **airtight-exhausted**: every reachable host, header, identity
+field, and the signature itself have been matched to the app, and the gateway still
+refuses the client. There is no further static field to add. Unblocking now requires
+**one piece of on-device evidence** (§6), not more static analysis.
+
+### What this blocks: the whole goal, not just login
+
+This is **not** "you cannot log in but could still stream." There is **no working
+video under static-only**:
+
+- The video transport is **cloud-brokered WebRTC-over-MQTT**: the 302 signaling
+  envelope rides Tuya's MQTT brokers (`User.domain.mobile*MqttUrl`,
+  `re/tuya_cloud_auth.md` §4), and connecting to those brokers needs the
+  **authenticated session** (`sid`) that the blocked login issues. No session ⇒ no
+  MQTT signaling ⇒ no WebRTC offer/answer ⇒ no frames.
+- The **LAN path (Tuya local protocol, TCP port 6668) is datapoint-only** — it
+  carries device datapoints (DPs), **not** an A/V media stream. It is not an
+  alternative way to view the camera.
+
+So clearing the identity gate is a hard prerequisite for the project's actual goal
+(seeing the baby), not merely for a green `auth status`.
 
 ## 4. What the Rust client does — and does not do
 
@@ -138,18 +212,21 @@ constraint of the whole project.
 - `babymonitor-cli` — a CLI viewer with `auth` and `devices` subcommands, human + `--json`
   output, and secret/PII fields redacted by default.
 
-It is **complete and token-injectable but CANNOT yet log in or stream**: the signer is
-token-pending (see §3), so `auth login` and any live fetch **honestly report the
-token-pending state** rather than fabricate a session. The live end-to-end test exists
-but is `#[ignore]`d and asserts the honest pending state today.
+It is **complete and token-injectable but CANNOT log in on its own** (the server-side
+identity gate, §3) and so cannot stream unattended today. `auth login` and any live
+fetch **honestly report that login is not available** rather than fabricate a session.
+The live end-to-end test exists but is `#[ignore]`d and asserts the honest pending
+state today. The session-token slot is **injectable**: given one captured live `sid`
+(§6), the same code path runs the rest of the chain for real.
 
 Build and run (from the repo root, inside the nix shell):
 
 ```sh
 nix-shell --run 'just build'                      # compile the workspace
 nix-shell --run 'just e2e'                         # build + test + clippy -D + fmt-check + stub-grep + offline checks
-nix-shell --run 'just run auth login'           # shows the honest token-pending state
-nix-shell --run 'just run devices list'         # works against a synthetic fixture
+nix-shell --run 'just run -- auth login'        # shows the honest "cannot log in" state
+nix-shell --run 'just run -- auth status'       # reads/clears the on-disk session store (offline)
+nix-shell --run 'just run -- devices list'      # works against a synthetic fixture
 nix-shell --run 'just showcase'                    # run every read-only CLI command (regression tripwire)
 ```
 
@@ -179,6 +256,59 @@ Tooling:
 > the per-claim evidence, confidence levels, and honest limitations. (The `re/*.md`
 > docs note that jadx line hints are approximate and drift between runs; the cited
 > **symbol** is authoritative.)
+
+## 6. The single unblock: one on-device capture
+
+The identity gate (§3) is upstream of everything the static analysis recovered, so
+exactly **one** piece of on-device evidence converts the tested client from
+"token-injectable" to "logs in and streams." This is tracked as **TASK-0022** and is
+deliberately **out of scope** for this static-only project — it is documented here so a
+follow-up with a rooted/owned device can finish the chain.
+
+**What one capture yields.** A single Frida hook or mitmproxy capture of the **genuine
+app** making one authenticated request on the owner's own device gives both halves the
+static client cannot synthesize:
+
+1. **The identity element** the gateway binds the `appKey` to — i.e. exactly what makes
+   the genuine app's `token.get` pass `ILLEGAL_CLIENT_ID` (the provisioning header /
+   app-attestation value / cert-pinned channel param). This is what §3 proves is
+   missing and unreproducible statically.
+2. **A live session token** — the `sid` (plus `uid` and the resolved
+   `User.domain.mobileApiUrl`) issued by a real login. The `sid` is the bearer for
+   every subsequent atop call **and** for the MQTT broker connection that carries the
+   WebRTC 302 signaling.
+
+Either alone is useful; a captured `sid` is enough to drive the **read path**
+(device-list → camera-config → MQTT signaling) without solving the login identity gate
+at all, because the client's session slot is injectable.
+
+**How to use a captured `sid` with the client.** The client persists a session as JSON
+(`sid`, `uid`, `mobile_api_base`, `expires_at`) in the on-disk **session store** — the
+same file `auth status` reads. To validate the full chain end-to-end:
+
+1. Find the store path:
+   `nix-shell --run 'just run -- auth status'` prints `store: <path>` (the
+   `SessionStore::default_path()` location under your data dir).
+2. Write the captured session into that file as the `Session` JSON shape
+   (`babymonitor-core` `session::Session`: `sid` / `uid` / `mobile_api_base` =
+   `User.domain.mobileApiUrl` / `expires_at`). Treat `sid`/`uid` as **secrets** — they
+   are account-linked PII; keep them in `secrets/` and never commit them. (A small
+   `session::SessionStore::save` helper is the library entry point; there is no
+   plaintext-`sid` CLI flag by design, to avoid `sid` landing in shell history.)
+3. Confirm it is loaded: `nix-shell --run 'just run -- auth status'` now reports a
+   stored session (with `sid`/`uid` redacted) and its `mobile_api_base`.
+4. Exercise the chain against the real account using the gated live build
+   (`--features live`, single-shot, rate-limited): the `auth live-login` /
+   device-fetch paths in `babymonitor-cli/src/live.rs` carry the injected `sid` on the
+   atop envelope, so login → `device.list` → per-camera `p2pType` → the MQTT **302**
+   signaling → WebRTC can run for real. The `#[ignore]`d live gold-oracle test
+   (`babymonitor-cli/tests/live_e2e.rs`) is the assertion harness for this run; it
+   checks **shape only** (a camera is found, transport is WebRTC) and never prints a
+   `sid`/`uid`/device id.
+
+This is the honest seam: the static work is complete up to the server-side identity
+binding, and a single owned-device capture closes it — no further reverse engineering
+required, only evidence this project chose not to collect.
 
 ## License
 

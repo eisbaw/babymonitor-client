@@ -3,10 +3,10 @@ id: TASK-0049
 title: >-
   DECISION (gated): cloud-login blocker — only after the corrupted-sign
   differential rules sign-failure out
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-25 15:01'
-updated_date: '2026-06-25 15:18'
+updated_date: '2026-06-25 17:42'
 labels:
   - auth
   - identity
@@ -34,4 +34,6 @@ GATED — do not action until TASK-0050 (corrupted-sign differential) completes.
 
 <!-- SECTION:NOTES:BEGIN -->
 UNBLOCKED by TASK-0050 (2026-06-25): the corrupted-sign differential ran against a1.tuyaeu.com — candidate sign and a one-nibble-corrupted sign BOTH returned byte-identical ILLEGAL_CLIENT_ID (HTTP 200, "Invalid client;No access"). The reject is therefore SIGN-INSENSITIVE: the gateway rejects on client identity BEFORE evaluating the sign. This is the controlled second source AC#3 asked for (the corrupted variant is the negative control), promoting the identity/provisioning-gate claim likely->confirmed (re/live_login.md). The "wrong sign" alternative is ruled OUT for this error. TASK-0050 Stage B also confirmed (re/tuya_cloud_auth.md §8) that captcha/verifyToken is a separate code-send service, NOT an atop token.get header — so there is no statically-missing request decoration either. Owner decision (on-device capture vs LAN-pairing pivot) is now live; the static client cannot clear this gate from recovered material alone.
+
+OWNER DECISION (2026-06-25): STOP static, SHIP the RE writeup. On-device capture / any dynamic unblock NOT authorized. Static cloud-login is airtight-exhausted (TASK-0046/0048/0050/0051): appKey confirmed-real, reject proven SIGN-INSENSITIVE (identity-layer), all gateways + last wire fields matched -> server-side appKey<->app binding a static client cannot satisfy. Closing as decided; the one-capture unblock path remains documented (TASK-0022) if ever revisited.
 <!-- SECTION:NOTES:END -->

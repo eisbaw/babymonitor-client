@@ -3,9 +3,10 @@ id: TASK-0045
 title: >-
   OWNER-DECISION: on-device capture of the app's real token.get (confirm
   appKey/ttid; resolve ILLEGAL_CLIENT_ID) — broader than cloud-login auth
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-25 13:36'
+updated_date: '2026-06-25 17:42'
 labels:
   - wave3
   - auth
@@ -27,3 +28,9 @@ BLOCKED ON OWNER DECISION. After matching every STATIC request element (host, cl
 <!-- AC:BEGIN -->
 - [ ] #1 Owner decides: authorize the on-device capture (then a follow-up cycle diffs the app real request vs ours + fixes/refutes the appKey/ttid), OR accept the provisioning hard-wall endpoint
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+OWNER DECISION (2026-06-25): STOP static, SHIP the RE writeup. On-device capture / any dynamic unblock NOT authorized. Static cloud-login is airtight-exhausted (TASK-0046/0048/0050/0051): appKey confirmed-real, reject proven SIGN-INSENSITIVE (identity-layer), all gateways + last wire fields matched -> server-side appKey<->app binding a static client cannot satisfy. Closing as decided; the one-capture unblock path remains documented (TASK-0022) if ever revisited.
+<!-- SECTION:NOTES:END -->

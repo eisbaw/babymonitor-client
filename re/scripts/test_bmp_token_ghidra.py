@@ -204,9 +204,13 @@ class TestSelectorAndRuntimeGate(unittest.TestCase):
         decodes to a key WITHOUT raising -- proving the full op1->matrix pipeline
         is wired and runnable (the machinery is correct; only the real runtime
         config blob is missing for the production token)."""
-        # We construct pixels so that for cfg=b"A", base lands somewhere we control.
-        # Simpler: directly exercise the op1 reader + solver via a hand-built layout.
-        # Build a pixel array, pick a config, compute base, then PLANT the bytes.
+        # We construct pixels so that for cfg, base lands somewhere we control.
+        # The planted layout mirrors the BYTE-EXACT op1 walk (FUN_00105138):
+        #   start offset = (xorstep_u32(px, base+3) ^ r) % L   (base+3, not base+1 —
+        #   the slot [x29,-0x34] is pre-incremented 3x; see bmp_token_ghidra._decode),
+        #   and the per-pair XOR-step XORs against the pair-START offset.
+        # This test therefore PINS the corrected walk (it would fail on the old buggy
+        # base+1 / ^after_b walk — that is the point: the byte-exact fix must hold).
         L = 0x3000
         px = bytearray(L)
         cfg = b"seed"
@@ -216,8 +220,19 @@ class TestSelectorAndRuntimeGate(unittest.TestCase):
         px[base] = 1            # selector = op1
         px[(base + 1) % L] = 1  # num_keys = 1
         px[(base + 2) % L] = 1  # num_coeffs = 1  -> 1x1 system, trivially solvable
-        # start offset
-        off = (g.xorstep_u32(px, (base + 1) % L) ^ r) % L
+        # The byte-exact start offset is (xorstep_u32(px, base+3) ^ r) % L, where
+        # xorstep packs px[base+3..base+6] big-endian. Plant those 4 header bytes so
+        # the start offset lands at a chosen location DISJOINT from base (avoids the
+        # old test's fragile self-overlap). We want off == TARGET, so we need
+        # xorstep == (TARGET ^ r) as a u32; pick TARGET then solve the 4 bytes.
+        target = (base + 0x400) % L                 # 1KB past base -> no overlap
+        magic = (target ^ r) & 0xFFFFFFFF           # xorstep must produce this u32
+        px[(base + 3) % L] = (magic >> 24) & 0xFF
+        px[(base + 4) % L] = (magic >> 16) & 0xFF
+        px[(base + 5) % L] = (magic >> 8) & 0xFF
+        px[(base + 6) % L] = magic & 0xFF
+        off = (g.xorstep_u32(px, (base + 3) % L) ^ r) % L
+        assert off == target, (off, target)
         # plant a=01 (len1, byte 0x02), b=01 (len1, byte 0x05): 1x1 system [a^0|b]=[1|b]
         # row = [a^0 | b] = [1 | b] -> solves c = b/1 = b -> key = bytes([b])
         px[off % L] = 1                # alen
@@ -229,6 +244,57 @@ class TestSelectorAndRuntimeGate(unittest.TestCase):
         keys = g.read_keys_from_content(cfg, raw)
         self.assertEqual(len(keys), 1)
         self.assertEqual(keys[0], "05")  # hex of the recovered constant byte
+
+
+class TestRealInputsIntegralOracle(unittest.TestCase):
+    """The STATIC SELF-ORACLE (TASK-0032): the native matrix solve REQUIRES the
+    Vandermonde denominator == 1 (else error 0xb). So a byte-exact op1 offset-walk
+    MUST produce an integral solve when fed the REAL inputs (config = appKey,
+    input = the real t_s.bmp). This test asserts that necessary condition WITHOUT
+    revealing the token value (no value is printed or asserted — only structural
+    facts: integral solve succeeds, shape is num_keys=1 / num_coeffs=4 / 32-byte
+    key). It is gated on secrets/tuya_appkey.json (gitignored): SKIPPED in a clean
+    checkout, but it bites locally where the appKey is present.
+
+    HONESTY: integral-solve is NECESSARY, not SUFFICIENT — a wrong walk could in
+    principle solve integral to a wrong token. The recovered value is therefore a
+    CANDIDATE (integral-solve-consistent), to be live-login-validated next."""
+
+    def _appkey(self):
+        secret = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "secrets", "tuya_appkey.json",
+        )
+        if not (os.path.exists(secret) and os.path.exists(T_S)):
+            self.skipTest("secrets/tuya_appkey.json or t_s.bmp absent")
+        import json
+        with open(secret) as fh:
+            return json.load(fh)["appKey"].encode()
+
+    def test_real_appkey_yields_op1_header(self):
+        cfg = self._appkey()
+        with open(T_S, "rb") as fh:
+            raw = fh.read()
+        v = g.header_check_and_view(raw)
+        px = g.pixels(v)
+        L = v.pixel_len
+        r = (g.strhash(cfg) % L) // 2
+        base = r % L
+        self.assertEqual(px[base % L], 1, "selector should be op1 for the real appKey")
+        self.assertEqual(px[(base + 1) % L], 1, "num_keys should be 1")
+        self.assertEqual(px[(base + 2) % L], 4, "num_coeffs should be 4")
+
+    def test_real_appkey_solves_integral(self):
+        """The oracle: byte-exact op1 walk + real inputs => integral Vandermonde
+        solve (no DecodeError). Asserts shape only, never the value."""
+        cfg = self._appkey()
+        with open(T_S, "rb") as fh:
+            raw = fh.read()
+        keys = g.read_keys_from_content(cfg, raw)  # raises if non-integral (0xb)
+        self.assertEqual(len(keys), 1)
+        # 4-row Vandermonde with 32-byte b-values => a 32-byte (64-hex) key.
+        self.assertEqual(len(keys[0]), 64)
+        # do NOT assert/print the value (it is the bmp_token candidate; secrets only)
 
 
 if __name__ == "__main__":

@@ -24,9 +24,14 @@ source lines live ONLY in `secrets/tuya_appkey.json` (gitignored). This doc reco
 > **radare2** dive (TASK-0023; the `t_s.bmp` matrix port was later done in
 > **Ghidra** under TASK-0033) recovered the signer. **CORRECTED (TASK-0033, see
 > `re/bmp_token_whitebox.md` §9):** the "only the `t_s.bmp` token-decode port
-> remains" residual is stale — the matrix IS ported; the real residual is the
-> **runtime SDK-config `byte[]`** (`doCommandNative param_6`), so the BMP token is
-> **NOT static-only achievable** and the signer is not fully statically recoverable.
+> remains" residual is stale — the matrix IS ported; the real residual was the
+> **runtime SDK-config `byte[]`** (`doCommandNative param_6`).
+> **FURTHER REFINED (TASK-0041, `re/bmp_token_provenance.md`):** that runtime
+> `config` byte[] is `ThingSmartNetWork.mAppId.getBytes()` = the **static appKey**
+> (in `secrets/tuya_appkey.json`), so the decode IS static-only after all. With the
+> byte-exact op1 walk fixed (TASK-0032, `re/scripts/bmp_token_ghidra.py`), the real
+> appKey + `t_s.bmp` now solve INTEGRAL (the native denom==1 self-oracle) → a
+> CANDIDATE bmp_token in `secrets/` (live-login-validated next).
 > Concretely the static dive proved the keyed
 > hash is **plain MD5** (not HMAC-SHA256; MD5 IV constants in
 > `libthing_security.so@0x76c0`) and the app-cert SHA-256 is **computable offline**

@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@architect'
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 05:21'
+updated_date: '2026-06-25 11:29'
 labels:
   - phase7
   - test
@@ -54,29 +54,7 @@ PART B CLI + harness:
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-FEED-FORWARD from TASK-0013 (device models + accessor, babymonitor-core::device) — the API shape the CLI 'devices list' / 'devices show' should surface:
-
-PARSE (offline, no network needed for the model layer):
-- device::parse_device_list(&[u8]) -> Result<DeviceList, Error::DeviceParse>
-- device::parse_camera_info(&[u8]) -> Result<CameraInfoBean, Error::DeviceParse>
-- DeviceList{ device_list: Vec<DeviceBean>, shared_device_list: Vec<DeviceBean> }; DeviceList::all_devices() iterates owned+shared; DeviceList::find_camera_device() -> Option<&DeviceBean> (sp/ipc family).
-
-DEVICES LIST (per DeviceBean): dev_id (REQUIRED), name, category, online() (bool, cloud||LAN), is_camera(), product_id, pv, uuid. CAMERA SHOW (CameraView::pair(&DeviceBean,&CameraInfoBean) -> Result, errors DeviceMismatch on non-camera): dev_id(), online(), transport() -> device::P2pTransport{Ppcs|ThingWebRtc|Other(i32)} (.is_webrtc()), p2p_id(), p2p_config() -> Option<&P2pConfig>.
-
-LIVE FETCH IS TOKEN-PENDING: device::list_devices(&SigningKeyMaterial,&impl BmpTokenProvider, sid, home_id) returns Err(BmpTokenPending) until TASK-0030 ports the bmp_token (same gate as TASK-0012's Signer::sign). So the CLI 'devices list' real-network path must be #[ignore]/token-pending behind that — the OFFLINE showcase path should run against the synthetic fixture (babymonitor/babymonitor-core/tests/fixtures/{device_list.json,camera_info.json}) or print a clear 'login required / signing pending (TASK-0030)' message, never panic.
-
-SECRET / PII FIELDS — MUST NOT PRINT BY DEFAULT (only behind an explicit --show-secrets/--reveal flag, and even then warn): DeviceBean.local_key, DeviceBean.sec_key, CameraInfoBean.password, CameraInfoBean.session_tid, P2pConfig.p2p_key, P2pConfig.init_str (+ session/ices/tcpRelay/udpRelay descriptors). dev_id/uuid/p2p_id are account-linked PII — safe to show in an authorized local CLI but keep OUT of --json that could be pasted into a bug report by default; the models' Debug already redacts the crypto secrets, so prefer {:?} or the accessor methods over hand-formatting raw fields. secret-scan will catch a real value leaking into any tracked file/snapshot.
-
-GOTCHAS / honest limitations (TASK-0014):
-- The client CANNOT log in: `auth login` honestly returns the token-pending state (Error::BmpTokenPending), blocked on bmp_token (TASK-0030). No fake success. Verified via showcase output.
-- Exit-code policy nuance: `auth login` token-pending exits 0 (it is a complete, honest answer to "what is my login state"); `devices list --live` token-pending exits 1 (it was asked to FETCH and could not). This asymmetry is deliberate and documented in code comments; `--live` is therefore OMITTED from `just showcase` (which requires all-zero exits) while the read-only offline commands are included.
-- `devices list/show` OFFLINE path reads a response body from `--fixture` (default: the committed synthetic fixture). No network. `--live` surfaces token-pending without touching the network (probes the PendingBmpToken signer gate first).
-- Secrets: localKey/secKey redacted by default in both human and --json; `--show-secrets` reveals (only synthetic values exist) and prints a stderr warning. device_json verified to never leak a secret with show_secrets=off (unit test).
-- Live gold-oracle test (tests/live_e2e.rs) is #[ignore]d (excluded from just e2e); run with `--ignored --test-threads=1`. Today it asserts the honest token-pending state (panics if someone makes it fake-succeed without TASK-0030). README documents the manual setup + authorized scope.
-- PART A device.rs fixes landed: P1 doc (deleted false id-mismatch clause; camera-category-only + id/dev_id equivalence is needs-live); P2 serde alias categoryCode (+2 tests); P2 ipc-literal hedged "(inferred)"; P2 .gitignore narrowed to the 2 named fixtures (verified: stray file under tests/fixtures/ is now ignore-by-default, known fixtures still tracked).
-- AC#4 (rate-limit/single-shot): no live calls this task; structure supports it (single-shot probe, no retry loop) and README/live-test mandate --test-threads=1 for the future live pass.
-
-Cycle-16 review: both GO, no P0/P1. CLI honest (no fake login; auth login surfaces BmpTokenPending; secrets redacted by default, --show-secrets gated+warns to stderr; #[ignore]d live test asserts token-pending, goes red on faked success). 4 device.rs fixes verified. P2: hand-assembled JSON braces -> consider a #[derive(Serialize)] view struct (low). Rust slice 12/13/14 complete; only the live path is token-pending (TASK-0030).
+FEED-FORWARD (TASK-0032): the bmp_token candidate is recovered offline (secrets/bmp_token.txt; integral-solve-consistent). The gated live login is now the SUFFICIENT oracle: capture ONE accepted sign + its exact str2 for a known request -> validates the op1-walk-derived bmp_token AND disambiguates the cmd=1 MD5 fold (MD5(key) vs MD5(key||str2), bmp_token_provenance.md s2.3). If the live sign matches babymonitor-core::sign with config=appKey/t_s.bmp decode, the static signer is fully pinned; if it mismatches, the op1 walk solved integral to a WRONG token (the necessary!=sufficient caveat) and needs re-derivation.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

@@ -73,16 +73,30 @@ UNCHANGED and corroborated; only the cmd-number that triggers the decode differs
 (cmd=0 setup, not cmd=1). This refines, not contradicts, F1.
 
 ------------------------------------------------------------------------------
-VALIDATION STATUS: fully-ported-unvalidated.
-There is NO embedded static oracle (no test vector / expected token in the .so).
-The matrix machinery is deterministic + device-independent and runs offline.
-HOWEVER (see re/bmp_token_whitebox.md §9 -- REFUTED static-only): the production
-token is NOT static-only -- read_keys_from_content's `config` arg is a RUNTIME JNI
-byte[] (doCommandNative param_6), which selects the pixel offset AND the
-header-validity branch. So the matrix runs offline, but emitting the REAL key list
-additionally requires the runtime SDK-config blob (or one live sign vector); the
-ONLY true oracle is a live sign-accept (EXCLUDED by scope). A wrong constant fails
-silently. Any produced value goes to secrets/ ONLY; never a tracked file.
+VALIDATION STATUS: integral-solve-consistent (candidate); live-login-validated next.
+There is NO embedded static oracle (no test vector / expected token in the .so),
+BUT the native matrix solve enforces a STATIC SELF-ORACLE: it REQUIRES the solved
+Vandermonde denominator == 1 (mp_int_compare_value(denom,1)==0, else error 0xb).
+A byte-exact op1 offset-walk must therefore produce an INTEGRAL solve on the real
+inputs. TASK-0041 established the inputs are static: config = the appKey bytes
+(secrets/tuya_appkey.json), input = the real assets/t_s.bmp. TASK-0032 then made
+the op1 walk byte-exact (two fixes below) and the real inputs now SOLVE INTEGRAL
+(num_keys=1, num_coeffs=4, alen=4, blen=32 -> a 32-byte/64-hex key). That denom==1
+gate is the necessary-condition oracle.
+
+TASK-0032 op1 byte-exact fixes (verified against the r2 disasm of FUN_00105138,
+0x5158..0x5428 -- the slot trace is in the inline comments in _decode):
+  (1) START OFFSET uses base+3, NOT base+1. The 3rd arg to the initial xorstep is
+      the stack slot [x29,-0x34], which is PRE-INCREMENTED 3x: base+1 (num_keys
+      read @0x519c), base+2 (num_coeffs read @0x5230), base+3 (xorstep arg @0x529c).
+  (2) The per-pair XOR-step XORs the next xorstep against the PAIR-START offset
+      (local_68 snapshot, [sp,0x2c] @0x5400), NOT against the post-b offset.
+
+HONESTY: integral-solve is NECESSARY but not SUFFICIENT -- a wrong walk could in
+principle solve integral to a WRONG token. So the recovered value is a CANDIDATE
+(integral-solve-consistent); ONE accepted live sign is the sufficient oracle and is
+the next step (TASK-0042). Any produced value goes to secrets/ ONLY; never a
+tracked file, never printed.
 ------------------------------------------------------------------------------
 """
 from __future__ import annotations
@@ -360,33 +374,60 @@ def _decode(px: bytes, config: bytes, op: int) -> List[str]:
     if num_coeffs == 0:
         raise DecodeError("num_coeffs == 0 (0x15)")
 
-    # Chained offset start. Ghidra rendered this as `FUN_0010583c(param_4,param_5)`
-    # (it dropped the 3rd arg); the r2 disassembly of 0x5138 shows the actual call
-    # is xorstep(px, L, base+1) and the result is XOR'd with `r` (the (strhash%L)/2
-    # value), then reduced mod L:
-    #     off = (xorstep_u32(px, base+1) ^ r) % L
-    off = (xorstep_u32(px, (base + 1) % L) ^ r) % L
+    # Chained offset start. Ghidra rendered the initial call as
+    # `FUN_0010583c(param_4,param_5)` (it elided the 3rd arg). The r2 disasm of
+    # FUN_00105138 shows the 3rd arg is a stack slot ([x29,-0x34]) that is
+    # PRE-INCREMENTED three times before this call:
+    #   @0x519c base+1 (consumed reading num_keys at pixels[base+1])
+    #   @0x5230 base+2 (consumed reading num_coeffs at pixels[base+2])
+    #   @0x529c base+3 (the 3rd arg to the initial xorstep)        <-- load-bearing
+    # so the start offset uses base+3, NOT base+1 (the prior port's residual bug).
+    # The xorstep result is then XOR'd with `r` ((strhash%L)/2) and reduced mod L:
+    #   0x52a4 bl 0x583c (arg3=base+3); 0x52ac eor w0,[sp,0x2c]=r; reduce mod L.
+    off = (xorstep_u32(px, (base + 3) % L) ^ r) % L
 
     pairs: List[Tuple[str, str]] = []
     for _ in range(num_coeffs):
+        # `pair_start` = the offset captured at the TOP of this iteration
+        # (FUN_00105138 @0x52dc: `[sp,0x2c] = [sp,0x28]`, i.e. local_68 snapshot).
+        # The per-pair XOR-step below XORs the NEXT xorstep against THIS value,
+        # NOT against the post-b offset (the prior port's residual bug — verified
+        # byte-exact from the r2 disasm of 0x53f0..0x5418, see comment below).
+        pair_start = off
         if op == 1:
-            # a: length byte at off, then `len` raw bytes; advance off
+            # a: length byte at off, then `alen` raw bytes; advance off
+            #   0x52f8 alen = pixels[cur]; 0x5318 cur=(cur+1)%L (a-value start);
+            #   0x536c cur=(a_start+alen)%L (after-a position)
             alen = px[off % L]
             a_hex, _ = read_value_op1(px, (off + 1) % L, alen)
             off2 = (off + 1 + alen) % L
+            #   0x5378 blen = pixels[cur]; 0x5398 cur=(cur+1)%L (b-value start);
+            #   0x53ec cur=(b_start+blen)%L (after-b position)
             blen = px[off2 % L]
             b_hex, _ = read_value_op1(px, (off2 + 1) % L, blen)
             off = (off2 + 1 + blen) % L
         else:
-            # op2: read a length byte then `len` LSB-packed bytes
+            # op2: read a length byte then `len` LSB-packed bytes.
+            # HONEST LIMITATION (op2 is NOT byte-verified): the real appKey config
+            # dispatches to op1 (selector=1), so op2 is out of scope for the
+            # production token and has NO end-to-end oracle. r2 disasm of the op2
+            # function FUN_001054f4 shows it does NOT use the op1-style xorstep
+            # per-pair walk (no `bl 0x583c` in its body; its `[sp,0x2c]` slot is a
+            # plain sequential counter @0x57e0). So op2's offset advances purely
+            # sequentially here; the op1 xorstep tail below is correctly NOT applied.
             alen, off = read_byte_op2(px, off)
             a_hex, off = read_value_op2(px, off, alen)
             blen, off = read_byte_op2(px, off)
             b_hex, off = read_value_op2(px, off, blen)
+            pairs.append((a_hex, b_hex))
+            continue
         pairs.append((a_hex, b_hex))
-        # per-pair offset XOR-step (decode_op1.c tail; r2 0x53fc: bl 0x583c; eor):
-        #     off = (xorstep_u32(px, off) ^ off) % L
-        off = (xorstep_u32(px, off) ^ off) % L
+        # op1 per-pair offset XOR-step. BYTE-EXACT from FUN_00105138 @0x53f0..0x5418:
+        #   0x53fc  bl 0x583c          -> xs = xorstep_u32(px, after_b_offset)
+        #   0x5400  ldr w8,[sp,0x2c]   -> w8 = pair_start  (the loop-top snapshot)
+        #   0x5404  eor w8, w0, w8     -> xs ^ pair_start   (NOT ^ after_b)
+        #   0x5414  reduce mod L
+        off = (xorstep_u32(px, off) ^ pair_start) % L
 
     # split into num_keys groups; each group solved independently
     group = num_coeffs // num_keys if num_keys else num_coeffs
@@ -423,7 +464,28 @@ def read_keys_from_content(config: bytes, bmp_raw: bytes) -> List[str]:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+def _project_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _load_appkey() -> Optional[bytes]:
+    """config = ThingSmartNetWork.mAppId.getBytes() = the appKey bytes (TASK-0041).
+    Read from secrets/tuya_appkey.json (gitignored). Returns None if absent."""
+    import json
+    p = os.path.join(_project_root(), "secrets", "tuya_appkey.json")
+    if not os.path.exists(p):
+        return None
+    with open(p) as fh:
+        return json.load(fh)["appKey"].encode()
+
+
 def main(argv: List[str]) -> int:
+    """Compute the bmp_token from the STATIC inputs (config = appKey, input =
+    t_s.bmp) and write it to secrets/bmp_token.txt ONLY. The value is NEVER printed
+    and NEVER hardcoded -- it is recomputed from the asset + appKey every run.
+
+    Usage: bmp_token_ghidra.py [assets_dir] [appKey_override]
+    """
     assets = argv[1] if len(argv) > 1 else ASSETS_DEFAULT
     t_s = os.path.join(assets, "t_s.bmp")
     if not os.path.exists(t_s):
@@ -434,26 +496,42 @@ def main(argv: List[str]) -> int:
     print(f"t_s.bmp: filesize={view.filesize} bf_off_bits={view.bf_off_bits} "
           f"pixel_len={view.pixel_len}")
     px = pixels(view)
-    # The config blob (param_1/x0 to read_keys_from_content) is the SDK-config
-    # byte[] passed into doCommandNative -- it is NOT a static asset, it is supplied
-    # by the caller at runtime. So a fully-resolved token requires that runtime
-    # config blob; here we demonstrate the decode machinery against a probe config
-    # to show it runs end-to-end and is deterministic.
-    probe = argv[2].encode() if len(argv) > 2 else b"securityOpen"
-    h = strhash(probe)
+
+    # config = the appKey bytes (TASK-0041: doCommandNative param_6 =
+    # mAppId.getBytes()). Override via argv[2] for experiments.
+    config = argv[2].encode() if len(argv) > 2 else _load_appkey()
+    if config is None:
+        print("config (appKey) unavailable: secrets/tuya_appkey.json absent and no "
+              "override given. Cannot compute the production token.", file=sys.stderr)
+        return 2
+
+    h = strhash(config)
     r = (h % view.pixel_len) // 2
     idx = r % view.pixel_len
     sel = px[idx]
-    print(f"probe config={probe!r}: strhash={h} selector_idx={idx} selector_byte={sel}")
+    base = r % view.pixel_len
+    print(f"config: strhash={h} selector_idx={idx} selector_byte={sel} "
+          f"num_keys={px[(base + 1) % view.pixel_len]} "
+          f"num_coeffs={px[(base + 2) % view.pixel_len]}")
     try:
-        keys = read_keys_from_content(probe, bmp_raw)
-        print(f"decoded {len(keys)} key(s); lengths={[len(k) for k in keys]}")
-        print("NOTE: values intentionally not printed; write to secrets/ only.")
+        keys = read_keys_from_content(config, bmp_raw)
     except DecodeError as e:
-        print(f"decode result for this probe config: {e}")
-    print("\nDecode: fully-ported-unvalidated (no static oracle; live sign-accept "
-          "is the only true oracle, excluded by scope). Real token needs the "
-          "runtime SDK-config blob.")
+        print(f"DECODE FAILED (op1 walk not integral): {e}", file=sys.stderr)
+        return 1
+
+    # INTEGRAL SOLVE succeeded (the native denom==1 self-oracle). Write the
+    # candidate bmp_token to secrets/ ONLY -- never print it, never a tracked file.
+    token = "_".join(keys)  # doCommandNative '_'-joins the key list (cmd=0)
+    out = os.path.join(_project_root(), "secrets", "bmp_token.txt")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w") as fh:
+        fh.write(token + "\n")
+    print(f"INTEGRAL SOLVE: yes. Wrote {len(keys)} key(s) "
+          f"(lengths={[len(k) for k in keys]}) to secrets/bmp_token.txt "
+          "(value withheld).")
+    print("\nbmp_token: CANDIDATE (integral-solve-consistent). NECESSARY condition "
+          "(native denom==1) met; live-login validation is the SUFFICIENT oracle "
+          "(TASK-0042). Value is in secrets/ only, never printed/committed.")
     return 0
 
 

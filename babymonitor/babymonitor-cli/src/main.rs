@@ -126,6 +126,15 @@ struct LiveLoginArgs {
     /// without risking the lockout-sensitive login step.
     #[arg(long)]
     probe_only: bool,
+    /// CORRUPT-SIGN differential (TASK-0050): only meaningful with --probe-only.
+    /// After building the fully-signed token.get envelope, flip exactly ONE hex
+    /// nibble of the `sign` value before sending — everything else byte-identical.
+    /// The corrupted sign keeps its 32-char lowercase-hex shape so the gateway
+    /// parses it and reaches sign-verification. Used to prove whether
+    /// ILLEGAL_CLIENT_ID is sign-sensitive (our candidate sign is wrong) or
+    /// sign-insensitive (an identity/provisioning gate upstream of sign-verify).
+    #[arg(long)]
+    corrupt_sign: bool,
 }
 
 /// `devices` subcommands.
@@ -296,14 +305,23 @@ fn auth_token_get_probe(args: &LiveLoginArgs, json: bool) -> Result<(), Error> {
             return Err(Error::NotImplemented("probe requires an explicit --host"));
         }
     };
-    match live::run_token_get_probe(&args.secrets_dir, &args.apk, host) {
+    // TASK-0050: the corrupted-sign differential. `--corrupt-sign` flips one hex
+    // nibble of the signature post-build so we can tell a sign-sensitive reject
+    // (our candidate sign is wrong) from a sign-insensitive identity gate.
+    let corrupt = args.corrupt_sign;
+    let variant = if corrupt {
+        "corrupt-sign"
+    } else {
+        "candidate-sign"
+    };
+    match live::run_token_get_probe(&args.secrets_dir, &args.apk, host, corrupt) {
         Ok(live::ProbeOutcome::Accepted) => {
             if json {
                 println!(
-                    "{{\"command\":\"auth live-login --probe-only\",\"host\":\"{host}\",\"accepted\":true,\"errorCode\":null}}"
+                    "{{\"command\":\"auth live-login --probe-only\",\"host\":\"{host}\",\"variant\":\"{variant}\",\"accepted\":true,\"errorCode\":null}}"
                 );
             } else {
-                println!("probe {host}: token.get ACCEPTED — sign oracle reachable. STOPPED before login.");
+                println!("probe {host} [{variant}]: token.get ACCEPTED — sign oracle reachable. STOPPED before login.");
             }
             Ok(())
         }
@@ -312,10 +330,12 @@ fn auth_token_get_probe(args: &LiveLoginArgs, json: bool) -> Result<(), Error> {
             // code's human text; print it too — it is server-side, not ours.
             if json {
                 println!(
-                    "{{\"command\":\"auth live-login --probe-only\",\"host\":\"{host}\",\"accepted\":false,\"errorCode\":\"{code}\"}}"
+                    "{{\"command\":\"auth live-login --probe-only\",\"host\":\"{host}\",\"variant\":\"{variant}\",\"accepted\":false,\"errorCode\":\"{code}\"}}"
                 );
             } else {
-                println!("probe {host}: token.get server error — errorCode={code} ({msg})");
+                println!(
+                    "probe {host} [{variant}]: token.get server error — errorCode={code} ({msg})"
+                );
             }
             Ok(())
         }

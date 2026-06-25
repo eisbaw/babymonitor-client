@@ -655,6 +655,33 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+/// Flip exactly ONE hex nibble of a lowercase-hex string (the Tuya `sign` is a
+/// 32-char lowercase MD5 hex). Returns a string of the SAME length and the same
+/// hex alphabet, differing from the input in exactly one character — so the
+/// gateway still parses it as a well-formed signature and proceeds to verify it.
+///
+/// The flip is deterministic (mutates the FIRST hex digit, XOR-ing its 4-bit
+/// value with 1 — `0<->1`, `2<->3`, …, `e<->f`), which always yields a different
+/// character. A non-hex / empty input is a programmer error here (the sign is
+/// always hex), so we return a typed [`LiveError`] rather than corrupting blindly.
+/// The input and output are signature material and are NEVER logged.
+fn corrupt_one_nibble(hex: &str) -> Result<String, LiveError> {
+    if hex.is_empty() {
+        return Err(LiveError::Crypto("cannot corrupt an empty sign".into()));
+    }
+    let mut chars: Vec<char> = hex.chars().collect();
+    let first = chars[0];
+    let val = first
+        .to_digit(16)
+        .ok_or_else(|| LiveError::Crypto("sign is not lowercase hex; cannot corrupt".into()))?;
+    // XOR the low bit to guarantee a different nibble (0<->1, 2<->3, ... e<->f).
+    let flipped = val ^ 1;
+    let new_char = std::char::from_digit(flipped, 16)
+        .ok_or_else(|| LiveError::Crypto("nibble flip produced a non-hex digit".into()))?;
+    chars[0] = new_char;
+    Ok(chars.into_iter().collect())
+}
+
 /// Render a reqwest error WITHOUT leaking the request URL — which carries the
 /// signed query string (`clientId` = appKey, `sign` = the signature: BOTH
 /// secret-by-policy). reqwest's default `Display` embeds the full effective URL
@@ -984,6 +1011,7 @@ pub fn run_token_get_probe(
     secrets_dir: &Path,
     apk_path: &Path,
     host: &str,
+    corrupt_sign: bool,
 ) -> Result<ProbeOutcome, LiveError> {
     let cfg = load_config(secrets_dir, apk_path)?;
     eprintln!("probe: config loaded (all secret values withheld).");
@@ -1015,7 +1043,7 @@ pub fn run_token_get_probe(
         "isUid": false,
     })
     .to_string();
-    let (envelope, body) = build_signed_envelope(
+    let (mut envelope, body) = build_signed_envelope(
         &cfg,
         TOKEN_GET_ACTION,
         TOKEN_GET_VERSION,
@@ -1023,7 +1051,39 @@ pub fn run_token_get_probe(
         sign_body,
     )?;
 
-    eprintln!("probe: sending ONE token.get to {host} (no password.login will follow)...");
+    // TASK-0050 corrupted-sign differential: flip exactly ONE hex nibble of the
+    // already-built `sign` value, leaving everything else byte-identical. The
+    // corrupted sign keeps its 32-char lowercase-hex shape, so the gateway parses
+    // it and reaches sign-verification — only the signature itself is wrong. This
+    // is the decisive test: if the SAME `ILLEGAL_CLIENT_ID` comes back for both the
+    // candidate and the corrupted sign, the reject is sign-INSENSITIVE (an identity
+    // gate upstream of sign-verify); if a DIFFERENT (sign/access) code comes back,
+    // the reject is sign-SENSITIVE and our candidate sign is the real blocker.
+    if corrupt_sign {
+        let sign = envelope
+            .get("sign")
+            .cloned()
+            .ok_or_else(|| LiveError::Crypto("envelope has no sign to corrupt".into()))?;
+        let corrupted = corrupt_one_nibble(&sign)?;
+        // Sanity: same length/shape, but a different value (never log either).
+        debug_assert_eq!(corrupted.len(), sign.len());
+        debug_assert_ne!(corrupted, sign);
+        envelope.insert("sign".into(), corrupted);
+        eprintln!(
+            "probe: --corrupt-sign active — flipped ONE hex nibble of the sign \
+             (value withheld); shape/length preserved so the gateway reaches \
+             sign-verification."
+        );
+    }
+
+    eprintln!(
+        "probe: sending ONE token.get to {host} (variant={}, no password.login will follow)...",
+        if corrupt_sign {
+            "corrupt-sign"
+        } else {
+            "candidate-sign"
+        }
+    );
     let resp = send_atop(&client, host, &cfg, &envelope, &body)?;
 
     if resp.success {
@@ -1440,6 +1500,46 @@ mod tests {
     fn urlencode_escapes_non_unreserved() {
         assert_eq!(urlencode("a b{}"), "a%20b%7B%7D");
         assert_eq!(urlencode("safe-_.~"), "safe-_.~");
+    }
+
+    // corrupt_one_nibble (TASK-0050): the differential's corrupted sign MUST keep
+    // the same length and hex alphabet (so the gateway parses + reaches
+    // sign-verification) while differing in exactly one character.
+    #[test]
+    fn corrupt_one_nibble_preserves_shape_changes_one_char() {
+        // A representative 32-char lowercase MD5 hex (the sign's shape).
+        let sign = "0123456789abcdef0123456789abcdef";
+        let corrupted = corrupt_one_nibble(sign).expect("hex input must corrupt");
+        assert_eq!(corrupted.len(), sign.len(), "length preserved");
+        assert_ne!(corrupted, sign, "value changed");
+        assert!(
+            corrupted
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "still lowercase hex: {corrupted}"
+        );
+        // Exactly ONE character differs.
+        let diffs = sign
+            .chars()
+            .zip(corrupted.chars())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(diffs, 1, "exactly one nibble flipped");
+        // The flip is deterministic: first nibble 0 -> 1.
+        assert_eq!(&corrupted[..1], "1");
+    }
+
+    // The flip must change EVERY hex digit (no fixed point), incl. 'f' -> 'e'.
+    #[test]
+    fn corrupt_one_nibble_handles_f_and_rejects_nonhex() {
+        let flipped = corrupt_one_nibble("ffffffff").expect("hex corrupts");
+        assert_eq!(&flipped[..1], "e", "f flips to e (f^1)");
+        // A non-hex sign is a programmer error -> typed Crypto error, not a panic.
+        assert!(matches!(
+            corrupt_one_nibble("zzzz"),
+            Err(LiveError::Crypto(_))
+        ));
+        assert!(matches!(corrupt_one_nibble(""), Err(LiveError::Crypto(_))));
     }
 
     // redact_query MUST strip a signed query string (clientId=appKey & sign=...)

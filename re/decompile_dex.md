@@ -9,51 +9,57 @@ stable paths) — strip the `decompiled/jadx/sources/` prefix when reading.
 ## Command (confidence: confirmed)
 
 ```
-# JADX_OPTS=-Xmx4g is exported by shell.nix (the JVM heap arg; it is NOT a jadx
-# CLI flag — passing -Xmx4g on the jadx command line errors "Unknown option").
-nix-shell --run 'jadx --no-debug-info \
-    --output-dir decompiled/jadx \
-    extracted/xapk/com.philips.ph.babymonitorplus.apk'
+# The JVM heap is a JVM arg (-Xmx…) passed via JADX_OPTS, NOT a jadx CLI flag —
+# passing -Xmx4g on the jadx command line errors "Unknown option".
+# shell.nix sets JADX_OPTS=-Xmx4g, which OOMs on this dex set; override to 12g.
+JADX_OPTS='-Xmx12g' nix-shell --run \
+    'JADX_OPTS="-Xmx12g" jadx --no-debug-info \
+        --output-dir decompiled/jadx \
+        extracted/xapk/com.philips.ph.babymonitorplus.apk'
 ```
 
-jadx 1.5.0 (JVM heap 4g). Pointed at the APK directly so all 14
+jadx 1.5.0 (JVM heap 12g). Pointed at the APK directly so all 14
 `classes*.dex` are processed in one pass (jadx reads every dex in the archive:
 the dex files are also copied verbatim into `decompiled/jadx/resources/`).
 
 GOTCHA (carried forward): the first attempt put `-Xmx4g` on the jadx CLI and
-failed with "Unknown option: -Xmx4g". The heap must go through `JADX_OPTS`
-(already set inside the nix shell), not the command line.
+failed with "Unknown option: -Xmx4g". The heap must go through `JADX_OPTS`, not
+the command line. When both `-Xmx4g` (shell default) and `-Xmx12g` are present,
+HotSpot uses the LAST one, so prefixing `JADX_OPTS="-Xmx12g"` wins.
 
 ## Coverage / jadx success (confidence: confirmed)
 
-- Input: 14 dex (~190 MB). jadx reports a total of **36,686 classes** to process.
-- Output: **~41,700 `.java` files** under `decompiled/jadx/sources/` (more files
-  than classes because nested/anonymous classes can emit separate files and jadx
-  also writes resource stubs).
-- jadx runs to a high percentage cleanly; the **heaviest obfuscated classes
-  (in `classes5.dex` 24 MB, `classes8.dex` 20 MB) are slow** and jadx spends a
-  long tail at ~79-80% CPU-bound before flushing them. This is expected for a
-  full Tuya-SDK + RN dex set, not a failure. Any classes jadx cannot fully
-  decompile are emitted with an inline `/* JADX ERROR ... */` comment + the raw
-  smali fallback rather than dropped, so partial-failure is visible in-file, not
-  silent. The package-level map below is stable regardless of the slow tail
-  because the directory/package structure is written up front.
-- Honesty note: jadx on heavily R8-obfuscated dex routinely leaves SOME method
-  bodies as `// Can't load method ...` / `throw new UnsupportedOperationException`
-  stubs. Treat any single decompiled method body as "likely", cross-check against
-  the native strings / JS contract before asserting "confirmed".
+- Input: 14 dex (~190 MB). jadx reports **36,686 classes** to process.
+- **First run at the shell default `-Xmx4g` FAILED with `java.lang.OutOfMemoryError`
+  (exit 1), truncated at ~80% / ~41,680 `.java` files** — the heaviest obfuscated
+  classes (in `classes5.dex` 24 MB, `classes8.dex` 20 MB) exhausted the 4g heap.
+  This is a real partial failure, recorded honestly, NOT hidden.
+- **Re-run at `-Xmx12g` SUCCEEDED cleanly: exit 0, reached 99% (36,685/36,686 —
+  the last item is the final write flush), zero `OutOfMemoryError`,** producing
+  **51,008 `.java` files** under `decompiled/jadx/sources/` (~888 MB). The extra
+  ~9,300 files over the OOM-truncated run are the classes the 4g heap dropped.
+- Residual per-method failures (expected on heavily R8-obfuscated dex, flagged
+  INLINE by jadx, not silent): **1,397 files carry a marker** — 1,806 `Method not
+  decompiled`, 19 `JADX ERROR`, 3 `Failed to decode`. jadx emits these as inline
+  comments + a stub body (`throw new UnsupportedOperationException("Method not
+  decompiled: …")`) so the class signature/fields are still present; only those
+  specific obfuscated method bodies are unreadable. No WHOLE class is dropped.
+- Honesty note: treat any single decompiled method body as "likely" and
+  cross-check against the native strings / JS contract before asserting
+  "confirmed"; for the ~1.8k flagged methods the body is simply absent.
 
 ## Package-level map (confidence: confirmed — counts from `find ... -name '*.java'`)
 
+Counts from the complete `-Xmx12g` run (50,977 `.java` under `sources/`):
+
 | Namespace | `.java` files | What it is |
 |---|---|---|
-| `com/thingclips` | ~16,764 | **Tuya/Thing SDK** — the whole app engine (camera, P2P, mqtt, auth, activator) |
-| `com/google` | ~7,160 | Firebase, GMS, MLKit, protobuf, ExoPlayer |
-| `com/facebook` | ~1,148 | React Native + Fresco + Folly JNI |
-| `com/facebook/react` | ~468 | **React Native bridge runtime** |
-| `com/gzl` | ~477 | Tuya "GZL" mini-app / uni-runtime (hosts the JS bundles) |
-| `com/alibaba` | ~49 | fastjson / ARouter |
-| `com/smart` | ~11 | `com.smart.app.SmartApplication` (app bootstrap) + splash |
+| `com/thingclips` | 22,377 | **Tuya/Thing SDK** — the whole app engine (camera, P2P, mqtt, auth, activator) |
+| `com/google` | 8,216 | Firebase, GMS, MLKit, protobuf, ExoPlayer |
+| `com/facebook` | 1,374 | React Native + Fresco + Folly JNI |
+| `com/facebook/react` | 588 | **React Native bridge runtime** |
+| `com/gzl` | 762 | Tuya "GZL" mini-app / uni-runtime (hosts the JS bundles) |
+| `com/smart` | 15 | `com.smart.app.SmartApplication` (app bootstrap) + splash |
 | `com/philips` | **1** | Philips' own code is essentially absent — this is a pure Tuya reskin |
 | `com/tuya` | 1 | legacy `com.tuya` shim (renamed to `com.thingclips`) |
 | obfuscated top-level pkgs | 44 dirs | R8/ProGuard output: `OooO00o`, `defpackage`, `ajers256188v21`, … |
@@ -89,8 +95,8 @@ Locations are directories under `decompiled/jadx/sources/`.
 - `com/thingclips/smart/camera/middleware/p2p/` — the camera↔P2P middleware.
 
 ### Camera / IPC (control + live view)
-- `com/thingclips/smart/ipc/` (~901 files) and `com/thingclips/smart/camera/`
-  (~844 files) — the IPC camera feature surface, panels, device control.
+- `com/thingclips/smart/ipc/` (1,521 files) and `com/thingclips/smart/camera/`
+  (1,154 files) — the IPC camera feature surface, panels, device control.
 - RN bridge plugins (the JS contract → Java): `com/thingclips/smart/plugin/
   tuniipccameramanager/`, `tuniipcdoorbellmanager/`, `tunip2pfilemanager/`,
   `tunimqttmanager/`, `tuniapirequestmanager/`, `tuniactivationmanager/`,
@@ -123,7 +129,7 @@ Locations are directories under `decompiled/jadx/sources/`.
   mqtt/` (the `MqttService`). This is the event/DP/signaling channel.
 
 ### Pairing / provisioning
-- `com/thingclips/smart/activator/` (~381 files) — EZ/AP/SmartLink/Matter pairing
+- `com/thingclips/smart/activator/` (648 files) — EZ/AP/SmartLink/Matter pairing
   (`libThingSmartLink.so` JNI: `ThingSmartLink.smartLink`). Matches the
   `startDeviceActivate` JS contract.
 
@@ -151,8 +157,9 @@ sections (e.g.
 ## Limitations (confidence: confirmed — scoping caveats)
 - Obfuscated impl classes (`pqdbppq`-style) need manual cross-referencing; the
   public interfaces are the trustworthy read.
-- jadx leaves some method bodies as stubs on the most obfuscated classes; any
-  single decompiled body is "likely", to be cross-checked.
-- Counts are approximate (`find -name '*.java'`) and were taken as jadx was
-  finishing its slow tail on the heaviest dex; the package STRUCTURE is complete
-  and stable, individual heavy-class bodies may continue to flush.
+- jadx leaves 1,806 method bodies as `Method not decompiled` stubs across 1,397
+  files (~2.7% of files) on the most obfuscated classes; the class signatures and
+  fields are still present. Any single decompiled body is "likely"; for the
+  flagged methods the body is absent and must be read from smali if needed.
+- The 4g default heap OOMs on this dex set — always use `-Xmx12g`. The final run
+  is complete (exit 0, 99%, 51,008 files); the earlier 4g OOM run was discarded.

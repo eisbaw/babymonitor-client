@@ -167,6 +167,9 @@ exact roles in key derivation are a TASK-0010 dive, not yet corroborated).
 The SDP-level `imm_p2p_rtc_sdp_{get,set}_aes_key` suggests an **AES key carried in
 SDP** for the media path — a TASK-0010 dive target (key derivation, the historically
 non-statically-recoverable part per review-gate F3).
+> **RESOLVED by TASK-0010 (see `re/webrtc_session.md`):** confirmed — the media AES
+> key rides the SDP `m=application` section as `a=aes-key:<hex>` (NOT DTLS-exporter-
+> derived), so one offer/answer 302 capture yields the key value. No crypto RE needed.
 
 ---
 

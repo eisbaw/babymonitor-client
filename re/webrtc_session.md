@@ -358,9 +358,15 @@ source); the session-state enum matches `imm_p2p_rtc_send_frame` /
 2. Looks up the session in the session list (`ctx+0x43e0`) by id; rejects with
    `-0xb` "invalid session" if absent or state != active.
 3. **Session state gate** (the `switch` on `plVar7+0x1a` = the `rtc_state` enum):
-   only **state 3** (connected) and the state-0/5 sub-cases proceed; others map to
-   error codes (state 4 → `-0xe`, 0xb → `-0x29`, 0xc → `-0x17`, 0x10 → `-0x1f`,
-   0x11 → `-0x1e`). This is the same state enum used by send_frame/recv_data.
+   the frame path **proceeds on state 0** (only if sub-flags `+0xd4==0` and
+   `+0x1b==0`) and **state 5** (via the `-100 - x` path); **state 3 returns error
+   `-0x13`** (the init value — no frame delivered), and other states map to error
+   codes (state 4 → `-0xe`, 0xb → `-0x29`, 0xc → `-0x17`, 0x10 → `-0x1f`, 0x11 →
+   `-0x1e`). This is the same state enum used by send_frame/recv_data.
+   (confidence: likely — REVIEW-CORRECTED: an earlier draft wrongly listed state 3
+   as the data-flow state; per `recv_frame.c:46-60` / `send_frame.c:45-59` the
+   frame pop/push is reached from case 0/5, not case 3. The human-readable
+   `on_state=active` name vs this numeric enum value needs a live capture to pin.)
 4. Pops a frame from `imm_p2p_rtc_audio_frame_list_pop_front` (this branch is the
    **audio** path), copies the payload (`memcpy` from `frame_buf + 0x18 + 0x1c +
    0x48`, i.e. past the RTP header), sets `frame->length`, `frame->type=0`, and
@@ -414,10 +420,10 @@ Recovered numeric cases:
 
 | state | recv/send behavior | inferred meaning |
 |---|---|---|
-| 0 | proceeds only if sub-flag `+0xd4==0` and `+0x1b==0` | connecting / initial |
-| 3 | **proceeds** (data flows) | **connected / active** |
+| 0 | **proceeds** (data flows) if sub-flag `+0xd4==0` and `+0x1b==0` | active data-transfer (sub-flags clear) |
+| 3 | returns `-0x13` (no frame) | NOT a data-flow state (review-corrected) |
 | 4 | `-0xe` | closing/closed |
-| 5 | proceeds via `-100 - x` path | (re)negotiating |
+| 5 | **proceeds** (data flows) via `-100 - x` path | active data-transfer / (re)negotiating |
 | 0xb | `-0x29` | error (auth?) |
 | 0xc | `-0x17` | error |
 | 0x10 | `-0x1f` | error |
@@ -436,8 +442,10 @@ The **Initialize 3-callback contract** drives the state machine from the host
 Driver sequence the Rust client implements:
 `init → (optional pre_connect) → connect_v2 [builds+sends offer via on_msg] →
 recv answer (302) [set_signaling] → trickle candidates both ways (302) →
-ICE connectivity → DTLS-SRTP handshake → on_state=active (state 3) →
-recv_frame loop`. (confidence: likely — the call set is directly present in the
+ICE connectivity → DTLS-SRTP handshake → on_state=active →
+recv_frame loop`. (The `recv_frame`/`send_frame` data path itself gates on the
+internal frame-transfer states **0/5**, not 3 — see the state-gate note above.)
+(confidence: likely — the call set is directly present in the
 `Initialize` callback contract + the cmd builders of `libThingP2PSDK.so`; the
 precise inter-leaving of candidate vs answer timing needs a live capture, §9.)
 

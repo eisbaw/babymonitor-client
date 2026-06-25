@@ -1,11 +1,11 @@
 ---
 id: TASK-0010
 title: 'SPIKE: libThingP2PSDK session + AV framing feasibility'
-status: In Progress
+status: Done
 assignee:
   - '@reverser'
 created_date: '2026-06-24 22:36'
-updated_date: '2026-06-25 07:34'
+updated_date: '2026-06-25 07:41'
 labels:
   - wave2
 dependencies:
@@ -51,4 +51,6 @@ VERDICT (AC#2): partially recoverable-statically -> Wave-2 pursues WebRTC-over-M
 IMPLEMENTABILITY (for TASK-0034): IMPLEMENTABLE given runtime-gated inputs (token, p2pId=remote_id, dev_id, skill, P2pConfig.p2pKey/ices/session, device localKey, pv - all from one authed device-list call; client mints trace_id+connect_session). webrtc-rs handles SDP/ICE/DTLS-SRTP/RTP; rumqttc handles the 302 transport; Tuya-custom = the 302 envelope + the m=application/a=aes-key/imm extension + KCP. GATES GREEN: check-evidence, secret-scan, e2e.
 
 GOTCHA: re/ghidra/*.c are NOT counted as citation tokens by check-evidence (SOURCE_EXT excludes 'c'); cite libThingP2PSDK.so + the .java path for token-counting. recv_frame branch dumped is the audio path; video path is symmetric via imm_p2p_rtc_frame_list_*.
+
+Cycle-21 review: both GO. a=aes-key-in-SDP finding binary-verified (resolves F3 honestly — evidenced upgrade, not contradiction); Ghidra primary (19 C dumps), r2 cross-check no divergence; session spec byte-anchored + implementable. Orchestrator fixed P1 (state-machine: state 3 returns -0x13, frame transfer on states 0/5 — earlier draft inverted it) + P2 (p2p_triage forward-pointer to the F3 resolution). re/webrtc_session.md is the TASK-0034 spec.
 <!-- SECTION:NOTES:END -->

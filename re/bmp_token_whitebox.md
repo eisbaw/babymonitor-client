@@ -335,3 +335,16 @@ the `.so` (no embedded test vector); the only true oracle is a live sign-accept
 with (where the Java/SDK layer constructs it). Until that blob is known, the
 `BmpTokenProvider` stays `PendingBmpToken` (NOT wired to a fake). A single accepted
 live sign remains the cheaper end-to-end oracle (contingency).
+
+**UPDATE (TASK-0041, `re/bmp_token_provenance.md`) — the runtime `config` blob is now
+RESOLVED and it is STATIC.** The `param_6` byte[] is
+`ThingSmartNetWork.mAppId.getBytes()` (the **appKey**), passed by
+`ThingNetworkSecurity.initJNI` at the cmd=0 init call
+(`doCommandNative(ctx, 0, mAppSecret.getBytes(), mAppId.getBytes(), mD)`). The appKey is
+already in `secrets/tuya_appkey.json`. With the REAL appKey config the header VALIDATES
+(selector=1, op1, `num_keys=1`, `num_coeffs=4`) — NOT the rejection arbitrary configs
+give. So "needs the runtime SDK-config blob" is now "the config IS the static appKey".
+The remaining residual is narrower: the **op1 offset-walk port is not yet byte-exact**
+(it yields a non-integral Vandermonde solve), and there is no static oracle — so a
+trustworthy bmp_token still needs ONE accepted live sign to validate. See
+`re/bmp_token_provenance.md`.

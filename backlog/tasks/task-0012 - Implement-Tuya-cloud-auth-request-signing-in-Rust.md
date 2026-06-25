@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@architect'
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 06:56'
+updated_date: '2026-06-25 11:06'
 labels:
   - phase5
   - rust
@@ -63,5 +63,7 @@ GATE: nix-shell just e2e (build+test+clippy -D+fmt+stub-grep+offline) GREEN; che
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
+--------------------------------------------------
 TASK-0033 feed-forward (bmp_token / AC#1): the t_s.bmp imath+matrix decode is now ported byte-exact from Ghidra C (re/scripts/bmp_token_ghidra.py). HOWEVER the signer is NOT yet offline-complete: Ghidra revealed the decode's config input is a RUNTIME JNI byte[] (doCommandNative param_6), not a static asset, so the production bmp_token cannot be computed from assets alone. The byte-for-byte differential (AC#1) therefore still needs EITHER the runtime SDK-config byte[] OR one live sign vector (AC#3 contingency). BmpTokenProvider stays PendingBmpToken; Signer::sign still returns BmpTokenPending (honest). MD5-not-HMAC, '_'-join order, and cert-SHA256-offline all stand from TASK-0023. Precise residual now = the runtime config blob (or a live vector), NOT the matrix algorithm (which is done).
+[TASK-0041 feed-forward] bmp_token config provenance RESOLVED: the read_keys_from_content config byte[] = ThingSmartNetWork.mAppId.getBytes() (the appKey, in secrets/tuya_appkey.json), passed at the cmd=0 init call doCommandNative(ctx,0,mAppSecret.getBytes(),mAppId.getBytes(),mD) in ThingNetworkSecurity.initJNI. So ALL signer inputs are static/known: appKey, appSecret, app_cert_sha256 (secrets/), t_s.bmp (asset). Exact canonical string + key documented in re/bmp_token_provenance.md §2 (sort whitelist -> key=val joined by '||'; postData replaced by swapSignString(md5AsBase64(body)); key = cert_sha256_hex _ <t_s.bmp matrix keys '_'-joined> _ appSecret; primitive plain MD5 hex). Wire config=appKey bytes into the bmp_token decode. REMAINING BLOCKER: the op1 offset-walk in re/scripts/bmp_token_ghidra.py is NOT byte-exact (non-integral Vandermonde solve with real config) and there is no static oracle -> keep BmpTokenProvider=PendingBmpToken until ONE accepted live sign validates it. cert-hash + appSecret + MD5 + '_'-join + canonical-string are buildable NOW.
 <!-- SECTION:NOTES:END -->

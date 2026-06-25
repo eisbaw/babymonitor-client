@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@architect'
 created_date: '2026-06-25 11:40'
-updated_date: '2026-06-25 13:28'
+updated_date: '2026-06-25 13:36'
 labels:
   - phase3
   - wave3
@@ -52,4 +52,6 @@ FEED-FORWARD (TASK-0044): chKey + SDK-fidelity params are now IN the live reques
 RESUMING the single live token.get with the CORRECTED request: host a1.tuyaeu.com (TASK-0043, refuted as the issue), clientId/time wire params (already correct), chKey HMAC-SHA256 confirmed-ordering in wire+sign (TASK-0044), SDK-fidelity params, bmp_token candidate, most-likely MD5 fold. This is THE validation attempt.
 
 SINGLE LIVE token.get RE-ATTEMPT (chKey-corrected request) — OUTCOME: still ILLEGAL_CLIENT_ID. The one corrected token.get was sent ONCE against a1.tuyaeu.com; the wire carried chKey+clientId+time+sign + all SDK-fidelity params (verified via captured request_param_keys in secrets/tuya_live_debug.json). Server: HTTP 200, success=false, errorCode=ILLEGAL_CLIENT_ID, errorMsg='Invalid client;No access', no result. Classified as non-sign Server error -> STOPPED before password.login per guardrail (zero lockout-sensitive calls; no retry; no host/fold sweep; 2FA not reached). chKey did NOT clear ILLEGAL_CLIENT_ID, so chKey/SDK-fidelity were not the (sole) gate; the bmp_token candidate + MD5 fold remain NEITHER validated NOR refuted (sign oracle still unreachable). Remaining server-opaque hypotheses: (a) provisioning/app-cert-pin/app-attestation identity gate a standalone client cannot reproduce; (b) a still-wrong chKey ordering (single-source) or an un-modelled signed identity input. Owner decides next (more material / authorized on-device Frida getChKey+request capture). Leak-hardening this cycle: routed probe_host's reqwest error through scrub_url_secrets so EVERY reqwest-error path is URL-redacted; ran with RUST_LOG unset (no reqwest/hyper debug). Captured to secrets/ only: tuya_live_debug.json (gitignored). Docs: re/live_login.md outcome updated (no values); re/chkey_static.md §3a strengthened (register re-trace) but kept 'likely' (one binary artifact, two views = one source per evidence rubric). Gates: e2e GREEN (live gated out), check-evidence GREEN, secret-scan GREEN.
+
+STATIC SURFACE EXHAUSTED (qa GO + static lead-hunt conclusive): corrected request matched host + clientId/time + chKey(confirmed) + ALL signed/whitelisted params + ALL 3 SDK headers (User-Agent/Connection/x-client-trace-id; no interceptor adds identity headers) + NO attestation gate exists anywhere in the decompile. ILLEGAL_CLIENT_ID is server-only, identity-layer, PRE-sign -> appKey/ttid PROVISIONING, not a missing static field. Likely: (a) our extracted appKey/ttid isn't the live value, or (b) appKey is server-bound to the official Philips app registration. STOPPING per guardrail -> owner decides. The ONLY remaining unblock is an on-device capture (broader than the authorized cloud login) -> TASK-0045. P2: live.rs scrub_url_secrets docstring stale-mentions without_url (not called).
 <!-- SECTION:NOTES:END -->

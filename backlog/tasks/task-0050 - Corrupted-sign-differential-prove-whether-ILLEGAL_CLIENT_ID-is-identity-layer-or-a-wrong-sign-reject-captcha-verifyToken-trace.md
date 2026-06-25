@@ -3,11 +3,11 @@ id: TASK-0050
 title: >-
   Corrupted-sign differential: prove whether ILLEGAL_CLIENT_ID is identity-layer
   or a wrong-sign reject (+ captcha/verifyToken trace)
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-06-25 15:10'
-updated_date: '2026-06-25 15:12'
+updated_date: '2026-06-25 15:20'
 labels:
   - phase3
   - wave3
@@ -35,9 +35,9 @@ Deliver the differential verdict (identity-layer vs sign-sensitive) with the two
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A --corrupt-sign probe variant exists (token.get only, guardrails enforced); the differential pair was run against one reachable host and the two errorCodes recorded in re/live_login.md (no values)
-- [ ] #2 The verdict is stated definitively: ILLEGAL_CLIENT_ID is either identity-layer/sign-insensitive (=> attestation/provisioning, promote to confirmed, unblock TASK-0049) OR sign-sensitive (=> bmp_token/fold is the real blocker, file the static re-attack task)
-- [ ] #3 Captcha/verifyToken path traced statically: whether the atop request requires a verifyToken/risk/fingerprint header is resolved (recoverable -> task filed; runtime-only -> noted), in re/tuya_cloud_auth.md
+- [x] #1 A --corrupt-sign probe variant exists (token.get only, guardrails enforced); the differential pair was run against one reachable host and the two errorCodes recorded in re/live_login.md (no values)
+- [x] #2 The verdict is stated definitively: ILLEGAL_CLIENT_ID is either identity-layer/sign-insensitive (=> attestation/provisioning, promote to confirmed, unblock TASK-0049) OR sign-sensitive (=> bmp_token/fold is the real blocker, file the static re-attack task)
+- [x] #3 Captcha/verifyToken path traced statically: whether the atop request requires a verifyToken/risk/fingerprint header is resolved (recoverable -> task filed; runtime-only -> noted), in re/tuya_cloud_auth.md
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -56,3 +56,27 @@ STAGE B (captcha/verifyToken static trace, NO network):
 
 GATES: just e2e + just secret-scan + just check-evidence green; cargo clippy --features live -D warnings; cargo test --features live --no-run. Commit per logical unit (branch task-0050-sign-differential).
 <!-- SECTION:PLAN:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Disambiguated ILLEGAL_CLIENT_ID via a controlled corrupted-sign differential and a captcha/verifyToken static trace.
+
+VERDICT: ILLEGAL_CLIENT_ID is SIGN-INSENSITIVE — an identity/provisioning gate upstream of sign-verification (confirmed). It is NOT a wrong-sign reject.
+
+Stage A (code + live):
+- Added --corrupt-sign to the existing --probe-only token.get path (babymonitor/babymonitor-cli/src/{live.rs,main.rs}). After build_signed_envelope, corrupt_one_nibble flips exactly one hex nibble of the sign (first nibble XOR 1), leaving everything else byte-identical; the corrupted sign keeps its 32-char lowercase-hex shape so the gateway parses it and reaches sign-verification. Unit tests cover length-preserve / one-char-diff / still-hex / f->e / non-hex+empty -> typed error. Sign material never logged. live feature only (gated out of e2e).
+- Ran the differential against a1.tuyaeu.com: exactly 2 token.get, zero password.login, no 2FA, neither Accepted.
+  - probe 1 (candidate sign): HTTP 200, errorCode=ILLEGAL_CLIENT_ID
+  - probe 2 (one nibble flipped): HTTP 200, errorCode=ILLEGAL_CLIENT_ID
+  Both responses byte-for-byte identical (raw bodies + request param keys; gitignored secrets/). A wrong signature changes nothing => sign-insensitive => identity reject before sign-eval.
+- re/live_login.md: promoted the "returned before sign-verification" claim from server-opaque(likely) to confirmed (controlled A/B; corrupted variant = negative control). Recorded the two honest consequences: identity gate confirmed (unblocks TASK-0049); the bmp_token/fold is NOT validated but IS proven not to be the token.get blocker, so no bmp_token re-attack task is filed (that branch was for the sign-sensitive outcome, which did not occur).
+
+Stage B (captcha/verifyToken static trace, NO network) — re/tuya_cloud_auth.md §8:
+- verifyToken is a request PARAMETER to the captcha service's own /verify/app/initConfig (CaptchaBusiness, a SEPARATE raw OkHttpClient + host), NOT an atop header. The atop network/sign layer has zero captcha/risk/fingerprint/ticket references; verifyToken occurs only in the login/captcha package (5 files). The captcha-verify result feeds AuthCodeRequestEntity.ticket for code-SENDING (AuthCodeUseCase.sendAuthCodeByType) — disjoint from token.get/password.login (zero overlap files). The challenge is WebView-interactive (runtime-only).
+- Verdict: no statically-derivable required header that token.get omits; nothing to add, no follow-up task. Corroborates Stage A.
+
+Gates: just e2e, just secret-scan, just check-evidence all green; cargo clippy --features live -D warnings clean; cargo test --features live compiles and new tests pass.
+
+No follow-up tasks filed (the sign-insensitive outcome does not call for the bmp_token re-attack; TASK-0049 decision is now unblocked, noted on that task).
+<!-- SECTION:FINAL_SUMMARY:END -->

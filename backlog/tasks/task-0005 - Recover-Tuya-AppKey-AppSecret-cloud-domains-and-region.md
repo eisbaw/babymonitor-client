@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@reverser'
 created_date: '2026-06-24 22:35'
-updated_date: '2026-06-25 01:23'
+updated_date: '2026-06-25 01:33'
 labels:
   - phase3
   - re
@@ -41,4 +41,6 @@ SPIKE (verdict required). Recover the material needed to sign Tuya mobile-app AP
 
 <!-- SECTION:NOTES:BEGIN -->
 FINAL SUMMARY: SPIKE complete. VERDICT=needs-runtime-hook for the full sign-key derivation. Tuya mobile-app sign algorithm characterized end-to-end (sorted-whitelist params joined by '||', postData folded as swapSignString(md5AsBase64), keyed sign via native doCommandNative cmd=1). appKey/appSecret/TTID recovered statically (secrets/tuya_appkey.json). F1 CONFIRMED: key=[app_cert_SHA256]_[t_s.bmp token]_[appSecret] in libthing_security.so (decode via imath/matrix in libthing_security_algorithm.so). Datacenter domains encrypted in thing_domains_v1/regions, runtime-decrypted, region-selected post-login (F5). Docs: re/tuya_sign.md (+Verdict), re/tuya_cloud_config.md (non-secret). Gates: check-evidence/secret-scan/e2e all GREEN. Follow-ups: TASK-0022 (Frida), TASK-0023 (Ghidra). Fed forward to TASK-0007/0012.
+
+Cycle-5 review: both GO. Secret-hygiene P0 PASSED (appKey/appSecret in zero tracked files, full history scan clean; secrets/ gitignored). Verdict needs-runtime-hook honest+correctly scoped. Orchestrator fixed 2 P2 prose-precision nits (tuya_sign.md:154 symbol-export wording; tuya_cloud_config.md regions-envelope description).
 <!-- SECTION:NOTES:END -->

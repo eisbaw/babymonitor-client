@@ -4,7 +4,7 @@ title: Implement Tuya cloud auth + request signing in Rust
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 01:22'
+updated_date: '2026-06-25 01:33'
 labels:
   - phase5
   - rust
@@ -39,4 +39,6 @@ WHY: the first genuinely buildable+testable slice. Implement Tuya HMAC request s
 - The keyed wire-sign is native (HMAC-SHA256 likely) over key=[app_cert_SHA256]_[bmp_token]_[appSecret]. appSecret is static (secrets/tuya_appkey.json). The bmp_token and the exact cert-hash combination are NOT static.
 - DIFFERENTIAL TEST VECTOR MUST BE LIVE: blocked on TASK-0022 (Frida hook) — capture (string-to-sign, sign) pairs on the user's device; do NOT self-derive the reference (circular, forbidden by TESTING.md). dep edge added.
 - The app-cert SHA-256 half can be computed offline from the APK signing cert if the combination order is learned (TASK-0023 Ghidra). Until then, treat the native sign as a black box validated against the captured vector.
+
+forward-carried from TASK-0005 review: Rust port traps — (1) string-to-sign segments are joined with literal '||' not '&' (pbbppqb.java:26-27); (2) ThingApiSignManager.java:161 SWALLOWS signer exceptions into a 'Exception Errorcode '+msg string — the Rust port must FAIL FAST instead of mirroring that silent fallback; (3) swapSignString = s[8:16]+s[0:8]+s[24:32]+s[16:24]. Differential vector comes from the live Frida hook (TASK-0022), not self-derived.
 <!-- SECTION:NOTES:END -->

@@ -151,8 +151,9 @@ Two independent sources: the literal constants AND the wiring that consumes them
   and the full AES table (`AES-128-GCM/CBC/CTR/...`), consistent with HMAC-SHA256 over
   the derived key. Labelled `likely` (not `confirmed`) because the exact native opcode
   sequence for cmd=1 was not disassembled to byte level — the routine is stripped
-  (static `nm` yields no `Sign`/`doCommand` symbol; only `JNI_OnLoad` is exported,
-  so natives are registered via `RegisterNatives` and the body is offset-only).
+  (static `nm -D` yields no Tuya *sign* symbol; the JNI natives are RegisterNatives-
+  registered so their bodies are offset-only — only mbedtls/crypto helpers and
+  `JNI_OnLoad` are named exports, 153 `T` symbols total, none of them the signer).
 
 ## What is and isn't statically reproducible (confidence: confirmed — scoping summary)
 

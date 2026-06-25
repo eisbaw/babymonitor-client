@@ -14,11 +14,12 @@ The candidate datacenter domains are shipped **encrypted** in the asset bundle
 `assets/thing_domains_v1/`, not as plaintext literals.
 
 - Two independent sources: (1) the on-disk asset
-  `decompiled/apktool/assets/thing_domains_v1/regions` is base64 over an
-  AES-ciphertext envelope — its leading base64 token decodes to a 48-hex-char key/IV
-  identifier (`4db6...dea2`) followed by `,` then base64 ciphertext; the sibling
-  `decompiled/apktool/assets/thing_domains_v1/pins` (cert-pin set) uses the same
-  envelope; and (2) the decrypt entrypoint `SecureNativeApi.getConfig(Context, String,
+  `decompiled/apktool/assets/thing_domains_v1/regions` decodes to a binary
+  ciphertext blob (~1940 bytes) whose head is a `4db6…` hex envelope header
+  followed by binary ciphertext (no commas, no plaintext host present); the sibling
+  `decompiled/apktool/assets/thing_domains_v1/pins` (cert-pin set, ~5743 bytes)
+  shares the same leading `4db6…` envelope header; and (2) the decrypt entrypoint
+  `SecureNativeApi.getConfig(Context, String,
   String)` is declared native at
   `decompiled/jadx/sources/com/thingclips/smart/security/jni/SecureNativeApi.java:22`,
   i.e. the config is decrypted at runtime inside `libthing_security*.so`.

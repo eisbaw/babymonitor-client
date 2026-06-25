@@ -366,45 +366,235 @@ fn read_u32(b: &[u8], at: usize) -> Result<u32, Error> {
     Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
-/// Extract the leaf X.509 certificate's DER bytes from a PKCS#7 SignedData blob.
+/// Extract the **leaf** (end-entity) X.509 certificate's DER bytes from a PKCS#7
+/// SignedData blob — the bytes Android returns as `signatures[0]`.
 ///
-/// A PKCS#7 SignedData carries the signing cert inside a `certificates [0]
-/// IMPLICIT` context tag, each cert a DER `SEQUENCE` (tag `0x30`). We find the
-/// first DER `SEQUENCE` whose declared length spans a self-consistent
-/// X.509-shaped structure (an inner `SEQUENCE` = tbsCertificate). This is a
-/// pragmatic extractor (no full ASN.1 parser); it errors loudly if it cannot
-/// find a plausible certificate rather than guessing.
+/// ## Structure navigated
+/// `ContentInfo ::= SEQUENCE { contentType OID, content [0] EXPLICIT SignedData }`
+/// and `SignedData ::= SEQUENCE { version, digestAlgorithms SET, contentInfo,
+/// certificates [0] IMPLICIT SET-OF-or-SEQUENCE-OF Certificate OPTIONAL, ... }`.
+/// We descend ContentInfo → SignedData, then locate the `certificates [0]`
+/// IMPLICIT context tag (`0xA0`) and enumerate the `Certificate` `SEQUENCE`s
+/// that live **inside that tag only** (NOT anywhere in the whole blob).
+///
+/// ## Leaf selection (the hardening — was: "first ≥64-byte SEQUENCE")
+/// A signer may embed a multi-cert chain (leaf + intermediates/root). Android's
+/// `signatures[0]` is the **end-entity** cert, not an arbitrary chain member.
+/// We therefore:
+///   * collect every cert SEQUENCE in the `[0]` block (each must have a
+///     cert-shaped inner: starts with a `SEQUENCE` = tbsCertificate);
+///   * if exactly ONE cert is present → it is the leaf;
+///   * if MORE than one → select the end-entity: the cert whose **subject DN**
+///     is NOT the **issuer DN** of any other cert in the set (a CA that signed a
+///     chain member is, by definition, not the leaf). If exactly one such cert
+///     exists, return it.
+///   * if the leaf cannot be determined unambiguously (zero or ≥2 candidates),
+///     **fail loud** with [`Error::CertHash`] rather than silently returning a
+///     wrong-but-plausible cert (which would yield a wrong-but-plausible hash).
+///
+/// ## Limitation (documented, not silent)
+/// DN comparison is done on the raw DER bytes of the issuer/subject `Name`
+/// fields (byte-equality), not canonicalised RFC 4518 string matching. For the
+/// chains we expect (self-signed single cert, or a leaf + distinctly-named CAs)
+/// byte-equality is correct; a pathological chain using two non-byte-identical
+/// encodings of the same DN could defeat it — in which case it errors loudly
+/// (≥2 leaf candidates) instead of guessing. A full ASN.1 + DN-canonicalisation
+/// parser is deliberately out of scope for this offline ingredient check.
 ///
 /// # Errors
-/// [`Error::CertHash`] if no certificate SEQUENCE is found.
+/// [`Error::CertHash`] if the PKCS#7 structure cannot be navigated, no
+/// certificate is present, or the leaf is ambiguous.
 pub fn extract_leaf_cert_der(pkcs7_der: &[u8]) -> Result<Vec<u8>, Error> {
-    // Walk top-level/any-level DER SEQUENCEs and return the first that parses as
-    // an X.509 cert shape: SEQUENCE { SEQUENCE(tbs) ... }. We scan for tag 0x30
-    // followed by a definite long-form length, then check the inner content
-    // starts with another 0x30 (tbsCertificate) — a strong signal for a cert vs
-    // the outer ContentInfo/SignedData sequences (which start with an OID 0x06).
-    let mut i = 0usize;
-    while i + 4 < pkcs7_der.len() {
-        if pkcs7_der[i] == 0x30 {
-            if let Some((content_start, content_len)) = der_length(pkcs7_der, i + 1) {
-                let end = content_start + content_len;
-                if end <= pkcs7_der.len() && content_len > 0 && pkcs7_der[content_start] == 0x30 {
-                    // Inner starts with SEQUENCE (tbsCertificate). Within an
-                    // X.509 cert the tbs is itself followed by an algorithm-id
-                    // SEQUENCE and a BIT STRING; require the whole thing be a
-                    // reasonable size to avoid matching tiny inner sequences.
-                    if content_len >= 64 {
-                        let total = end - i;
-                        return Ok(pkcs7_der[i..i + total].to_vec());
-                    }
-                }
-            }
+    let certs = collect_certificates(pkcs7_der)?;
+    match certs.len() {
+        0 => Err(Error::CertHash(
+            "no X.509 certificate found in PKCS#7 certificates [0] block".into(),
+        )),
+        1 => Ok(certs[0].to_vec()),
+        _ => select_leaf(&certs),
+    }
+}
+
+/// Navigate ContentInfo → SignedData → `certificates [0]` IMPLICIT and return the
+/// raw DER byte-slices of every `Certificate` SEQUENCE inside that tag.
+///
+/// We only parse enough structure to reach the `[0]` block, then enumerate the
+/// SEQUENCEs directly under it. Restricting the scan to the `[0]` block (rather
+/// than the whole blob, as the old code did) prevents matching the outer
+/// ContentInfo/SignedData/SignerInfo SEQUENCEs as if they were certificates.
+fn collect_certificates(pkcs7_der: &[u8]) -> Result<Vec<&[u8]>, Error> {
+    // ContentInfo = outer SEQUENCE.
+    let (ci_content, _) = der_tlv(pkcs7_der, 0, 0x30)
+        .ok_or_else(|| Error::CertHash("PKCS#7: outer ContentInfo SEQUENCE not found".into()))?;
+    // Skip contentType OID (0x06), then content [0] EXPLICIT (0xA0).
+    let after_oid = skip_tlv(pkcs7_der, ci_content, 0x06)
+        .ok_or_else(|| Error::CertHash("PKCS#7: contentType OID not found".into()))?;
+    let (c0_content, _) = der_tlv(pkcs7_der, after_oid, 0xA0)
+        .ok_or_else(|| Error::CertHash("PKCS#7: content [0] EXPLICIT tag not found".into()))?;
+    // SignedData = SEQUENCE inside content [0].
+    let (sd_content, sd_end) = der_tlv(pkcs7_der, c0_content, 0x30)
+        .ok_or_else(|| Error::CertHash("PKCS#7: SignedData SEQUENCE not found".into()))?;
+    // Walk SignedData members to find the certificates [0] IMPLICIT tag (0xA0).
+    // Members before it: version INTEGER (0x02), digestAlgorithms SET (0x31),
+    // encapContentInfo SEQUENCE (0x30). Scan TLVs until we hit 0xA0.
+    let mut p = sd_content;
+    while p < sd_end {
+        let tag = *pkcs7_der
+            .get(p)
+            .ok_or_else(|| Error::CertHash("PKCS#7: truncated SignedData".into()))?;
+        let (content, end) = der_length(pkcs7_der, p + 1)
+            .map(|(cs, cl)| (cs, cs + cl))
+            .ok_or_else(|| Error::CertHash("PKCS#7: bad length in SignedData".into()))?;
+        if end > pkcs7_der.len() {
+            return Err(Error::CertHash("PKCS#7: SignedData member OOB".into()));
         }
-        i += 1;
+        if tag == 0xA0 {
+            // certificates [0] IMPLICIT — enumerate cert SEQUENCEs within it.
+            return enumerate_cert_seqs(pkcs7_der, content, end);
+        }
+        p = end;
     }
     Err(Error::CertHash(
-        "no X.509 certificate SEQUENCE found in PKCS#7 block".into(),
+        "PKCS#7: no certificates [0] block in SignedData".into(),
     ))
+}
+
+/// Enumerate top-level `Certificate` SEQUENCEs (tag `0x30`) in `[lo, hi)`, each
+/// validated to be cert-shaped (inner starts with a tbsCertificate SEQUENCE and
+/// is a plausible size).
+fn enumerate_cert_seqs(der: &[u8], lo: usize, hi: usize) -> Result<Vec<&[u8]>, Error> {
+    let mut out = Vec::new();
+    let mut p = lo;
+    while p < hi {
+        if der.get(p) != Some(&0x30) {
+            // Not a SEQUENCE (e.g. an attribute-cert [1] / CRL); stop at the
+            // first non-SEQUENCE to avoid mis-parsing trailing structures.
+            break;
+        }
+        let (content_start, content_len) = der_length(der, p + 1)
+            .ok_or_else(|| Error::CertHash("cert SEQUENCE: bad length".into()))?;
+        let end = content_start + content_len;
+        if end > hi {
+            return Err(Error::CertHash(
+                "cert SEQUENCE: length exceeds block".into(),
+            ));
+        }
+        // Cert shape: inner must start with the tbsCertificate SEQUENCE, and be
+        // a reasonable size (a real cert is well over 64 bytes).
+        if content_len >= 64 && der.get(content_start) == Some(&0x30) {
+            out.push(&der[p..end]);
+        }
+        p = end;
+    }
+    Ok(out)
+}
+
+/// Select the end-entity (leaf) cert from a multi-cert chain: the one whose
+/// subject DN is not the issuer DN of any other cert. Fails loud if zero or ≥2
+/// candidates qualify (ambiguous → do not guess).
+fn select_leaf(certs: &[&[u8]]) -> Result<Vec<u8>, Error> {
+    // For each cert, extract (issuer_dn, subject_dn) as raw DER byte-slices.
+    let names: Vec<(&[u8], &[u8])> = certs
+        .iter()
+        .map(|c| cert_issuer_subject(c))
+        .collect::<Result<_, _>>()?;
+    let issuers: Vec<&[u8]> = names.iter().map(|(i, _)| *i).collect();
+    let leaves: Vec<usize> = names
+        .iter()
+        .enumerate()
+        .filter(|(idx, (_, subject))| {
+            // Leaf := its subject is not the issuer of any OTHER cert.
+            !issuers
+                .iter()
+                .enumerate()
+                .any(|(j, iss)| j != *idx && iss == subject)
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    match leaves.as_slice() {
+        [only] => Ok(certs[*only].to_vec()),
+        [] => Err(Error::CertHash(
+            "PKCS#7 chain: no end-entity cert (every subject is an issuer — a cycle?)".into(),
+        )),
+        many => Err(Error::CertHash(format!(
+            "PKCS#7 chain: {} candidate leaf certs — ambiguous, refusing to guess",
+            many.len()
+        ))),
+    }
+}
+
+/// Extract the raw DER of a cert's `issuer` and `subject` `Name` fields.
+///
+/// `Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature }`;
+/// `tbsCertificate ::= SEQUENCE { [0] version OPTIONAL, serialNumber INTEGER,
+/// signature AlgId SEQUENCE, issuer Name, validity SEQUENCE, subject Name, ... }`.
+/// We descend into tbs, skip the optional `[0]` version, serial, the inner
+/// AlgId SEQUENCE, take `issuer` (next SEQUENCE), skip `validity`, take `subject`.
+fn cert_issuer_subject(cert: &[u8]) -> Result<(&[u8], &[u8]), Error> {
+    // Descend the outer Certificate SEQUENCE to its content, then into the
+    // first member = tbsCertificate SEQUENCE, then walk tbs fields.
+    let (cert_content, _) = der_tlv(cert, 0, 0x30)
+        .ok_or_else(|| Error::CertHash("cert: outer SEQUENCE not found".into()))?;
+    let (tbs, _) = der_tlv(cert, cert_content, 0x30)
+        .ok_or_else(|| Error::CertHash("cert: tbsCertificate not found".into()))?;
+    let mut p = tbs;
+    // Optional version [0] EXPLICIT (0xA0): skip if present.
+    if cert.get(p) == Some(&0xA0) {
+        p = skip_any_tlv(cert, p).ok_or_else(|| Error::CertHash("cert: bad version tag".into()))?;
+    }
+    // serialNumber INTEGER.
+    p = skip_tlv(cert, p, 0x02).ok_or_else(|| Error::CertHash("cert: serial not found".into()))?;
+    // signature AlgorithmIdentifier SEQUENCE.
+    p = skip_tlv(cert, p, 0x30).ok_or_else(|| Error::CertHash("cert: sig-alg not found".into()))?;
+    // issuer Name (SEQUENCE).
+    let issuer = der_full_tlv(cert, p, 0x30)
+        .ok_or_else(|| Error::CertHash("cert: issuer Name not found".into()))?;
+    p = skip_tlv(cert, p, 0x30).ok_or_else(|| Error::CertHash("cert: issuer skip".into()))?;
+    // validity SEQUENCE — skip.
+    p = skip_tlv(cert, p, 0x30)
+        .ok_or_else(|| Error::CertHash("cert: validity not found".into()))?;
+    // subject Name (SEQUENCE).
+    let subject = der_full_tlv(cert, p, 0x30)
+        .ok_or_else(|| Error::CertHash("cert: subject Name not found".into()))?;
+    Ok((issuer, subject))
+}
+
+/// Read a TLV at `at` expecting `tag`; return `(content_start, content_end)`.
+fn der_tlv(b: &[u8], at: usize, tag: u8) -> Option<(usize, usize)> {
+    if *b.get(at)? != tag {
+        return None;
+    }
+    let (cs, cl) = der_length(b, at + 1)?;
+    let end = cs + cl;
+    if end <= b.len() {
+        Some((cs, end))
+    } else {
+        None
+    }
+}
+
+/// Like [`der_tlv`] but return the FULL TLV byte-slice (tag+len+content).
+fn der_full_tlv(b: &[u8], at: usize, tag: u8) -> Option<&[u8]> {
+    let (_cs, end) = der_tlv(b, at, tag)?;
+    Some(&b[at..end])
+}
+
+/// Skip one TLV at `at` expecting `tag`; return the offset just past it.
+fn skip_tlv(b: &[u8], at: usize, tag: u8) -> Option<usize> {
+    let (_cs, end) = der_tlv(b, at, tag)?;
+    Some(end)
+}
+
+/// Skip one TLV at `at` regardless of tag; return the offset just past it.
+fn skip_any_tlv(b: &[u8], at: usize) -> Option<usize> {
+    b.get(at)?; // tag must exist
+    let (cs, cl) = der_length(b, at + 1)?;
+    let end = cs + cl;
+    if end <= b.len() {
+        Some(end)
+    } else {
+        None
+    }
 }
 
 /// Decode a DER definite-length field starting at `at` (the length byte).
@@ -622,6 +812,84 @@ impl<P: BmpTokenProvider> Signer<P> {
 mod tests {
     use super::*;
 
+    // ── DER test builders ──────────────────────────────────────────────────
+    //
+    // Minimal helpers to assemble SYNTHETIC but structurally-valid PKCS#7
+    // SignedData blobs so the hardened extractor (which now navigates the real
+    // ContentInfo → SignedData → certificates [0] structure) can be exercised
+    // without the real (secret) cert. All bytes here are non-secret fixtures.
+
+    /// Wrap `content` in a DER TLV with the given `tag`, definite length.
+    fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let len = content.len();
+        if len < 0x80 {
+            out.push(len as u8);
+        } else {
+            // Long form: minimal number of length bytes.
+            let bytes = len.to_be_bytes();
+            let first = bytes.iter().position(|&b| b != 0).unwrap();
+            let n = bytes.len() - first;
+            out.push(0x80 | n as u8);
+            out.extend_from_slice(&bytes[first..]);
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    /// Build a minimal X.509-shaped cert SEQUENCE with the given issuer/subject
+    /// DN payloads (raw bytes inside the Name SEQUENCE). Padded so the cert is
+    /// >= 64 content bytes (the extractor's plausibility guard).
+    fn fake_cert(issuer_dn: &[u8], subject_dn: &[u8]) -> Vec<u8> {
+        let version = tlv(0xA0, &tlv(0x02, &[0x02])); // [0] { INTEGER 2 } (v3)
+        let serial = tlv(0x02, &[0x01]);
+        let sigalg = tlv(0x30, &tlv(0x06, &[0x2A]));
+        let issuer = tlv(0x30, issuer_dn);
+        let validity = tlv(0x30, &[]);
+        let subject = tlv(0x30, subject_dn);
+        // Padding to push tbs (and thus the cert) well past 64 bytes.
+        let spki = tlv(0x30, &[0xAB; 80]);
+        let mut tbs_body = Vec::new();
+        for part in [
+            &version, &serial, &sigalg, &issuer, &validity, &subject, &spki,
+        ] {
+            tbs_body.extend_from_slice(part);
+        }
+        let tbs = tlv(0x30, &tbs_body);
+        let sig = tlv(0x03, &[0x00, 0xFF]); // BIT STRING
+        let mut cert_body = tbs.clone();
+        cert_body.extend_from_slice(&sigalg);
+        cert_body.extend_from_slice(&sig);
+        tlv(0x30, &cert_body)
+    }
+
+    /// Assemble a minimal PKCS#7 SignedData ContentInfo carrying `certs` in the
+    /// `certificates [0]` IMPLICIT block.
+    fn fake_pkcs7(certs: &[Vec<u8>]) -> Vec<u8> {
+        let version = tlv(0x02, &[0x01]);
+        let digest_algs = tlv(0x31, &[]);
+        let encap = tlv(0x30, &tlv(0x06, &[0x2A])); // pkcs7-data-ish
+        let mut cert_block = Vec::new();
+        for c in certs {
+            cert_block.extend_from_slice(c);
+        }
+        let certificates = tlv(0xA0, &cert_block); // certificates [0] IMPLICIT
+        let signer_infos = tlv(0x31, &[]);
+        let mut sd_body = Vec::new();
+        for part in [&version, &digest_algs, &encap, &certificates, &signer_infos] {
+            sd_body.extend_from_slice(part);
+        }
+        let signed_data = tlv(0x30, &sd_body);
+        let content_0 = tlv(0xA0, &signed_data); // content [0] EXPLICIT
+        let content_type = tlv(
+            0x06,
+            &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02],
+        );
+        let mut ci_body = content_type;
+        ci_body.extend_from_slice(&content_0);
+        tlv(0x30, &ci_body) // ContentInfo
+    }
+
     // ── Sub-step 1: swapSignString ─────────────────────────────────────────
     //
     // Known-vector: a constructed 32-char input lets us assert the EXACT
@@ -768,21 +1036,13 @@ mod tests {
 
     // ── Sub-step 5: cert SHA-256 extraction (synthetic DER) ────────────────
     //
-    // Build a minimal PKCS#7-shaped buffer: a SEQUENCE wrapping an inner cert
-    // SEQUENCE that itself starts with a tbs SEQUENCE >= 64 bytes. This proves
-    // the extractor + hash without needing the real (secret) cert.
+    // Build a structurally-valid synthetic PKCS#7 SignedData and prove the
+    // hardened extractor recovers the exact embedded cert SEQUENCE bytes — no
+    // real (secret) cert needed.
     #[test]
-    fn extract_leaf_cert_der_finds_cert_sequence() {
-        // Inner cert: SEQUENCE(len=70) { SEQUENCE(len=68){ 68 bytes... } }
-        let tbs_body = vec![0xABu8; 68];
-        let mut tbs = vec![0x30, 68];
-        tbs.extend_from_slice(&tbs_body); // tbs SEQUENCE, len 68 -> total 70
-        let mut cert = vec![0x30, tbs.len() as u8];
-        cert.extend_from_slice(&tbs); // cert SEQUENCE wrapping tbs
-                                      // Wrap in an outer "pkcs7-ish" SEQUENCE preceded by some OID noise.
-        let mut blob = vec![0x06, 0x09, 1, 2, 3, 4, 5, 6, 7, 8, 9]; // an OID to skip
-        blob.extend_from_slice(&cert);
-
+    fn extract_leaf_cert_der_finds_single_cert() {
+        let cert = fake_cert(b"ISS", b"SUB");
+        let blob = fake_pkcs7(std::slice::from_ref(&cert));
         let extracted = extract_leaf_cert_der(&blob).unwrap();
         assert_eq!(
             extracted, cert,
@@ -790,17 +1050,42 @@ mod tests {
         );
     }
 
+    // Multi-cert chain: leaf (subject=LEAF, issued by CA) + CA (self-signed).
+    // The extractor must pick the LEAF (its subject is no other cert's issuer),
+    // NOT the first SEQUENCE — this is the AC#1 multi-cert hardening.
+    #[test]
+    fn extract_leaf_cert_der_picks_leaf_in_chain() {
+        let ca = fake_cert(b"CA", b"CA"); // self-signed root
+        let leaf = fake_cert(b"CA", b"LEAF"); // issued by CA
+                                              // Put the CA FIRST so the old "first SEQUENCE" path would mis-pick it.
+        let blob = fake_pkcs7(&[ca.clone(), leaf.clone()]);
+        let extracted = extract_leaf_cert_der(&blob).unwrap();
+        assert_eq!(
+            extracted, leaf,
+            "must select the end-entity (leaf), not the CA"
+        );
+        assert_ne!(extracted, ca, "must NOT pick the CA that signed the chain");
+    }
+
+    // Ambiguous chain (two unrelated self-signed certs → two leaf candidates):
+    // must FAIL LOUD, never silently pick one.
+    #[test]
+    fn extract_leaf_cert_der_fails_loud_on_ambiguous_chain() {
+        let a = fake_cert(b"AAA", b"AAA");
+        let b = fake_cert(b"BBB", b"BBB");
+        let blob = fake_pkcs7(&[a, b]);
+        let err = extract_leaf_cert_der(&blob).unwrap_err();
+        assert!(
+            matches!(&err, Error::CertHash(m) if m.contains("ambiguous")),
+            "ambiguous chain must error, got {err:?}"
+        );
+    }
+
     #[test]
     fn app_cert_sha256_hex_is_64_lowercase_hex() {
-        // Same synthetic cert as above; we only assert SHAPE (64 lowercase hex),
-        // never a real value.
-        let tbs_body = vec![0xABu8; 68];
-        let mut tbs = vec![0x30, 68];
-        tbs.extend_from_slice(&tbs_body);
-        let mut cert = vec![0x30, tbs.len() as u8];
-        cert.extend_from_slice(&tbs);
-
-        let digest = app_cert_sha256_hex(&cert).unwrap();
+        let cert = fake_cert(b"ISS", b"SUB");
+        let blob = fake_pkcs7(std::slice::from_ref(&cert));
+        let digest = app_cert_sha256_hex(&blob).unwrap();
         assert_eq!(digest.len(), 64);
         assert!(digest
             .chars()
@@ -933,6 +1218,133 @@ mod tests {
         assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
         // NB: the value itself is a secret-by-policy identifier — never assert
         // or print it here.
+    }
+
+    // AC#1 CROSS-CHECK (the honesty fix): our pure-Rust extractor's cert digest
+    // MUST equal an INDEPENDENT reference computed by `openssl` over the same
+    // META-INF/BNDLTOOL.RSA. The reference is deliberately NOT the misleading
+    // `openssl x509 -outform DER` RE-ENCODE path; it is `openssl asn1parse
+    // -strparse <off>` which lifts the RAW embedded leaf-cert SEQUENCE bytes
+    // verbatim — i.e. exactly Android's `signatures[0]` semantics (the cycle-14
+    // review established the raw embedded SEQUENCE is the correct reference).
+    //
+    // The reference command, end to end (all offline, no device):
+    //   1. unzip META-INF/BNDLTOOL.RSA from the APK            (zip reader)
+    //   2. openssl asn1parse -inform DER -in RSA               (find cert offset)
+    //         → the `certificates [0]` leaf SEQUENCE offset
+    //   3. openssl asn1parse -inform DER -strparse <off> -out  (raw cert bytes)
+    //   4. sha256 of those raw bytes
+    // and we assert_eq! it against app_cert_sha256_hex_from_apk(apk).
+    //
+    // The hash VALUE is WITHHELD: we compare two computed digests, never print
+    // or hardcode it (CLAUDE.md: the cert hash is a secret-by-policy id).
+    //
+    // #[ignore]d: needs the gitignored APK AND an `openssl` binary on PATH (both
+    // present under nix-shell). Run via `just cert-crosscheck` or
+    // `cargo test ... real_app_cert_matches_openssl_reference -- --ignored`.
+    #[test]
+    #[ignore = "needs the gitignored APK + an openssl binary on PATH; run via \
+                `just cert-crosscheck` to differentially validate the extractor"]
+    fn real_app_cert_matches_openssl_reference() {
+        use std::process::Command;
+
+        let apk = std::path::Path::new("../../extracted/xapk/com.philips.ph.babymonitorplus.apk");
+        if !apk.exists() {
+            panic!("APK not extracted at {}", apk.display());
+        }
+
+        // ── Our path: pure-Rust extractor over the real APK. ────────────────
+        let ours = app_cert_sha256_hex_from_apk(apk).expect("rust cert digest from APK");
+
+        // ── Reference path: openssl over the raw embedded leaf cert. ─────────
+        // 1) Lift the PKCS#7 block out of the APK with our (already-tested) zip
+        //    reader, write it to a temp file for openssl to read.
+        let apk_bytes = std::fs::read(apk).expect("read APK");
+        let pkcs7 = find_signature_block_in_zip(&apk_bytes).expect("PKCS#7 block from APK");
+        let tmp = std::env::temp_dir().join("task0031_bndltool.p7");
+        std::fs::write(&tmp, &pkcs7).expect("write temp PKCS#7");
+
+        // 2) asn1parse to find the leaf Certificate SEQUENCE byte offset. The
+        //    leaf is the FIRST `cons: SEQUENCE` at depth d=4 (inside the
+        //    `cont [0]` certificates block at d=3). We parse the offset column.
+        let parse = Command::new("openssl")
+            .args(["asn1parse", "-inform", "DER", "-in"])
+            .arg(&tmp)
+            .output()
+            .expect("run openssl asn1parse (is openssl on PATH?)");
+        assert!(
+            parse.status.success(),
+            "openssl asn1parse failed: {}",
+            String::from_utf8_lossy(&parse.stderr)
+        );
+        let listing = String::from_utf8(parse.stdout).expect("asn1parse utf8");
+        let cert_off = leaf_cert_offset_from_asn1parse(&listing)
+            .expect("locate leaf cert SEQUENCE offset in asn1parse output");
+
+        // 3) -strparse <off> extracts the RAW DER of that SEQUENCE (no re-encode).
+        let raw_cert = std::env::temp_dir().join("task0031_leaf.der");
+        let strparse = Command::new("openssl")
+            .args(["asn1parse", "-inform", "DER", "-in"])
+            .arg(&tmp)
+            .args(["-strparse", &cert_off.to_string(), "-noout", "-out"])
+            .arg(&raw_cert)
+            .output()
+            .expect("run openssl asn1parse -strparse");
+        assert!(
+            strparse.status.success(),
+            "openssl -strparse failed: {}",
+            String::from_utf8_lossy(&strparse.stderr)
+        );
+
+        // 4) SHA-256 the raw embedded cert bytes = the independent reference.
+        let ref_bytes = std::fs::read(&raw_cert).expect("read raw leaf cert");
+        let reference = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&ref_bytes);
+            hex::encode(h.finalize())
+        };
+
+        // Cleanup temp artifacts (best-effort).
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&raw_cert);
+
+        // ── The differential assertion. VALUE WITHHELD. ─────────────────────
+        assert_eq!(
+            ours, reference,
+            "Rust extractor digest must equal the independent openssl \
+             raw-embedded-leaf reference (Android signatures[0] semantics). \
+             [values intentionally not printed]"
+        );
+    }
+
+    /// Parse `openssl asn1parse` output and return the byte offset of the leaf
+    /// X.509 `Certificate` SEQUENCE — the first `cons: SEQUENCE` whose inner
+    /// content is itself a SEQUENCE (tbsCertificate) of cert size. We pick the
+    /// FIRST depth-4 (`d=4`) constructed SEQUENCE following the `cont [ 0 ]`
+    /// certificates block; in a multi-cert chain that is the leaf only when it
+    /// is listed first, but for THIS single-cert APK there is exactly one. The
+    /// Rust extractor (not this helper) owns multi-cert leaf selection; this
+    /// reference just needs the one embedded cert's raw bytes.
+    fn leaf_cert_offset_from_asn1parse(listing: &str) -> Option<usize> {
+        // Find the certificates `cont [ 0 ]` line at depth d=3, then the next
+        // `d=4 ... cons: SEQUENCE`. Lines look like:
+        //   "   56:d=3  hl=4 l= 962 cons: cont [ 0 ]"
+        //   "   60:d=4  hl=4 l= 958 cons: SEQUENCE"
+        let mut in_certs = false;
+        for line in listing.lines() {
+            let is_cont0 = line.contains("d=3") && line.contains("cont [ 0 ]");
+            if is_cont0 {
+                in_certs = true;
+                continue;
+            }
+            if in_certs && line.contains("d=4") && line.contains("cons: SEQUENCE") {
+                // Offset is the integer before the first ':'.
+                let off_str = line.split(':').next()?.trim();
+                return off_str.parse::<usize>().ok();
+            }
+        }
+        None
     }
 
     // FULL byte-for-byte differential (AC#1): blocked on the real bmp_token

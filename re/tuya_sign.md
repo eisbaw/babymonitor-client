@@ -87,6 +87,17 @@ sorted-params → MD5 → swap → native-keyed-sign pipeline.
    `swapSignString( MD5Util.md5AsBase64(str) )`. So the POST body is folded into the
    string-to-sign as a swapped MD5-base64, not raw.
 
+   > **CAVEAT (OPEN — body-digest length 24-vs-32).** `md5AsBase64` of a 16-byte
+   > MD5 yields **24** base64 chars, but `swapSignString`'s slices (§3 below)
+   > assume a **32**-char input — so the `postData` sign path as transcribed
+   > cannot be exercised end-to-end. EITHER `md5AsBase64` here uses a different
+   > (no-pad/hex-ish 32-char) encoding, OR the slice indices differ for postData.
+   > This is unresolved until a **gold vector** pins it; the Rust
+   > `post_data_digest` returns a typed error on non-32 input rather than emitting
+   > a wrong digest (see its rustdoc in `babymonitor/babymonitor-core/src/sign.rs`).
+   > The postData sign path is therefore unexercised/untrusted until that vector
+   > lands (TASK-0032 / a live capture).
+
 3. **swapSignString(s)** — byte permutation of a 32-char MD5-base64
    (`ThingApiSignManager.swapSignString` ~:524, exact slices ~:567-571):
    given `s`, let `A=s[0:8]`, `B=s[8:24]`, `B1=B[0:8]`, `B2=B[8:16]`, `C=s[24:32]`;

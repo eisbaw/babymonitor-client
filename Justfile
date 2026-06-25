@@ -64,6 +64,21 @@ assert-offline:
     cargo test --manifest-path {{MANIFEST}} --offline -- --include-ignored --list >/dev/null
     @echo "assert-offline: OK (test binaries build & enumerate with --offline; no network)"
 
+# Differentially validate the app-cert digest: the pure-Rust extractor MUST
+# match an independent `openssl asn1parse -strparse` reference over the raw
+# embedded leaf cert (needs the gitignored APK + openssl; value withheld).
+[group('test')]
+cert-crosscheck:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=$(cargo test --manifest-path {{MANIFEST}} -p babymonitor-core \
+        sign::tests::real_app_cert_matches_openssl_reference -- --ignored --exact 2>&1)
+    echo "$out"
+    # Guard against a false-green: the filter MUST have actually run the test.
+    echo "$out" | grep -q "1 passed" \
+        || { echo "cert-crosscheck: test did not run (filter mismatch)"; exit 1; }
+    echo "cert-crosscheck: OK (Rust extractor == openssl raw-embedded reference)"
+
 # Run the CLI. Pass args after `--`, e.g. `just run info --json`.
 [group('run')]
 run *ARGS:

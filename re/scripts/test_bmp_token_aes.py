@@ -94,8 +94,8 @@ class TestPipeline(unittest.TestCase):
     @unittest.skipUnless(os.path.exists(os.path.join(ASSETS, "t_s.bmp")),
                          "assets not extracted")
     def test_decode_is_deterministic(self):
-        a = M.decode_bmp_token(ASSETS)
-        b = M.decode_bmp_token(ASSETS)
+        a = M.decode_cert_pinning_config(ASSETS)
+        b = M.decode_cert_pinning_config(ASSETS)
         self.assertEqual(a, b)
         self.assertEqual(len(a), 226)
 
@@ -106,7 +106,7 @@ class TestPipeline(unittest.TestCase):
         # cert-pinning config {"securityOpen": bool, "data": [pin, pin]}. Getting
         # valid JSON out of AES-CBC is essentially impossible with a wrong
         # key/iv/mode -- this jointly validates cipher + key + iv + truncation.
-        tok = M.decode_bmp_token(ASSETS)
+        tok = M.decode_cert_pinning_config(ASSETS)
         self.assertTrue(all(32 <= b < 127 for b in tok), "plaintext must be printable")
         obj = json.loads(tok.decode("ascii"))
         self.assertIn("securityOpen", obj)

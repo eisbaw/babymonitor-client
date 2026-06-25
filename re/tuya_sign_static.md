@@ -162,14 +162,19 @@ AND F1's `[cert_sha256]_[bmp_token]_[appSecret]`.
 
 ## 5. t_s.bmp token decode = imath bignum + matrix (THE residual blocker) (confidence: confirmed)
 
-> **CORRECTION (TASK-0029, supersedes the "imath matrix" hypothesis below).** Deeper
-> disassembly of the BMP decode driver (`libthing_security.so@0x1a030`) shows the
-> imath/matrix path decodes the *SDK-config blob* (asset `tecrkcehc`), NOT `t_s.bmp`.
-> The actual `t_s.bmp` token is produced by a **white-box table cipher**
-> (`libthing_security.so@0x11658`), a different (harder) residual. Full analysis,
-> evidence, and the verifiable port live in `re/bmp_token_decode.md`
-> (`Decode: partially-ported`). The paragraphs below are retained as the original
-> spike reasoning but are revised by that doc.
+> **NOTE (TASK-0030, REINSTATES the imath-matrix model below).** An intermediate
+> TASK-0029 "correction" claimed the imath/matrix path decodes only the SDK-config
+> blob and that `t_s.bmp` is decoded by a separate white-box cipher. **Both halves of
+> that were wrong** and are retracted:
+> (1) `fcn.11658` is **standard AES-128-CBC** (not a white-box); its output is the
+>     **TLS cert-pinning config**, keyed by MD5(`t_s.bmp`) — `re/bmp_token_whitebox.md`.
+> (2) `t_s.bmp` has **TWO** code xrefs; the second (`fcn.13b5c` @ `0x13bf0`, on the
+>     cmd=1 sign path) reads the raw `t_s.bmp` bytes and feeds them as the key material
+>     to `read_keys_from_content` → the imath matrix (`fcn.5eb0`). So the matrix below
+>     **IS** the `t_s.bmp` token decode — the original model in this section is
+>     CORRECT. See `re/bmp_token_whitebox.md` §6/§8 for the JOB-1 trace. The paragraphs
+>     below stand, with addresses now corroborated; the residual remains the un-ported
+>     bignum + matrix.
 
 Two independent sources: the SignFileDecoder asset-read in `libthing_security.so` AND
 the imath/matrix exports of `libthing_security_algorithm.so`.

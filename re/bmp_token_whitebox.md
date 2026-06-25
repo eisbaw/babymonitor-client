@@ -32,12 +32,27 @@ FIPS-197 known-answer cross-check (`github.com/usnistgov/ACVP`) reproduced in
   yields **well-formed JSON** (a near-impossible-by-chance structural oracle — a
   wrong key/IV/mode produces garbage).
 - **Caveat (the honest part):** the decrypted blob is the **TLS cert-pinning config**
-  `{"securityOpen": bool, "data": [sha256_pin_1, sha256_pin_2]}`, NOT obviously the
-  request-signer's `bmp_token`. `t_s.bmp` has exactly ONE consumer in the lib (this
-  AES path), so the prior model of a *separate* "t_s.bmp → sign token" decode is not
-  supported by the disassembly. The mapping from this output to the signer's middle
-  `_`-part is the residual (§6). The signer (TASK-0012) is therefore **not yet
-  offline-unblocked** by a confirmed token — see the feed-forward.
+  `{"securityOpen": bool, "data": [sha256_pin_1, sha256_pin_2]}`, NOT the
+  request-signer's `bmp_token`. This AES path is **one of TWO** `t_s.bmp` consumers
+  (see the ERRATUM below); the OTHER consumer (`fcn.13b5c`, on the cmd=1 sign path)
+  is the one that produces the signer's middle `_`-part, via the imath-bignum + matrix
+  decode in `libthing_security_algorithm.so` (JOB-1, TASK-0030, §6). So the
+  AES/cert-pinning finding stands, AND the signer's `bmp_token` lives on a separate,
+  still-unported path. The signer (TASK-0012) is therefore **not yet offline-unblocked
+  by a *confirmed value*** — but the path IS statically characterized end-to-end
+  (deterministic, device-independent); see §6 + the feed-forward.
+
+> **ERRATUM (TASK-0030, this revision).** An earlier version of this doc (and the
+> commit-`5967f77` message) claimed `t_s.bmp` has **exactly ONE** code xref (the AES
+> path) and concluded the "separate t_s.bmp → sign token" model was unsupported. That
+> was **WRONG**, caused by an un-analysed `axt`. `r2 axt @ str.t_s.bmp` (relocs
+> applied) returns **TWO** code xrefs: (1) `0x19a64` in `fcn.199d8` — the AES
+> cert-pinning path (correct), and (2) `0x13bf0` in `fcn.13b5c` — a raw-bytes reader
+> called from `doCommandNative` (`fcn.13ef4`) at `0x1466c`, ON the cmd=1 sign path.
+> There is also a `t_s_daily.bmp` sibling string (`0x912b`, ref `0x13bfc` in the same
+> `fcn.13b5c`), runtime-selected by a boolean flag. So `t_s.bmp` **does** feed the
+> sign path — corroborating, not undermining, the F1 model. The single-xref claim is
+> retracted.
 
 ---
 
@@ -120,8 +135,8 @@ S-boxes from this committed dump, NOT from the gitignored `.so` at runtime.
 
 Two independent sources: the decrypted output of the real `assets/tecrkcehc_ext` (valid
 JSON, asserted in `re/scripts/test_bmp_token_aes.py`) AND the lib's own interned JSON
-keys `libthing_security.so@0x8dc2` ("securityOpen") / the single `t_s.bmp` xref @0x19a64.
-(The signer-mapping question in the bullets is the OPEN part — no static oracle, flagged.)
+keys `libthing_security.so@0x8dc2` ("securityOpen"). (`t_s.bmp` has TWO xrefs, not one —
+see the ERRATUM in Status; this AES path is the `0x19a64` one.)
 
 Decrypting the real `tecrkcehc_ext` yields valid JSON:
 `{"securityOpen": <bool>, "data": ["<sha256-fingerprint>", "<sha256-fingerprint>"]}`
@@ -130,20 +145,33 @@ where each `data` entry is a 95-char colon-separated SHA-256 fingerprint (32 hex
 
 Consequences for the request signer (TASK-0012):
 
-- `t_s.bmp`'s ONLY xref in `libthing_security.so` is `0x19a64` (this AES path). There
-  is **no separate "t_s.bmp → sign token" decode**; the prior model (a distinct
-  white-box token producer) is **not supported** by the disassembly.
-- So the signer's middle `_`-part ("bmp_token", per nalajcie `cert_sha256 _ token _
-  appSecret`) is **one of these decrypted artifacts** — most plausibly a `data[]`
-  cert-fingerprint or `securityOpen` — OR the original signer decomposition
-  (`re/tuya_sign_static.md` §7) over-split the key. This cannot be disambiguated
-  statically: the only true oracle is the end-to-end Tuya sign-accept (a single live
-  signed request), which is OUT OF SCOPE here.
+- `t_s.bmp` has **TWO** consumers (ERRATUM): the AES cert-pinning path (`0x19a64`,
+  this doc) AND the sign path (`fcn.13b5c` @ `0x13bf0`, called from `doCommandNative`
+  @ `0x1466c`). The cert-pinning blob this AES path produces is **NOT** the signer's
+  `bmp_token`. The F1 model (`cert_sha256 _ bmp_token _ appSecret`) is therefore
+  **CORROBORATED**, not undermined.
+- The signer's middle `_`-part is produced on the sign path: `fcn.13b5c` reads the
+  **raw `t_s.bmp` bytes** (a verbatim `std::string` of the BMP file — no MD5/base64),
+  which `doCommandNative` then passes as the key-material argument (`x3`) to
+  `read_keys_from_content` (`libthing_security_algorithm.so@0x4974`).
+  `read_keys_from_content` validates the BMP header (`fcn.4a34`), takes the **pixel
+  array from offset 54** (`bmp+0x36`), and uses it to drive the **imath-bignum +
+  matrix** deobfuscation (`fcn.4b28` → `fcn.5138`/`fcn.54f4` → matrix `fcn.5eb0`,
+  "inited matrix:") that decodes the SDK-config blob into the labelled key list, which
+  then feeds the cmd=1 MD5 key-builder (`fcn.13474`). Full JOB-1 trace below in §8.
+- **BmpToken: partially (statically-recoverable-in-principle, not yet ported).** The
+  decode is fully **deterministic and device-independent** — it depends only on the
+  static `t_s.bmp` pixels + the static config blob + the embedded matrix constants,
+  with no runtime/network input. So it CAN be ported offline, but doing so requires
+  porting the imath bignum + the matrix `transform` (the same residual already
+  characterized in `re/tuya_sign_static.md` §5). This is the original F1 "imath
+  matrix" model — now confirmed to be on the t_s.bmp sign path.
 
-**What WOULD validate the end-to-end signer offline:** one captured/accepted live
-sign (the TASK-0012 AC#3 contingency). With that single vector, the middle `_`-part
-is pinned in one place (`sign::tests::full_signature_byte_parity_pending_task_0030`),
-and the `SignBody` / postData ambiguities resolve simultaneously.
+**What WOULD shortcut the port:** one captured/accepted live sign (the TASK-0012 AC#3
+contingency) pins the middle `_`-part in one place
+(`sign::tests::full_signature_byte_parity_pending_task_0030`) and resolves the
+`SignBody`/postData ambiguities simultaneously — cheaper than the bignum/matrix port,
+but the port is the fully-static route.
 
 ## 7. Port + validation summary (confidence: confirmed)
 
@@ -161,7 +189,67 @@ Two independent sources: the per-claim disassembly anchors in the table below
 | ciphertext = b64-decode(ext body) | fcn.19cf0 → fcn.196bc → fcn.2e7b0; 256 bytes; §1 | confirmed |
 | AES core correct | FIPS-197 KAT passes; `.so` S-box byte-match; clean-JSON oracle | confirmed |
 | decrypted blob = cert-pin JSON | `{"securityOpen",…,"data":[2×sha256]}`; §6 | confirmed |
-| blob == signer's bmp_token | NO static oracle (needs a live sign) | **open** |
+| blob == signer's bmp_token | NO — they are on different `t_s.bmp` consumers (ERRATUM, §6, §8) | confirmed |
+| signer bmp_token = raw-`t_s.bmp` → imath matrix decode | `fcn.13b5c`→`read_keys_from_content`→matrix `fcn.5eb0`; §8 | confirmed |
+| signer bmp_token ported offline | imath bignum + matrix un-ported (deterministic, device-independent) | **partially** |
 
-Decode: fully-ported-validated (cipher) / signer-token-mapping-open (needs a live
-sign-accept; see §6).
+Decode (cert-pinning AES path): fully-ported-validated. BmpToken (signer middle
+`_`-part): partially (statically-recoverable-in-principle; imath-bignum + matrix
+un-ported) — see §8.
+
+## 8. JOB-1: the SECOND `t_s.bmp` consumer — the sign path (confidence: confirmed)
+
+Two independent sources: the instruction-level disassembly of `fcn.13b5c`,
+`doCommandNative` (`fcn.13ef4`), and `read_keys_from_content`
+(`libthing_security_algorithm.so@0x4974`) cited inline, AND the on-disk `t_s.bmp`
+(22554 bytes, `BM` magic, `bfOffBits`=54, 24bpp) whose header exactly satisfies the
+validator `fcn.4a34`'s checks.
+
+**`fcn.13b5c` returns the RAW `t_s.bmp` bytes (no transform):**
+- `Context.getAssets()` (JNI, `@0x13bb0` "getAssets") → `AAssetManager_fromJava`
+  (`@0x13be8`).
+- Asset name select (`@0x13bf4`): `tst w20, 1` ; `csel x1, x9, x8, ne` with
+  `x8="t_s.bmp"`(`0x86c0`), `x9="t_s_daily.bmp"`(`0x912b`). So **(flag & 1)!=0 →
+  `t_s_daily.bmp`, else `t_s.bmp`**. `w20` = `arg3`, set by `doCommandNative` at
+  `0x1465c` as `cset w2, ne` from the JNI **boolean `Z`** parameter
+  (`(Context,int,[B,[B,Z)` — `arg7`). `t_s_daily.bmp` is **NOT shipped** in this APK
+  ⇒ production uses `t_s.bmp` (flag = false).
+- `AAssetManager_open` → `AAsset_getLength` → `malloc(len)` → `AAsset_read`
+  (`@0x13c08…0x13c30`), then builds a `std::string` of the bytes via SSO (`@0x13c48`,
+  len<23) or heap (`@0x13c60`) + `memcpy` (`@0x13c88`). **No MD5, no base64, no slice
+  — the verbatim file bytes are returned** (NRVO into `x8`/`x19`).
+
+**`doCommandNative` (`fcn.13ef4`, cmd=1 sign) uses those raw bytes as MATRIX KEY
+MATERIAL:**
+- Dispatch (`@0x14428`): `cmp w24,2 → 0x14500` (cmd2) ; `cmp w24,1 → 0x144a0`
+  (**cmd1 sign**) ; `cbnz w24 → 0x14dfc` (cmd0 fallthrough). cmd 0/1/2 converge at the
+  `0x14500…0x145f8` block.
+- `@0x14600` GetByteArrayElements / `@0x14620` GetArrayLength on the input `byte[]`
+  (the SDK-config blob), copied via `calloc`+`memcpy` into `x28` (`@0x14640`).
+- `@0x1466c`: **`bl fcn.13b5c`** with `x2 = (Z flag)` → raw `t_s.bmp` string at
+  `x29-0xc8`.
+- `@0x146b0`: **`bl read_keys_from_content`** with `x0=x28` (config blob),
+  `x2`=out-count, `x1`=out-keylist, **`x3` = the raw `t_s.bmp` bytes** (the matrix key
+  material).
+- The parsed key list (`@0x146d8…0x147e8` loop over `securityOpen`/`data`/… entries)
+  then feeds the cmd=1 MD5 key-builder (`@0x14858 bl fcn.13474`, §3 of
+  `re/tuya_sign_static.md`), result returned via `NewStringUTF` (`@0x14890`).
+
+**`read_keys_from_content` (`@0x4974`) consumes the BMP pixels:**
+- `arg4` (the raw `t_s.bmp` bytes) → validate header `fcn.4a34` (checks `BM`,
+  filesize bounds, `bfOffBits == filesize-0xe-0x28`, 24/32 bpp, compression 0).
+- Computes `pixel_len = [bmp+2] - [bmp+0xa]` (filesize − pixel offset) and passes
+  `bmp + 0x36` (pixel array, offset **54**) + `pixel_len` to `fcn.4b28`.
+- `fcn.4b28`: string-hashes the config blob (`fcn.509c`, `h=h*31+byte`), indexes a
+  **selector byte from the pixel data** at `((h % pixel_len)/2) % pixel_len`, and
+  dispatches on it: `1 → fcn.5138`, `2 → fcn.54f4` (else error). **Both** call the
+  matrix init/deobf `fcn.5eb0` ("inited matrix:" `@0x2b30`, dense `mp_int_*`) — the
+  imath-bignum + matrix decode of the config using the BMP pixels.
+
+**Verdict — `BmpToken: partially` (statically-recoverable-in-principle, un-ported).**
+The decode is fully deterministic and device-independent (static `t_s.bmp` pixels +
+static config blob + embedded matrix constants; no runtime/network input), so it can
+be ported offline. But it requires porting imath bignum (`mp_int_*`) + the matrix
+`transform`/`fcn.5eb0` exactly — the same heavy residual as `re/tuya_sign_static.md`
+§5, now confirmed to sit on the `t_s.bmp` sign path. Not completed in this task. A
+single accepted live sign remains the cheaper end-to-end oracle (contingency).

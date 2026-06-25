@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
-"""bmp_token_aes.py -- BYTE-EXACT offline port of the Tuya mobile-sign `bmp_token`
-producer (TASK-0030).
+"""bmp_token_aes.py -- BYTE-EXACT offline port of the Tuya AES-128-CBC routine that
+decrypts the TLS **cert-pinning config** (asset `tecrkcehc_ext`) using MD5(`t_s.bmp`)
+as the key (TASK-0030).
+
+NAME/SCOPE NOTE (corrected TASK-0030 P1-2): the historical filename says
+"bmp_token", but this module does NOT produce the request-signer's `bmp_token`
+(the middle `_`-part of the sign key). It produces the **cert-pinning config**. The
+signer's `bmp_token` is produced on a SEPARATE path -- `fcn.13b5c` reads the RAW
+`t_s.bmp` bytes and feeds them to `read_keys_from_content`
+(libthing_security_algorithm.so) whose imath-bignum + matrix (fcn.5eb0) decode is
+the still-unported residual (see re/bmp_token_whitebox.md JOB-1 + re/tuya_sign_static.md
+Sec.5). This file is kept named `*_aes` for git history; the public API below is named
+for what it actually returns (the cert-pinning config).
 
 THE CORRECTION (vs TASK-0029 / re/bmp_token_decode.md):
   TASK-0029 characterised `libthing_security.so` fcn.11658 as an un-portable
@@ -25,25 +36,31 @@ I/O MAPPING (driver fcn.1a030 -> fcn.19810 -> fcn.11570 -> fcn.11658):
     parses declared_len (=226) as decimal, then base64-DECODES the body
     (fcn.196bc -> fcn.2e7b0, alphabet @0x9dc7) into a 256-byte ciphertext stored at
     ctx+0x30.
-  - KEY: fcn.199d8 reads `t_s.bmp`, MD5-hexes it (fcn.195cc) into a 32-char lower-hex
-    string at ctx+0x60. The AES key = the FIRST 16 BYTES of that ASCII hex string
-    (key expansion fcn.119e4 reads only one 16-byte `ldr q0`).
+  - KEY: fcn.199d8 reads `t_s.bmp` and computes MD5 over its raw bytes (fcn.195cc),
+    storing the **16 RAW digest bytes** (NOT the 32-char hex string) as the
+    std::string at ctx+0x60 (SSO length byte 0x20 => len 16; bytes copied verbatim).
+    The AES-128 key = those 16 raw MD5 digest bytes; key expansion fcn.119e4 reads
+    exactly one 16-byte `ldr q0`. (This corrects the earlier "first 16 bytes of the
+    hex string" docstring -- the code below, the oracle, and the .so all use the RAW
+    16-byte digest. See `aes_key_from_bmp`.)
   - IV: the embedded constant "7178265647164836" @.rodata 0x85f5 (16 ASCII bytes),
     passed as arg5 (the first CBC chaining block).
   - OUTPUT: AES-128-CBC-decrypt(ciphertext, key, iv) -> 256 plaintext bytes, then
-    TRUNCATED to `declared_len` (226) bytes. That truncated buffer IS the bmp_token
-    (the 2nd '_'-joined sign-key part).
+    TRUNCATED to `declared_len` (226) bytes. That truncated buffer is the
+    **TLS cert-pinning config** JSON `{"securityOpen": bool, "data": [pin, pin]}` --
+    NOT the request-signer's bmp_token (see the NAME/SCOPE NOTE above).
 
 VALIDATION:
   - The AES-128 core is validated against the FIPS-197 / NIST known-answer vector
     (see test_bmp_token_aes.py) -- an INDEPENDENT static oracle for the cipher.
   - Determinism + stable shape on the real assets is checked.
-  - What CANNOT be proven statically: that this token is byte-identical to what the
-    app sends. The first true oracle is the end-to-end Tuya sign-accept (a live
-    call), which is OUT OF SCOPE. Status: fully-ported-unvalidated (see the .md).
+  - The decrypted blob parses as the expected cert-pinning JSON config -- a strong
+    STRUCTURAL oracle (a wrong key/iv/mode yields garbage, not valid JSON).
+  - Status: fully-ported-validated (cipher). This does NOT validate the signer's
+    bmp_token (a different, unported path).
 
-NO SECRET VALUE IS HARDCODED. The decoded token, if produced, must be written ONLY
-to secrets/ -- never a tracked file or test assertion.
+NO SECRET VALUE IS HARDCODED. The decoded cert-pinning config, if emitted, is written
+ONLY to secrets/ -- never a tracked file or test assertion.
 """
 from __future__ import annotations
 
@@ -203,7 +220,7 @@ def aes128_cbc_decrypt(ciphertext: bytes, key: bytes, iv: bytes) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# The full bmp_token decode (the recovered pipeline)
+# The full cert-pinning-config decode (the recovered AES pipeline)
 # ---------------------------------------------------------------------------
 def parse_ext_asset(raw: bytes):
     """Return (declared_len:int, ciphertext:bytes) from the `tecrkcehc_ext` asset
@@ -225,11 +242,12 @@ def aes_key_from_bmp(bmp_raw: bytes) -> bytes:
     return hashlib.md5(bmp_raw).digest()
 
 
-def decode_bmp_token(assets_dir: str) -> bytes:
-    """Full offline bmp_token decode. Returns the token bytes (length = declared_len).
+def decode_cert_pinning_config(assets_dir: str) -> bytes:
+    """Full offline decode of the TLS cert-pinning config (length = declared_len).
 
-    THIS PRODUCES A CANDIDATE TOKEN. It is fully-ported but UNVALIDATED against a
-    live oracle -- do NOT treat the value as confirmed, and never commit it."""
+    Returns the decrypted `{"securityOpen":bool,"data":[pin,pin]}` JSON bytes. This is
+    NOT the request-signer's bmp_token (a different, unported path). It is fully-ported
+    and validated by the clean-JSON structural oracle; never commit the value."""
     with open(os.path.join(assets_dir, "t_s.bmp"), "rb") as f:
         bmp_raw = f.read()
     with open(os.path.join(assets_dir, "tecrkcehc_ext"), "rb") as f:
@@ -245,24 +263,24 @@ def main(argv: List[str]) -> int:
     if not os.path.exists(os.path.join(assets, "t_s.bmp")):
         print(f"ERROR: assets not found under {assets}", file=sys.stderr)
         return 2
-    token = decode_bmp_token(assets)
+    config = decode_cert_pinning_config(assets)
     # Print SHAPE only, never the value (CLAUDE.md / TESTING.md: no secret in stdout
-    # of a committed-runnable path; the value goes to secrets/ via --emit-secret).
-    printable = all(32 <= b < 127 for b in token)
-    print(f"bmp_token decoded: {len(token)} bytes, printable_ascii={printable}")
-    print("Decode: fully-ported-unvalidated (AES-128-CBC; needs a live sign-accept "
-          "to confirm byte-exactness).")
-    if "--emit-secret" in argv:
+    # of a committed-runnable path; the value goes to secrets/ via --emit-cert-pin).
+    printable = all(32 <= b < 127 for b in config)
+    print(f"cert-pinning config decoded: {len(config)} bytes, printable_ascii={printable}")
+    print("Decode: fully-ported-validated (AES-128-CBC + clean-JSON oracle). "
+          "NOTE: this is the cert-pinning config, NOT the signer's bmp_token.")
+    if "--emit-cert-pin" in argv:
         # Write the VALUE only to secrets/ (gitignored), never stdout.
         secrets_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
             "secrets",
         )
         os.makedirs(secrets_dir, exist_ok=True)
-        out = os.path.join(secrets_dir, "bmp_token.txt")
+        out = os.path.join(secrets_dir, "cert_pinning_config.json")
         with open(out, "wb") as f:
-            f.write(token)
-        print(f"(token VALUE written to {out} -- gitignored)")
+            f.write(config)
+        print(f"(cert-pinning config VALUE written to {out} -- gitignored)")
     return 0
 
 

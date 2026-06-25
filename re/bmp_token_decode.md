@@ -19,55 +19,70 @@ relates to the public reference `nalajcie/tuya-sign-hacking`, and the precise wa
 
 ## Status (confidence: confirmed)
 
-> **SUPERSEDED IN PART BY TASK-0030 (`re/bmp_token_whitebox.md`).** §3 below calls
-> `fcn.11658` an "un-portable white-box table cipher". Re-disassembly proves that is
-> WRONG: it is **standard AES-128-CBC** (canonical AES S-boxes @0x795f/0x7a5f,
-> InvMixColumns with the 0x1b GF reduction, 10 rounds, CBC). It is now **fully ported
-> and validated** (`re/scripts/bmp_token_aes.py`, FIPS-197 KAT + clean-JSON oracle).
-> The decrypted blob is the **TLS cert-pinning config** `{"securityOpen",…,
-> "data":[2×sha256]}`, not obviously the signer's `bmp_token` — see
-> `re/bmp_token_whitebox.md` §6 for the residual. Read that doc, not §3, for the
-> cipher.
+> **SUPERSEDED BY TASK-0030 (`re/bmp_token_whitebox.md`). This whole doc is now
+> HISTORICAL — read it as the earlier (TASK-0029) hypothesis, not live claims.** Two
+> things below were WRONG:
+> 1. §3 called `fcn.11658` an "un-portable white-box table cipher". It is in fact
+>    **standard AES-128-CBC** (canonical AES S-boxes @0x795f/0x7a5f, InvMixColumns with
+>    the 0x1b GF reduction, 10 rounds, CBC), now **fully ported and validated**
+>    (`re/scripts/bmp_token_aes.py`, FIPS-197 KAT + clean-JSON oracle). Its output is
+>    the **TLS cert-pinning config** `{"securityOpen",…,"data":[2×sha256]}` — read on
+>    a DIFFERENT `t_s.bmp` consumer than the signer's `bmp_token`.
+> 2. §1 claimed the imath **matrix** path is "unrelated to `t_s.bmp`". That is also
+>    WRONG (TASK-0030 JOB-1): `t_s.bmp` has **TWO** code xrefs, and the SECOND
+>    (`fcn.13b5c` @ `0x13bf0`, on the cmd=1 sign path) feeds the raw `t_s.bmp` pixels
+>    INTO `read_keys_from_content` → the imath matrix. So the matrix DOES consume
+>    `t_s.bmp`, and the §5-of-`tuya_sign_static.md` "imath matrix decodes t_s.bmp"
+>    hypothesis was RIGHT after all. Read `re/bmp_token_whitebox.md` §6/§8 for the
+>    corrected, unified model; the paragraphs below are retained only as the original
+>    spike reasoning.
 
-**Decode: fully-ported-validated (cipher); signer-token-mapping-open** — the AES
-transform is byte-exact and validated; the framing/IO is recovered; what remains open
-is which decrypted artifact the request-signer's middle `_`-part consumes (needs a
-live sign-accept). (Original §3 verdict "white-box wall" is retracted.)
+**Decode (cert-pinning AES path): fully-ported-validated. Signer bmp_token:
+partially (un-ported, imath matrix).** The AES transform (`fcn.11658`) is byte-exact
+and validated, but its OUTPUT is the cert-pinning config — NOT the signer's
+`bmp_token`. The signer's `bmp_token` is produced on the OTHER `t_s.bmp` consumer
+(`fcn.13b5c` → imath matrix), characterized end-to-end but un-ported
+(`re/bmp_token_whitebox.md` §8). (The historical §3 "white-box wall" verdict is
+retracted; the §1 "matrix unrelated to t_s.bmp" conclusion is also retracted.)
 
-This is grounded by two independent sources: (1) the byte-level disassembly of the
-BMP decode driver and its callees in `libthing_security.so@0x1a030` (cited inline),
-and (2) the public reference `nalajcie/tuya-sign-hacking`
-(`re/review_gate_findings.md:24`), which documents a *different* (older) scheme that
-provably does not reproduce this APK's token.
+**One-line justification (corrected):** `t_s.bmp` has two consumers — (a) the AES
+cert-pin path (`fcn.199d8`→`fcn.11658`, keyed by MD5(t_s.bmp)) and (b) the sign path
+(`fcn.13b5c`→`read_keys_from_content`, the raw pixels driving the imath matrix
+`fcn.5eb0`). The body of THIS doc earlier wrongly merged these; read the whitebox
+doc for the unified model.
 
-**One-line justification:** `re/tuya_sign_static.md` §5 hypothesised the t_s.bmp
-token was decoded by the imath-bignum **matrix** in `libthing_security_algorithm.so`.
-Disassembly **refutes** that for the BMP path: the imath `read_keys_from_content`
-matrix decodes the *SDK-config blob* (asset `tecrkcehc`), while `t_s.bmp` is consumed
-by a separate **white-box table-network block cipher** (`libthing_security.so@0x11658`)
-keyed by an embedded constant. The framing around it is fully recovered; the cipher
-itself is the wall.
+Two independent sources ground this corrected Status: (1) the byte-level disassembly
+in `libthing_security.so@0x13bf0` (the second `t_s.bmp` xref in `fcn.13b5c`, with the
+AES path at `libthing_security.so@0x11658`), AND (2) the on-disk asset
+`assets/t_s.bmp` (22554-byte `BM`, `bfOffBits`=54, 24bpp) whose header satisfies the
+validator `fcn.4a34` that gates the imath-matrix decode.
 
 ---
 
-## 1. The two decode paths are distinct — the §5 conflation is corrected (confidence: confirmed)
+## 1. [HISTORICAL — partly WRONG] "the two decode paths are distinct" (confidence: speculative)
 
-Two independent sources: the xref graph of the imported `read_keys_from_content`
-AND the named public reference's separate "config keys" vs "BMP token" mechanisms.
+> **RETRACTED by TASK-0030 JOB-1.** This section concluded the imath matrix is
+> "unrelated to `t_s.bmp`". That conclusion was WRONG: it missed the SECOND `t_s.bmp`
+> xref (`fcn.13b5c` @ `0x13bf0`), which reads the raw BMP bytes and passes them as the
+> matrix key material into `read_keys_from_content`. The matrix DOES consume
+> `t_s.bmp` pixels. See `re/bmp_token_whitebox.md` §8. The original reasoning is kept
+> below for the record.
+
+(Original TASK-0029 reasoning, retained:)
 
 - The imath/matrix function `read_keys_from_content` is **imported** into
-  `libthing_security.so@0x2e600`; its **only** caller is the cmd-dispatch
-  `libthing_security.so@0x13ef4` (= `doCommandNative@0x13ed8`, the SDK-config-blob
-  parser, `re/tuya_sign_static.md` §2). There is **no edge** from the BMP decode
-  driver `libthing_security.so@0x1a030` to `read_keys_from_content` (r2 `axt`
-  confirms a single xref).
-- The matrix input is a **comma-separated** coefficient string: `parse`
+  `libthing_security.so@0x2e600`; its caller is the cmd-dispatch
+  `libthing_security.so@0x13ef4` (= `doCommandNative`, the SDK-config-blob parser,
+  `re/tuya_sign_static.md` §2). [The earlier draft inferred "no t_s.bmp edge" — but
+  `doCommandNative` itself feeds the raw `t_s.bmp` bytes to `read_keys_from_content`
+  via `fcn.13b5c` at `0x1466c`; see §8 of the whitebox doc.]
+- The matrix input was read as a **comma-separated** coefficient string: `parse`
   (`libthing_security_algorithm.so@0x4eec`) splits on `','` (`strchr` for `0x2c`)
-  into 16-byte (a,b) structs — i.e. it consumes the decrypted config blob (asset
-  `tecrkcehc`, a JSON `{"data":[...]}` of cert-pin hex pairs), not raw BMP pixels.
-- Therefore the imath **matrix** is the public reference's *config-key* decode, and
-  is unrelated to `t_s.bmp`. The §5 claim that t_s.bmp uses the imath matrix is a
-  **cross-source contradiction**, here resolved in favour of the disassembly.
+  into 16-byte (a,b) structs — it consumes the decrypted config blob, keyed by the
+  BMP pixels.
+- Conclusion (now corrected): the imath **matrix** IS the F1 / `nalajcie` BMP-token
+  decode, and it IS driven by `t_s.bmp`. The §5-of-`tuya_sign_static.md` "t_s.bmp uses
+  the imath matrix" claim was CORRECT.
 
 ## 2. The recovered t_s.bmp pipeline (confidence: confirmed)
 
@@ -96,7 +111,15 @@ matches the parse.
 The framing in steps 1–4 (BMP offset access, the decimal parse, the constant) is
 re-implemented and unit-tested in `re/scripts/bmp_token_decode.py`.
 
-## 3. The core transform is a white-box table cipher — the wall (confidence: confirmed)
+## 3. [HISTORICAL — WRONG] "the core transform is a white-box table cipher — the wall" (confidence: speculative)
+
+> **RETRACTED by TASK-0030.** `fcn.11658` is **standard AES-128-CBC**, not an
+> un-portable white-box; it is fully ported and validated
+> (`re/scripts/bmp_token_aes.py`, `re/bmp_token_whitebox.md`). Its OUTPUT is the TLS
+> cert-pinning config, not the signer's `bmp_token`. The "wall" framing below is the
+> earlier (mistaken) hypothesis, retained for the record.
+
+(Original TASK-0029 reasoning, retained:)
 
 Two independent sources: the NEON table/substitution instructions in
 `libthing_security.so@0x11658` AND the public reference
@@ -153,7 +176,8 @@ our faithful re-implementation of it, run against this APK's `t_s.bmp`.
 | native offset string-hash (acc*31+byte, abs) | **YES — ported+tested** | `libthing_security_algorithm.so@0x509c`; §4; nalajcie |
 | embedded transform constant | **YES** | `libthing_security.so@0x85f5` "7178265647164836"; §2 |
 | nalajcie matrix reference (cross-check) | **YES — ported+tested, inapplicable** | nalajcie ref; `re/scripts/bmp_token_decode.py`; §4 |
-| **the white-box table cipher** (token producer) | **NO — the wall** | `libthing_security.so@0x11658` (tbl/eor/T-table); §3 |
+| ~~the white-box table cipher (token producer)~~ | **RETRACTED** — `fcn.11658` is AES-128-CBC (cert-pin config, not token); see whitebox doc | corrected |
+| signer bmp_token = raw `t_s.bmp` → imath matrix | **NO — un-ported (deterministic)** | `fcn.13b5c`→`read_keys_from_content`→matrix `fcn.5eb0`; whitebox §8 |
 
 ## 6. Impact on TASK-0012 and honest limitations (confidence: confirmed)
 
@@ -168,16 +192,18 @@ in `libthing_security.so@0x14c30` feeding the MD5 key-builder `@0x13474`
   key-join, offline cert-SHA256, appKey/appSecret) is recovered
   (`re/tuya_sign_static.md` §3-7). A *partial* differential (cert-hash + appSecret +
   MD5/hex/`_`-join sub-steps with a placeholder token) remains achievable now.
-- **Honest gotchas:**
+- **Honest gotchas (corrected by TASK-0030):**
   - The §5-of-`tuya_sign_static.md` "imath matrix decodes t_s.bmp" hypothesis was
-    WRONG; that matrix is the config-key path. The actual t_s.bmp decode is a
-    white-box cipher — a *harder* residual than first characterised.
-  - `re/scripts/bmp_token_decode.py` does **not** output a token (it raises
-    `WhiteBoxResidual`). It implements the recovered framing + the independent
-    reference and proves the scheme mismatch. It must NOT be presented as a working
-    token decode.
-  - Remaining static path (large, no oracle): extract the `.rodata@0x7800` /
-    `.data.rel.ro@0x38000`/`0x39000` tables, reconstruct `fcn@0x11658` byte-exact,
-    feed t_s.bmp + `tecrkcehc_ext` + the constant. Realistically this is the point
-    where a single captured request (gold oracle) is far cheaper than completing the
-    white-box port — recommend that contingency for TASK-0012.
+    **RIGHT**, not wrong (this doc earlier mis-retracted it). `t_s.bmp`'s raw pixels
+    ARE fed to the imath matrix via `fcn.13b5c` → `read_keys_from_content`
+    (whitebox §8). The "white-box cipher decodes t_s.bmp" claim here was the mistaken
+    one.
+  - `re/scripts/bmp_token_decode.py` does **not** output a token. It implements the
+    recovered framing + the independent nalajcie reference. It must NOT be presented
+    as a working token decode.
+  - Remaining static path for the signer's `bmp_token` (large, no local oracle): port
+    imath bignum (`mp_int_*`) + the matrix `fcn.5eb0`/`transform`, feed the raw
+    `t_s.bmp` pixels (offset 54) + the SDK-config blob. Deterministic and
+    device-independent, so portable in principle. A single captured/accepted request
+    (gold oracle) is still the cheaper end-to-end route — recommended contingency for
+    TASK-0012.

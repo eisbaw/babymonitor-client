@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@architect'
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 04:53'
+updated_date: '2026-06-25 06:03'
 labels:
   - phase5
   - rust
@@ -93,4 +93,6 @@ GOTCHAS / HONEST LIMITATIONS:
 FEED-FORWARD: appended interface shapes to TASK-0013 (SigningKeyMaterial) and TASK-0030 (BmpTokenProvider). Kept In Progress: AC#1 stays token-pending until TASK-0030 lands the token + an independent gold vector.
 
 Cycle-14 review: both GO. Architect re-derived all 5 recovered sub-steps independently = correct; token-pending honest; cert value confirmed correct (raw-embedded-cert = Android semantics). Non-blocking P1/P2 -> TASK-0031 (cert validation reproducibility + leaf-selection robustness + spec contradiction caveat). AC#1 stays token-pending.
+
+FEED-FORWARD from TASK-0030 JOB-1 (2026-06-25): the byte-exact signer is NOT yet offline-recoverable, but the residual is now fully characterized and is a STATIC port (not inherently device-bound). The signer's bmp_token (the middle _-part of the MD5 sign key) is produced by: doCommandNative (libthing_security.so@0x13ef4, cmd=1) -> fcn.13b5c reads the RAW t_s.bmp bytes (verbatim, no transform; t_s_daily.bmp selected by the JNI boolean Z flag but NOT shipped, so production uses t_s.bmp) -> passed as arg x3 to read_keys_from_content (libthing_security_algorithm.so@0x4974) -> BMP header validated (fcn.4a34), pixel array at offset 54 -> imath-bignum + matrix deobfuscation (fcn.4b28 -> fcn.5138/fcn.54f4 -> matrix fcn.5eb0) decodes the SDK-config blob into the labelled key list -> feeds the MD5 key-builder fcn.13474. NOTE: the AES-128-CBC path (fcn.11658, TASK-0030) decodes a DIFFERENT t_s.bmp consumer (the TLS cert-pinning config) and is NOT the signer token. EXACT NEXT STEP for AC#1/AC#3: pick ONE of (a) port the imath bignum + matrix decode offline per re/bmp_token_whitebox.md s8 (deterministic, device-independent, but no local oracle until the end-to-end sign differential — a 1-element error fails silently); or (b) the cheaper contingency — capture ONE accepted live sign and differential it against core::sign. Tracked in TASK-0032 (re-scoped). Keep the BmpTokenPending discipline until one of those lands; do NOT wire a guessed token.
 <!-- SECTION:NOTES:END -->

@@ -116,7 +116,7 @@ Fixed in `babymonitor/babymonitor-core/src/sign.rs` `SIGN_WHITELIST`.
 ## Likely cause + next step (confidence: speculative)
 
 Hypothesis (NOT validated — labelled speculative): the recovered appKey
-(confirmed-format `wx…`, `secrets/tuya_appkey.json`) is provisioned for a
+(in `secrets/tuya_appkey.json`, value/format withheld) is provisioned for a
 **region-config-decrypted datacenter host**, not the legacy public
 `a1.tuya{eu,us}.com` atop gateway. The candidate datacenter hosts ship
 **encrypted** in `assets/thing_domains_v1/regions` and are decrypted at runtime

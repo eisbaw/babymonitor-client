@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@architect'
 created_date: '2026-06-25 11:40'
-updated_date: '2026-06-25 12:08'
+updated_date: '2026-06-25 12:16'
 labels:
   - phase3
   - wave3
@@ -59,4 +59,6 @@ SHIPPED (code+doc, method only, no values):
 - Deliverable: re/live_login.md (outcome + method, no values).
 LIKELY CAUSE (speculative, NOT validated): appKey provisioned for a region-config-decrypted datacenter host (encrypted thing_domains_v1/regions, native getConfig), not the legacy a1.tuya*.com gateway. NEXT: decrypt regions blob OR one Frida/proxy capture (TASK-0022) to get the real host + any missing provisioning field, then re-run the ONE token.get to reach the sign oracle.
 GATES: just e2e GREEN; check-evidence GREEN; secret-scan GREEN; secrets/* gitignored+unstaged.
+
+Cycle review: both GO (no P0; secret hygiene clean — no value in any tracked file/commit/history; guardrails honored: 0 password attempts, 2FA NOT reached; whitelist fix correct; URL-scrubber works). OUTCOME: token.get rejected ILLEGAL_CLIENT_ID at the gateway client-identity layer BEFORE sign eval -> bmp_token candidate NEITHER validated NOR refuted (still live). LOGIN FAILED at the gateway -> per guardrail, STOPPED + reporting to operator. Status: In Progress (blocked on gateway host/provisioning). P1 hardening for the NEXT live cycle: (a) scrub_url_secrets docstring claims without_url it doesn't call — fix doc or implement; (b) probe_host uses unscrubbed {e} (safe only incidentally) + add a 'do not run live with RUST_LOG=reqwest/hyper debug' warning (reqwest/hyper can log the full signed URL). Orchestrator dropped the wx-prefix appKey-shape disclosure from re/live_login.md.
 <!-- SECTION:NOTES:END -->

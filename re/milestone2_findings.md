@@ -81,11 +81,24 @@ references (tinytuya, tuya-iot SDKs).
    extensively documented by the public RE community (e.g. tinytuya, tuya-iot SDKs, Tuya-camera
    P2P efforts). This raises feasibility substantially versus a bespoke protocol.
 3. **Highest-value artifact to recover next:** the embedded **Tuya AppKey / AppSecret** (Philips'
-   Tuya developer app credentials). Tuya cloud signs every API request (HMAC) with these; they are
-   required to reimplement cloud auth. They live somewhere in the APK (native string table,
-   `assets/*config*.json`, or DEX). → backlog task.
+   Tuya developer app credentials). They live somewhere in the APK (native string table,
+   `assets/*config*.json`, or DEX) and are needed to reimplement cloud auth. → backlog task.
+   *CORRECTION/forward-pointer (TASK-0027):* an earlier draft framed appKey/appSecret as
+   **sufficient** to sign ("Tuya cloud signs every API request (HMAC) with these"). The later
+   TASK-0005 spike **refutes** that — see `re/tuya_sign.md`, `Verdict: needs-runtime-hook`:
+   appKey/appSecret **ALONE are insufficient**. The mobile sign KEY also folds in the running
+   APK's app-signing-certificate SHA-256 (a runtime input) **and** a token decoded from the
+   embedded `t_s.bmp` asset, and the keyed-hash routine runs in native (`libthing_security.so`,
+   command 1) — none of which is byte-reproducible from static analysis. So appKey/appSecret are
+   necessary but not sufficient; the full sign needs a runtime hook (`re/tuya_sign.md`).
 4. The hard core remains **`libThingP2PSDK`**: Tuya's P2P session establishment + the AV framing
    over it. Static-only, this is the riskiest piece; public Tuya-P2P work is the main lever.
+   *Forward-pointer (TASK-0026):* the later streaming-mode triage refines this "cloud-brokered
+   P2P" framing in points 1 + 4 — see `re/streaming_mode.md`, which finds **WebRTC-over-MQTT
+   (signaling code 302) is the PREFERRED per-device transport with legacy PPCS as fallback,
+   chosen at runtime from the cloud-provided `p2pType`** — so the AV path is not necessarily the
+   proprietary PPCS framing assumed here. (Substance/labels of points 1+4 unchanged; this is a
+   navigation pointer only.)
 
 ## Confidence summary (canonical labels)
 

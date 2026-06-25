@@ -42,7 +42,7 @@ the public Tuya refs already established for this project.
 |---|---|---|
 | miniapp_IPCKit.js | 45 KB | **IPC camera live-view kit** — the camera panel feature surface (connect/talk/playback/snapshot) |
 | miniapp_P2PKit.js | 25 KB | **P2P transport kit** — wraps `TUNIP2pFileManager` / ThingP2P connection params |
-| miniapp_PlayNetKit.js | 36 KB | **Play/network kit** — streaming play-mode + ICE (73 `ice` hits) |
+| miniapp_PlayNetKit.js | 36 KB | **Play/network kit** — play-mode UI/orchestration only; the JS is transport-agnostic (see ICE-FP correction below) |
 | miniapp_DeviceKit.js | 115 KB | device model, DP control, device list |
 | miniapp_HomeKit.js | 33 KB | home/family + **login ticket** (`onTicketSuccess`) |
 | miniapp_MediaKit.js | 22 KB | media playback (lullaby/audio) |
@@ -52,6 +52,30 @@ the public Tuya refs already established for this project.
 mini_app_js: `jsBridgeService.js` + `jsBridgeWebView.js` are the JS↔native bridge
 shims; `polyfill.min.js` is a core-js polyfill; `gzlConstant*/gzlTheme*` are
 config/theme constants.
+
+> CORRECTION (TASK-0025, supersedes an earlier draft of the PlayNetKit row).
+> An earlier version of this row claimed PlayNetKit carries "ICE (73 `ice`
+> hits)", implying WebRTC ICE primitives live in the JS. **That is FALSE — a
+> substring false-positive.** Re-verified for this fix on the current
+> `just decompile` tree: `rg -io '[a-z]*ice[a-z]*'
+> decompiled/js/assets/kit_js/miniapp_PlayNetKit.js.pretty` yields only
+> identifier substrings (`slice`, `connectMatterDevice`, `onScanDeviceInfo`,
+> `getDeviceSecurityConfigs`, `license`, …) — never WebRTC `ice`; and a grep for
+> real handshake primitives `rg -lc 'RTCPeerConnection|createOffer|ice-ufrag'
+> decompiled/js/assets/kit_js/*.pretty` returns **zero**. The JS kit layer is
+> **transport-agnostic**: PlayNetKit (and the IPC kit) only name the bridge
+> `connect`/`createMediaDevice` verbs whose param is `{deviceId}`-only (per
+> `TUNIIPCCameraManager.json`, the streaming section below) — no sdp/ice/mode
+> media-session fields. The real WebRTC SDP/ICE/DTLS-SRTP machinery is **native**,
+> in `libThingP2PSDK.so` (signaling strings `a=ice-ufrag`/`invalid signaling:
+> type: candidate`, demangled `re/symbols/libThingP2PSDK.dynsym.txt`) and
+> surfaced in Java by `P2PMQTTServiceManager.send302MessageThroughMqtt`
+> (`decompiled/jadx/sources/com/thingclips/smart/p2p/utils/P2PMQTTServiceManager.java`).
+> See `re/streaming_mode.md` for the full WebRTC-over-MQTT verdict and its own
+> ICE-false-positive correction. (confidence: confirmed — two independent
+> non-`.md` sources back this: the JS greps over
+> `decompiled/js/assets/kit_js/*.pretty` AND the native+Java WebRTC evidence in
+> `libThingP2PSDK.so` / `P2PMQTTServiceManager.java`.)
 
 ## The JS↔native bridge mechanism (confidence: confirmed)
 

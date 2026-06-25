@@ -4,7 +4,7 @@ title: Map Tuya cloud auth + device-binding API
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:36'
-updated_date: '2026-06-25 00:23'
+updated_date: '2026-06-25 01:22'
 labels:
   - phase4
   - re
@@ -39,5 +39,11 @@ WHY (skill phase 3/4): model the request/response contract for account login, to
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-forward-carried from TASK-0001/0003: Cloud-auth code lives in DEX, not JS (login is ticket-based: TUNILoginManager.onTicketSuccess). Sign manager: com/thingclips/sdk/network/ThingApiSignManager.java (see task 5 notes for method lines). Account/login SDK: com/thingclips/sdk/user/ (obfuscated impls) + com/thingclips/smart/login*, com/thingclips/smart/api/loginapi. Two cloud gateways from JS: apiRequestByAtop (mobile-app atop, F1 sign) and apiRequestByHighwayRestful (host/api/header/query/body/method). Datacenter is runtime-from-login (F5); hostnames in native thing_domains_v1, not JS.
+[from TASK-0005 SPIKE] Cloud-auth signing map (see re/tuya_sign.md, re/tuya_cloud_config.md):
+- Request signer = Tuya mobile-app gateway ("atop"), NOT OpenAPI. Entry TUNIAPIRequestManager.apiRequestByAtop -> ThingApiSignManager.
+- String-to-sign: sort params asc, keep whitelist (a,v,t,sid,appVersion,os,deviceId,lang,requestId,et,sp,...), join key=value with literal "||" (not "&"); postData value replaced by swapSignString(md5AsBase64(body)) first; swapSignString permutes a 32-char md5-b64 as B[0:8]+s[0:8]+s[24:32]+B[8:16].
+- Keyed sign is NATIVE: pbddddb.bdpdqbp -> ThingNetworkSecurity.doCommandNative(ctx, cmd=1, stringToSign). Key derivation = f(app_cert_SHA256, token from t_s.bmp, appSecret) inside libthing_security.so (F1 confirmed via native strings: t_s.bmp, SignFileDecoder, X509Certificate, SHA256). Likely HMAC-SHA256.
+- appKey/appSecret/TTID: STATIC in DEX BuildConfig -> secrets/tuya_appkey.json (values NOT in any committed file).
+- Datacenter domains: NOT static plaintext; encrypted in assets/thing_domains_v1/regions, decrypted at runtime by native getConfig; datacenter chosen by region post-login (F5). Plan datacenter selection as runtime-from-login.
+- VERDICT for the sign key: needs-runtime-hook. The differential test vector for the signer is NOT statically derivable; it must come from the Frida hook (TASK-0022) or a live capture.
 <!-- SECTION:NOTES:END -->

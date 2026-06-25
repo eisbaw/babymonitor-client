@@ -4,15 +4,14 @@ title: Implement Tuya cloud auth + request signing in Rust
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 00:23'
+updated_date: '2026-06-25 01:22'
 labels:
   - phase5
   - rust
   - wave1
   - auth
 dependencies:
-  - TASK-0011
-  - TASK-0007
+  - TASK-0022
 priority: high
 ---
 
@@ -35,5 +34,9 @@ WHY: the first genuinely buildable+testable slice. Implement Tuya HMAC request s
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-forward-carried from TASK-0001/0003: Rust sign reference = com/thingclips/sdk/network/ThingApiSignManager.java (decompiled/jadx/sources): generateSignatureSdk():99 builds sorted key string, postDataMD5Hex():423, swapSignString():524 byte-permute over MD5-base64. Differential reference per TESTING.md is nalajcie/tuya-sign-hacking (mobile sign), NOT tinytuya. Gateway request shape: TUNIAPIRequestManager.apiRequestByAtop {api,version,postData,extData}. Sign key derivation likely native (t_s.bmp/whitebox, task 5).
+[from TASK-0005 SPIKE] Rust signing guidance (see re/tuya_sign.md):
+- Implement string-to-sign EXACTLY: sorted whitelist params joined by "||" with key=value; postData folded as swapSignString(md5AsBase64(body)); swapSignString(s)= s[8:16] + s[0:8] + s[24:32] + s[16:24] (i.e. B1+A+C+B2 where A=s[0:8],B=s[8:24],C=s[24:32]).
+- The keyed wire-sign is native (HMAC-SHA256 likely) over key=[app_cert_SHA256]_[bmp_token]_[appSecret]. appSecret is static (secrets/tuya_appkey.json). The bmp_token and the exact cert-hash combination are NOT static.
+- DIFFERENTIAL TEST VECTOR MUST BE LIVE: blocked on TASK-0022 (Frida hook) — capture (string-to-sign, sign) pairs on the user's device; do NOT self-derive the reference (circular, forbidden by TESTING.md). dep edge added.
+- The app-cert SHA-256 half can be computed offline from the APK signing cert if the combination order is learned (TASK-0023 Ghidra). Until then, treat the native sign as a black box validated against the captured vector.
 <!-- SECTION:NOTES:END -->

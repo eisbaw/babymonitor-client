@@ -4,7 +4,7 @@ title: 'Wave-2 DEEP RE-PLAN: run phase2-backlog-snowball for Wave-2 in a fresh s
 status: To Do
 assignee: []
 created_date: '2026-06-25 07:14'
-updated_date: '2026-06-25 08:02'
+updated_date: '2026-06-25 08:25'
 labels:
   - phase-gate
   - replan
@@ -43,4 +43,6 @@ WHAT MEDIA-DECODE/RENDER WORK REMAINS (FILED as TASK-0037, dep on TASK-0034):
 4. Actual frame RENDER/PLAYBACK (a video sink + audio out) — not yet scoped; Wave-2 re-plan should add a render/CLI-view task after TASK-0037.
 
 RE-PLAN IMPLICATION: the stream protocol layer is done and unblocked-by-design; the remaining stream work (TASK-0037 + render) is strictly downstream of the auth decision (TASK-0035). Sequence: TASK-0035 (auth) -> capture device creds + one 302 -> TASK-0037 (media engine + AES mode + TLS) -> render task.
+
+CORRECTION (cycle-23): line ~36's '302-payload AES NOT statically pinnable (runtime AESUtil.ALGO + Cipher.il) -> MqttCryptoPending' is FALSE/STALE. The AES is pinned (AES-128/ECB/PKCS5, key=localKey, no IV) and implemented; the residual is only the pv->variant binding + framing (MqttEnvelopePending). Wave-2 re-plan should carry the corrected scope.
 <!-- SECTION:NOTES:END -->

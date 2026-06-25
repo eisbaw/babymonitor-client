@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@architect'
 created_date: '2026-06-25 07:59'
-updated_date: '2026-06-25 08:20'
+updated_date: '2026-06-25 08:25'
 labels:
   - phase3
   - rust
@@ -54,4 +54,8 @@ GOTCHAS:
 - DECRYPT with the wrong key trips PKCS7-unpad validation probabilistically (~255/256), NOT deterministically -- the negative test relies on this overwhelming likelihood, not a guarantee. Acceptable for a unit test but noted.
 
 STILL OPEN on TASK-0037 (task stays In Progress): webrtc-rs media engine, the pv->variant binding + outer MQTT framing (live capture), MQTT TLS (rumqttc use-rustls). Gate green: e2e (95 lib tests incl. 6 new AES KAT/neg, clippy -D, fmt-check, assert-offline after aes cached), check-evidence, secret-scan.
+
+CORRECTION (cycle-23, supersedes Description item 2): the localKey AES IS statically pinned — AES-128/ECB/PKCS5Padding, key=localKey ASCII bytes, NO IV, output UPPERCASE-hex|base64|raw by pv variant (now IMPLEMENTED + openssl-KAT-tested in stream/mqtt_crypto.rs). The error is MqttEnvelopePending (NOT MqttCryptoPending), and it gates ONLY the pv->variant binding for code 302 + the outer Tuya envelope framing (genuine live-capture residual). Remaining for this task: webrtc-rs media engine + that pv-binding/framing + MQTT TLS.
+
+Cycle-23 review (AES portion): both GO. Correction accurate (re-derived from qpqddqd.java/AESUtil.java); AES impl correct (openssl-independent KAT eef67dc3...); hex-case not conflated (302=UPPERCASE byte2hex, SDP=lowercase); gate honestly narrowed; rename clean. P2 (future): the SDP a=aes-key 'lowercase' claim is uncited (imm_p2p_misc_hex_to_char body not decompiled) but non-load-bearing (decoder case-insensitive).
 <!-- SECTION:NOTES:END -->

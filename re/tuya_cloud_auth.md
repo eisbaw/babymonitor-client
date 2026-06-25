@@ -474,3 +474,56 @@ These are filed/forward-carried, not hidden. The bean **shapes** above are enoug
 for TASK-0012 (envelope + login endpoints) and TASK-0013 (typed device/camera
 models) to be written now; the live unknowns are validated when the user runs the
 Rust client against the real account (TESTING.md gold oracle).
+
+## 8. Captcha / `verifyToken` is NOT an atop `token.get` header (TASK-0050 Stage B) (confidence: confirmed)
+
+**Question:** does the atop `token.get` request get decorated with a
+`verifyToken` / risk / device-fingerprint header that a from-scratch client
+omits (a candidate explanation for `ILLEGAL_CLIENT_ID`)? **Resolved
+definitively: NO.** The captcha/`verifyToken` machinery is a SEPARATE service on
+a SEPARATE HTTP stack, gating the auth-CODE-send action — not `token.get`, not
+`password.login`, and it adds nothing to the atop envelope.
+
+Method + evidence (jadx; symbol-anchored, line hints drift):
+
+1. **`verifyToken` is a captcha-service request PARAMETER, not an atop header.**
+   `CaptchaBusiness.l(...)` (`com/thingclips/smart/login/captcha/business/CaptchaBusiness.java`,
+   the `initConfig` method) POSTs to `apiServer + "/verify/app/initConfig"` and
+   puts `verifyToken` (plus `verifyId`/`verifyAppKey`/`appClientType`/
+   `verifyUniqueCode`/`systemName`/`systemVersion`) into the JSON body of THAT
+   request. The sibling endpoints are `/verify/initJs` (`m`) and
+   `/verify/app/clickPass` (`n`). `apiServer` is the captcha verify host, a
+   DIFFERENT base URL from the atop `/api.json` gateway.
+
+2. **Separate HTTP stack.** `CaptchaBusiness` holds its OWN raw
+   `okhttp3.OkHttpClient` field (`new OkHttpClient()`) and builds raw
+   `Request.Builder()` calls — it does NOT go through `Business`/`ThingApiParams`/
+   the signed atop pipeline. So nothing it does touches the atop `sign`, `clientId`,
+   or envelope.
+
+3. **The atop network/sign layer never reads any captcha/risk/fingerprint field.**
+   A grep of `com/thingclips/smart/android/network/` and
+   `com/thingclips/sdk/network/` for `verifyToken|captchaToken|riskToken|x-risk|
+   ticket|fingerprint` returns ZERO hits. `verifyToken` occurs in the WHOLE tree in
+   only 5 files, ALL under `com/thingclips/smart/login/captcha/`.
+
+4. **Captcha gates code-SENDING, reactively, via UI — not `token.get`.** The
+   verify-result `Map<String,String>` produced by `CaptchaServiceManager.k0(...)`
+   (`verifyCaptcha`) is fed via `AuthCodeRequestEntity.j(map)` into the entity's
+   `ticket` map and used by `AuthCodeUseCase.sendAuthCodeByType` (the
+   send-verification-code action). A null-safe cross-check confirms **zero files**
+   reference BOTH the captcha-verify API and `token.get`/`password.login` — the two
+   are disjoint code paths. The captcha is shown by `CaptchaServiceImpl.verifyCaptcha`
+   in a WebView (`jscore/impl/WebViewImpl`), i.e. an interactive anti-bot challenge
+   triggered ON-DEMAND when the server flags risk on code-sending.
+
+**Verdict (confirmed):** there is NO statically-derivable `verifyToken`/risk/
+fingerprint header that the atop `token.get` requires and our from-scratch client
+omits. The captcha path is (a) a different service/host, (b) a different request
+shape, (c) reached only for code-sending, and (d) WebView-interactive
+(**runtime-only**, needs a human + the JS challenge — it cannot be precomputed
+statically). It is therefore NOT the cause of `ILLEGAL_CLIENT_ID` on `token.get`,
+and there is no follow-up "add a missing header" task to file from this trace.
+This corroborates the TASK-0050 Stage A differential (`re/live_login.md`):
+`ILLEGAL_CLIENT_ID` is a sign-insensitive identity/provisioning gate, not a
+missing-request-decoration problem.

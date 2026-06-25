@@ -18,15 +18,64 @@ OUTCOME, never a value.
 
 ---
 
-## Outcome (confidence: likely)
+## Corrupted-sign differential — `ILLEGAL_CLIENT_ID` is sign-INSENSITIVE (TASK-0050) (confidence: confirmed)
+
+**The decisive test ran. `ILLEGAL_CLIENT_ID` is returned BEFORE the gateway
+evaluates our `sign` — proven, no longer server-opaque.** This promotes the
+"identity-layer code, returned upstream of sign-verification" claim from a
+server-opaque assertion to a **confirmed** one, via a controlled differential.
+
+Method (`babymonitor/babymonitor-cli/src/live.rs` `run_token_get_probe` +
+`corrupt_one_nibble`, behind `--features live`): build the fully-signed
+`token.get` envelope, then send it twice to the SAME host (`a1.tuyaeu.com`),
+byte-identical EXCEPT the `sign` value, which the second probe corrupts by
+flipping exactly one hex nibble (so the signature is well-formed — 32-char
+lowercase hex — and the gateway parses it and would reach sign-verification, but
+the signature itself is now wrong):
+
+| probe | sign | HTTP | errorCode | errorMsg |
+|---|---|---|---|---|
+| 1 (`--probe-only`) | our candidate sign | 200 | `ILLEGAL_CLIENT_ID` | `Invalid client;No access` |
+| 2 (`--probe-only --corrupt-sign`) | one nibble flipped | 200 | `ILLEGAL_CLIENT_ID` | `Invalid client;No access` |
+
+The two responses are **byte-for-byte identical** (raw bodies + request param
+keys compared, gitignored `secrets/tuya_live_debug_probe1_candidate.json` vs
+`secrets/tuya_live_debug.json`). A WRONG signature changes NOTHING about the
+response ⇒ the reject is **sign-insensitive** ⇒ the gateway rejects on **client
+identity** before it ever reads/evaluates the `sign`. **Confidence `confirmed`:**
+this is a controlled A/B differential (the corrupted variant is the negative
+control), not a single opaque capture — two independent observations whose only
+difference (the sign) provably does not move the result.
+
+**Probe budget:** exactly **2** signed `token.get` calls (the differential pair).
+ZERO `password.login` (across ALL cycles). 2FA NOT reached. Neither probe was
+`Accepted` (the sign oracle is still unreachable — by design, because the
+identity gate short-circuits before sign-verify).
+
+**Two honest consequences (do not overclaim):**
+1. The identity/provisioning gate (app-attestation / app-cert-pin / server-side
+   appKey↔package binding) is now the CONFIRMED blocker for `token.get` — a
+   standalone static client cannot clear it from the recovered material alone.
+   This UNBLOCKS the TASK-0049 decision (on-device capture vs accept-block): the
+   "wrong sign" alternative is now ruled OUT for THIS error.
+2. This does **NOT** validate the `bmp_token` candidate or the MD5 fold — the
+   server still never judged our signature (it short-circuits before that). But
+   it DOES prove the `bmp_token`/fold is **not** what is blocking `token.get`:
+   even a deliberately-broken sign yields the identical reject. So re-attacking
+   the `bmp_token` decode would NOT clear `ILLEGAL_CLIENT_ID`; the sign oracle
+   only becomes reachable once the identity gate is passed (then a corrupted vs
+   correct sign WOULD diverge, finally validating the fold).
+
+## Outcome (confidence: likely — SUPERSEDED on the "server-opaque" point by TASK-0050 above)
 
 **The live sign oracle remains UNREACHABLE: with the chKey-corrected request the
 public atop gateway STILL rejected our `token.get` with `ILLEGAL_CLIENT_ID`
 ("Invalid client;No access", HTTP 200, `success=false`, no `result`) — the SAME
 client-identity / provisioning rejection as the pre-chKey attempt.** Whether this
-is returned strictly BEFORE the gateway evaluates our `sign` is a **server-opaque**
-assertion we cannot prove from the capture: `ILLEGAL_CLIENT_ID` is an
-identity-layer code. The `token.get` SIGN was neither explicitly accepted nor
+is returned strictly BEFORE the gateway evaluates our `sign` ~~is a **server-opaque**
+assertion we cannot prove from the capture~~ **is now CONFIRMED returned BEFORE
+sign-verification by the TASK-0050 corrupted-sign differential above**:
+`ILLEGAL_CLIENT_ID` is an identity-layer code. The `token.get` SIGN was neither explicitly accepted nor
 explicitly rejected by a sign-error code, so the `bmp_token` candidate + MD5 fold
 are STILL NEITHER validated NOR refuted. `password.login` was NOT attempted (zero
 lockout-sensitive calls consumed across BOTH cycles); 2FA was NOT reached.

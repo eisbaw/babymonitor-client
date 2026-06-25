@@ -2,30 +2,59 @@
 """bmp_token_decode.py -- offline decode attempt for the Tuya mobile-sign
 `bmp_token` residual (TASK-0029).
 
+> ***SUPERSEDED / CORRECTED BY TASK-0030 (`re/bmp_token_whitebox.md` §6/§8).***
+> The original (TASK-0029) verdict embedded in this script -- "this APK's bmp_token
+> is a white-box table cipher, NOT the nalajcie matrix scheme; the imath matrix does
+> NOT consume t_s.bmp; there is no edge from the BMP driver" -- is **WRONG and
+> RETRACTED**. The corrected, instruction-level-verified model (see the banner of
+> `re/bmp_token_decode.md` and `re/bmp_token_whitebox.md` §6/§8) is:
+>
+>   - `t_s.bmp` has **TWO** consumers in `libthing_security.so`:
+>       (a) `fcn.199d8` @0x19a64 -> `fcn.11658` = **standard AES-128-CBC** (FIPS-197
+>           S-boxes), keyed by MD5(t_s.bmp); its OUTPUT is the **TLS cert-pinning
+>           config** -- a RED HERRING for the sign token (now fully ported+validated
+>           in `re/scripts/bmp_token_aes.py`). It is NOT a white-box cipher.
+>       (b) `fcn.13b5c` @0x13bf0 = a **raw-bytes reader** (no transform), called from
+>           `doCommandNative` (`fcn.13ef4`) @0x1466c, which passes the **raw t_s.bmp
+>           bytes** to `read_keys_from_content` (`libthing_security_algorithm.so`
+>           @0x4974) -> imath-bignum + matrix decode (`fcn.5eb0`, "inited matrix:")
+>           -> key list -> cmd=1 MD5 key-builder.
+>   - So the signer's **bmp_token IS the imath-matrix decode of `t_s.bmp`** on the
+>     sign path (corroborates F1 `[cert_sha256]_[bmp_token]_[appSecret]` and
+>     `tuya_sign_static.md` §5). The matrix FAMILY is the correct model.
+>   - NARROW TRUE FACT preserved below: nalajcie/tuya-sign-hacking's SPECIFIC older
+>     byte-layout does NOT reproduce THIS APK's token (TASK-0029: this BMP's header
+>     bytes are implausible for that exact reader). That is a *layout* mismatch, NOT
+>     evidence against the matrix scheme -- do not conflate the two.
+
 This script does THREE things, all offline and deterministic:
 
-  1. NALAJCIE REFERENCE (independent cross-check). A faithful, self-contained
+  1. NALAJCIE REFERENCE (older-SDK layout cross-check). A faithful, self-contained
      re-implementation of the *public* Tuya BMP-token deobfuscation documented by
      `nalajcie/tuya-sign-hacking` (review-gate F1): a hash(clientId)->offset walk
      over the BMP pixel bytes that yields (a_i, b_i) coefficient pairs, then an
      EXACT-RATIONAL polynomial-interpolation solve (Gaussian elimination over the
-     rationals, denominator must reduce to 1, numerator-bytes == token). This is
-     the "independent reference" required by TESTING.md Part-2 signal #2 -- it does
-     NOT read our own decompiled control flow as its oracle.
+     rationals, denominator must reduce to 1, numerator-bytes == token). The matrix
+     FAMILY is the right model for this APK (TASK-0030); however nalajcie's SPECIFIC
+     older byte-layout does NOT match this APK's t_s.bmp bytes, so this reader yields
+     no token here. It remains a useful independent reference for the matrix family
+     (it does NOT read our own decompiled control flow as its oracle).
 
   2. THIS-APP FRAMING (recovered parts). The pieces of *this* APK's actual
      `security_infra::SignFileDecoder` pipeline that ARE statically recovered:
        - the `tecrkcehc_ext` asset framing (a decimal length line + a base64
          ciphertext body), parsed exactly as native `fcn.19cf0` does (ASCII-decimal
          base-10 accumulate, stop at '\n');
-       - the embedded constant string the transform is keyed with;
+       - the embedded constant string the AES cert-pin transform is keyed with;
        - the djb2-style string hash native uses for the BMP offset (`fcn.509c`:
          acc = acc*31 + byte; abs()).
 
-  3. WALL CHARACTERISATION. A programmatic assertion that this APK's BMP-token
-     decode is NOT the nalajcie matrix scheme but a white-box table cipher
-     (`libthing_security.so fcn.11658`), so the reference in (1) cannot reproduce
-     this app's token. This is the honest residual.
+  3. RESIDUAL CHARACTERISATION. A programmatic assertion that this APK's signer
+     bmp_token = the imath+matrix decode of t_s.bmp on the sign path -- deterministic
+     and device-independent, but UN-PORTED (no local oracle; nalajcie's older
+     byte-layout doesn't match this APK's specific bytes). This is the honest
+     residual. (The separate AES consumer of t_s.bmp is the cert-pinning config, a
+     red herring -- see `re/scripts/bmp_token_aes.py`.)
 
 NO SECRET VALUE IS HARDCODED. Any recovered value is computed from the assets and,
 if ever fully recovered, must be written ONLY to secrets/ (never a tracked file).
@@ -36,18 +65,24 @@ Symbol anchors (BuildID libthing_security.so 444ecb4f..., algorithm 904862d9...)
   - tecrkcehc_ext reader         : libthing_security.so fcn.0x19bf4 (AAsset "tecrkcehc_ext")
   - ASCII-decimal parse          : libthing_security.so fcn.0x19cf0 (pow(10,...) accumulate, stop 0x0a)
   - embedded constant            : libthing_security.so .rodata 0x85f5 "7178265647164836"
-  - white-box transform (WALL)   : libthing_security.so fcn.0x11570 -> fcn.0x11658
-                                   (tbl v0.16b,{v16-v19}; ldr q1,[x9,0x800] T-table @0x7800;
-                                    dense eor v.8b GF(2) mixing) -- a software white-box
-                                    table-network block cipher, NOT a polynomial/matrix solve.
-  - imath/matrix lib             : libthing_security_algorithm.so read_keys_from_content@0x4974
+  - AES cert-pin transform       : libthing_security.so fcn.0x11570 -> fcn.0x11658
+                                   (standard AES-128-CBC, FIPS-197 S-boxes @0x795f/0x7a5f,
+                                    InvMixColumns 0x1b GF reduction, 10 rounds, CBC).
+                                   This is the cert-pinning-config consumer of t_s.bmp
+                                   (keyed by MD5(t_s.bmp)) -- a RED HERRING for the sign
+                                   token, fully ported in re/scripts/bmp_token_aes.py.
+  - raw t_s.bmp reader (sign)    : libthing_security.so fcn.0x13b5c @0x13bf0 -- returns the
+                                   VERBATIM t_s.bmp bytes (no transform), called from
+                                   doCommandNative fcn.0x13ef4 @0x1466c.
+  - imath/matrix lib (SIGN TOKEN): libthing_security_algorithm.so read_keys_from_content@0x4974
                                    -> parse@0x4eec (comma split) -> matrix fcn.0x5eb0
                                    (mp_rat_div/mul/sub/reduce, mp_int_compare_value denom==1,
-                                    mp_int_to_binary numerator). This path decodes the
-                                   *SDK-config blob* (asset `tecrkcehc`, JSON {"data":[...]}),
-                                   NOT t_s.bmp -- verified: the only xref to the imported
-                                   read_keys_from_content is fcn.0x13ef4 (cmd-dispatch), there
-                                   is no edge from the BMP driver fcn.0x1a030.
+                                    mp_int_to_binary numerator). This path DOES consume the
+                                   raw t_s.bmp bytes (passed as arg4/x3 from doCommandNative
+                                   @0x146b0) AND the SDK-config blob -- it is the SIGNER's
+                                   bmp_token decoder. (The earlier "no edge from the BMP
+                                   driver / single xref to read_keys_from_content" claim was
+                                   FALSE: the second t_s.bmp xref fcn.13b5c feeds this matrix.)
 """
 from __future__ import annotations
 
@@ -248,22 +283,34 @@ def nalajcie_decode(bmp_raw: bytes, client_id: bytes) -> Optional[bytes]:
 
 
 # ---------------------------------------------------------------------------
-# (3) THIS-APP decode -- the wall
+# (3) THIS-APP decode -- the residual (un-ported imath+matrix on the sign path)
 # ---------------------------------------------------------------------------
-class WhiteBoxResidual(NotImplementedError):
-    """Raised to mark the un-ported white-box table cipher (fcn.0x11658)."""
+class MatrixResidual(NotImplementedError):
+    """Raised to mark the un-ported imath+matrix sign-token decode
+    (read_keys_from_content@0x4974 -> matrix fcn.0x5eb0). The token is
+    deterministic + device-independent but has no local oracle; nalajcie's older
+    byte-layout does not match this APK's specific bytes."""
+
+
+# Backwards-compat alias (the historical name; the residual is a matrix decode, not
+# a white-box cipher -- the "white-box" verdict was retracted by TASK-0030).
+WhiteBoxResidual = MatrixResidual
 
 
 def thisapp_decode(assets_dir: str) -> bytes:
-    """What this APK actually does for the bmp_token. The framing is recovered; the
-    core transform is a white-box table cipher and is NOT statically ported."""
-    raise WhiteBoxResidual(
-        "this APK's t_s.bmp token = white-box table cipher (libthing_security.so "
-        "fcn.0x11658: tbl S-box + GF(2) eor mixing + T-table @0x7800), keyed by the "
-        "constant '7178265647164836' over the tecrkcehc_ext base64 ciphertext. It is "
-        "NOT the nalajcie polynomial/matrix scheme. Full static port requires "
-        "extracting all T-tables and reconstructing the SPN round function byte-exactly. "
-        "See re/bmp_token_decode.md (Decode: not-portable-via-reference / partially-ported)."
+    """What this APK actually does for the signer's bmp_token. The framing is
+    recovered, but the token itself is UN-PORTED: it is the imath+matrix decode of
+    the raw t_s.bmp bytes on the sign path -- not produced here."""
+    raise MatrixResidual(
+        "this APK's signer bmp_token = the imath+matrix decode "
+        "(libthing_security_algorithm.so read_keys_from_content@0x4974 / matrix "
+        "fcn.0x5eb0) of the RAW t_s.bmp bytes on the sign path (fed via "
+        "libthing_security.so fcn.0x13b5c -> doCommandNative fcn.0x13ef4 @0x1466c). "
+        "It is deterministic + device-independent but UN-PORTED: no local oracle, and "
+        "nalajcie's older byte-layout doesn't match this APK's specific bytes. The "
+        "AES path (fcn.0x11658) is the SEPARATE cert-pinning consumer of t_s.bmp, a "
+        "red herring (ported in re/scripts/bmp_token_aes.py). "
+        "See re/bmp_token_whitebox.md §8."
     )
 
 
@@ -286,12 +333,13 @@ def main(argv: List[str]) -> int:
         ea = parse_ext_asset(open(ext, "rb").read())
         print(f"tecrkcehc_ext: declared_len(decimal)={ea.declared_len}  "
               f"ciphertext_len={len(ea.payload)} (base64 body)")
-    print(f"embedded constant (key/IV): {EMBEDDED_CONSTANT.decode()}")
+    print(f"embedded constant (AES cert-pin key/IV): {EMBEDDED_CONSTANT.decode()}")
 
-    # (1) Run the independent nalajcie reference. Demonstrate it does NOT apply here.
-    # We probe a small set of plausible clientId byte-strings; the goal is to SHOW
-    # the matrix scheme yields no consistent token from this BMP (the wall), not to
-    # brute the real clientId (which lives in secrets/, not here).
+    # (1) Run the nalajcie older-SDK-layout reference. The matrix FAMILY is the right
+    # model for this APK (TASK-0030), but nalajcie's SPECIFIC older byte-layout does
+    # not match this APK's t_s.bmp bytes -- so this exact reader yields no token here.
+    # We probe the public demo clientId only to SHOW the layout mismatch, not to brute
+    # the real clientId (which lives in secrets/, not here).
     sample_ids = [b"3fjrekuxank9eaej3gcx"]  # the nalajcie demo clientId (public)
     matched = False
     for cid in sample_ids:
@@ -301,15 +349,18 @@ def main(argv: List[str]) -> int:
             print(f"nalajcie-reference produced a token for clientId={cid!r}: "
                   f"{len(tok)} bytes")
     if not matched:
-        print("nalajcie-reference: NO consistent matrix token from this BMP "
-              "(expected -- this APK uses a white-box cipher, not the matrix scheme).")
+        print("nalajcie-reference (older SDK layout): NO token from this BMP "
+              "(expected -- the matrix FAMILY is correct, but nalajcie's specific "
+              "older byte-layout doesn't match this APK's t_s.bmp bytes).")
 
-    # (3) The actual app decode is the wall.
+    # (3) The actual signer bmp_token is the un-ported imath+matrix residual.
     try:
         thisapp_decode(assets)
-    except WhiteBoxResidual as e:
-        print("\nWALL (residual):", str(e))
-    print("\nDecode: not-portable-via-reference (white-box) / partially-ported (framing)")
+    except MatrixResidual as e:
+        print("\nRESIDUAL (un-ported):", str(e))
+    print("\nDecode: signer bmp_token un-ported (imath+matrix of raw t_s.bmp on the "
+          "sign path) / framing partially-ported / AES cert-pin path ported separately "
+          "(re/scripts/bmp_token_aes.py)")
     return 0
 
 

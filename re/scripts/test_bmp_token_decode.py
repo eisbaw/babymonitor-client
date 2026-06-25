@@ -92,21 +92,32 @@ class TestMatrixSolverKnownVector(unittest.TestCase):
 
 
 class TestNalajcieReferenceVsThisApp(unittest.TestCase):
-    """The independent cross-check: nalajcie matrix scheme must NOT reproduce this
-    APK's token (the documented finding) -- this app is a white-box cipher."""
+    """The narrow, TRUE residual fact (corrected by TASK-0030): the matrix FAMILY is
+    the correct model for this APK's signer bmp_token (raw t_s.bmp -> imath+matrix
+    decode on the sign path), but nalajcie/tuya-sign-hacking's SPECIFIC older
+    byte-layout does NOT reproduce this APK's token -- a layout mismatch, NOT evidence
+    against the matrix scheme. The token itself is un-ported (no local oracle)."""
 
     @unittest.skipUnless(os.path.exists(os.path.join(ASSETS, "t_s.bmp")), "assets absent")
-    def test_matrix_scheme_does_not_apply(self):
+    def test_nalajcie_older_layout_does_not_match_this_apk(self):
+        # The matrix FAMILY is the right model (TASK-0030); this asserts ONLY the
+        # narrow layout fact: nalajcie's SPECIFIC older reader finds an implausible
+        # header on this APK's t_s.bmp and yields no token. It does NOT assert "this
+        # isn't a matrix scheme" (it is -- see re/bmp_token_whitebox.md §8).
         with open(os.path.join(ASSETS, "t_s.bmp"), "rb") as fh:
             bmp = fh.read()
-        # the public nalajcie demo clientId; on THIS bmp the matrix header is
-        # implausible -> no token. This asserts the scheme mismatch (the wall).
         tok = M.nalajcie_decode(bmp, b"3fjrekuxank9eaej3gcx")
-        self.assertIsNone(tok, "unexpected: matrix scheme produced a token on this BMP")
+        self.assertIsNone(
+            tok,
+            "nalajcie's older byte-layout unexpectedly produced a token on this BMP",
+        )
 
     @unittest.skipUnless(os.path.exists(os.path.join(ASSETS, "t_s.bmp")), "assets absent")
-    def test_thisapp_decode_is_walled(self):
-        with self.assertRaises(M.WhiteBoxResidual):
+    def test_thisapp_decode_is_unported(self):
+        # The signer bmp_token is the un-ported imath+matrix decode of raw t_s.bmp on
+        # the sign path -- it still raises (token not produced), but the reason is the
+        # MATRIX residual, not the retracted "white-box cipher" verdict.
+        with self.assertRaises(M.MatrixResidual):
             M.thisapp_decode(ASSETS)
 
 

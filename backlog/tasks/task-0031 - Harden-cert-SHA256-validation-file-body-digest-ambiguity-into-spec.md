@@ -1,11 +1,11 @@
 ---
 id: TASK-0031
 title: Harden cert-SHA256 validation + file body-digest ambiguity into spec
-status: In Progress
+status: Done
 assignee:
   - '@architect'
 created_date: '2026-06-25 04:53'
-updated_date: '2026-06-25 09:11'
+updated_date: '2026-06-25 09:17'
 labels:
   - rust
   - auth
@@ -60,4 +60,6 @@ GOTCHAS / LIMITATIONS:
 - The real APK is a SINGLE self-signed cert, so the multi-cert leaf-selection path is exercised ONLY by synthetic tests, not by the live cert. If Philips ever ships a multi-cert chain, the byte-equality DN match is the thing to re-validate.
 - cert-crosscheck needs both the gitignored APK AND openssl on PATH (present under nix-shell). It is NOT in the e2e gate (needs the APK) — run it manually / pre-publish.
 - leaf_cert_offset_from_asn1parse assumes the first d=4 SEQUENCE after the certificates 'cont [ 0 ]' line is the leaf; fine for the single-cert APK. The Rust extractor (not this reference helper) owns true multi-cert leaf selection.
+
+Cycle-26 review: both GO. Extractor hardening sound (PKCS#7 nav + fail-loud leaf selection; architect fuzzed 8 malformed blobs = zero panics); cross-check PROVEN independent (architect measured raw d2d6.. != re-encode 06b9.. != whole-block 1a05..; Rust yields the raw = Android semantics); value withheld; body-digest caveat honest. CORRECTION to my impl-note: the earlier 'openssl re-encode coincidentally agrees (cert already canonical)' is FALSE — re-encode genuinely DIFFERS from the raw leaf for this cert (which makes the -strparse reference choice load-bearing, not incidental); do not cite re-encode as benign. P2 tracker-render artifact reconciled (Done).
 <!-- SECTION:NOTES:END -->

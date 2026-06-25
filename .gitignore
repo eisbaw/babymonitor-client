@@ -42,3 +42,6 @@ result
 result-*
 *.swp
 .DS_Store
+
+# Backlog tool runtime artifact
+backlog/email-preferences.json

@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@reverser'
 created_date: '2026-06-25 03:29'
-updated_date: '2026-06-25 04:11'
+updated_date: '2026-06-25 04:12'
 labels:
   - phase3
   - re
@@ -36,11 +36,5 @@ Residual blocker from TASK-0023 static signer dive (re/tuya_sign_static.md §5).
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-GOTCHAS / honest findings:
-- The tuya_sign_static.md §5 hypothesis (t_s.bmp decoded by imath matrix) is WRONG. Disassembly: read_keys_from_content (imath matrix, mp_rat_*) is only xref'd from cmd-dispatch fcn.13ef4 (SDK-config blob, asset tecrkcehc JSON); there is NO edge from the BMP driver fcn.1a030. The matrix decodes config keys, not the BMP token.
-- The REAL t_s.bmp token decode (libthing_security.so fcn.1a030 -> fcn.19810 -> fcn.11570 -> fcn.11658) is a WHITE-BOX TABLE CIPHER: tbl v0.16b{v16-v19} S-box, ldr q1,[x9,0x800] T-table @.rodata 0x7800, dense eor v.8b GF(2) mixing, tables also @0x38000/0x39000. Keyed by embedded constant '7178265647164836' (.rodata 0x85f5) over the tecrkcehc_ext base64 ciphertext (header decimal 226 + 344-byte body, parsed by fcn.19cf0 base-10 pow accumulate).
-- This is NOT nalajcie's polynomial/matrix BMP scheme — nalajcie reversed an OLDER Tuya SDK. Confirmed by porting nalajcie's exact-rational solver (validated on a planted known-vector) and showing it produces NO consistent token from this BMP.
-- Decode: partially-ported. Framing (BMP read, ext decimal parse, offset string-hash acc*31+byte/abs, constant) recovered + unit-tested (12 tests, re/scripts/test_bmp_token_decode.py). White-box cipher = the WALL: needs all T-tables extracted + fcn.11658 SPN reconstructed byte-exact, with no local oracle until the end-to-end sign differential. Did NOT complete; chose Python (not a non-functional Rust stub).
-- TASK-0012 byte-for-byte differential remains BLOCKED offline on bmp_token only; recommend its AC#3 contingency (one gated live-captured request as the gold vector) over completing the white-box port. Partial differential (cert-hash+appSecret+MD5+'_'-join, placeholder token) achievable now.
-- No secret value written to any tracked file (secret-scan green). The embedded constant '7178265647164836' is a public APK whitebox parameter, not a recovered token/key.
+FINAL: partial result delivered + committed (c2298cd). Follow-up filed as TASK-0030 (white-box port OR live-vector contingency). Task stays In Progress — NOT Done — because the decode is only partially ported (framing + independent cross-check), the white-box token producer (fcn.11658) is the un-ported wall.
 <!-- SECTION:NOTES:END -->

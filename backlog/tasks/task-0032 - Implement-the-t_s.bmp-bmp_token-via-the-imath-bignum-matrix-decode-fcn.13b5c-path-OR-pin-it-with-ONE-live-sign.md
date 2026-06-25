@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-06-25 05:42'
-updated_date: '2026-06-25 06:03'
+updated_date: '2026-06-25 06:35'
 labels:
   - phase3
   - re
@@ -27,3 +27,9 @@ TASK-0030 JOB-1 corrected the premise of the original TASK-0032 (which wrongly s
 - [ ] #2 SignBody KeyOnly-vs-KeyAndCanonical + postData 24-vs-32 ambiguities resolved in one place
 - [ ] #3 sign::Signer wired with the confirmed bmp_token provider; sign::tests::full_signature_byte_parity_pending_task_0030 asserts byte parity
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+TASK-0033 (Ghidra-headless port) is the deep-static attempt to resolve this residual; if it lands a confident byte-exact port, TASK-0032 narrows to just the live-vector validation.
+<!-- SECTION:NOTES:END -->

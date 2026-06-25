@@ -1,11 +1,11 @@
 ---
 id: TASK-0015
 title: 'REVIEW GATE: Wave-1 code + analysis (mped-architect + qa-test-runner)'
-status: In Progress
+status: Done
 assignee:
   - '@orchestrator'
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 06:33'
+updated_date: '2026-06-25 06:34'
 labels:
   - phase-gate
   - review
@@ -37,4 +37,6 @@ WAVE-1 GATE (read-only). Run mped-architect (architecture/honesty) and qa-test-r
 
 <!-- SECTION:NOTES:BEGIN -->
 P0 fix applied (Wave-1 NO-GO): the shipped client + README + live-e2e test still described the RETRACTED white-box-table-cipher model and cited the CLOSED TASK-0030. Reconciled the code to the FINAL settled model — bmp_token is the imath-bignum + matrix decode on the sign path (fcn.13b5c -> read_keys_from_content@0x4974 -> matrix fcn.5eb0); the AES-128-CBC fcn.11658 is a separate cert-pinning consumer (red herring for the signer). Mechanical, no logic change: README.md, babymonitor-core/{lib,sign,device}.rs, babymonitor-cli/src/main.rs + tests/live_e2e.rs; 'white-box table cipher' -> the matrix model, TASK-0030 -> TASK-0032, doc refs repointed to re/tuya_sign_static.md §5 + re/bmp_token_whitebox.md §8; the runtime BmpTokenPending message + CLI JSON blocked_on now cite TASK-0032; renamed sign::tests::full_signature_byte_parity_pending_task_0030 -> _task_0032. Also closed stale-In-Progress TASK-0029. Gates GREEN: e2e, check-evidence, secret-scan. rg 'TASK-0030|white-box table cipher' over babymonitor/ now empty.
+
+Wave-1 holistic gate: qa GO (52 tests, gates bite, zero secret leaks in all history); architect NO-GO on P0-1 (shipped client/README cited retracted white-box model + closed TASK-0030) -> fixed d2bbd9b (verified: zero stale refs, auth login now cites TASK-0032/imath+matrix). Wave-1 declared COMPLETE. Wave-2 risks (per architect): R1 bmp_token no-oracle, R2 WebRTC stream unbuilt, R3 cert-extractor brittleness, R4 citation drift.
 <!-- SECTION:NOTES:END -->

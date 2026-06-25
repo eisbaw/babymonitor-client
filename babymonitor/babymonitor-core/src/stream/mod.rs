@@ -9,8 +9,9 @@
 //! - [`signaling`] — the MQTT **302** signaling envelope `{header,msg,token}`
 //!   (offer/answer/candidate/disconnect) serde codec (`re/webrtc_session.md` §2).
 //! - [`mqtt_crypto`] — the SDP `a=aes-key:<hex>` media-key hex codec (byte-exact,
-//!   `re/webrtc_session.md` §3c) + the 302-payload localKey-AES seam (the AES
-//!   *mode/IV* is NOT statically pinned — see the module honesty note there).
+//!   `re/webrtc_session.md` §3c) + the 302-payload localKey-AES primitive
+//!   (recovered + KAT-pinned: AES-128/ECB/PKCS5, key=localKey, no IV; only the
+//!   pv→output-variant binding + outer framing stay live-gated — see the module).
 //! - [`connect`] — the `connect_v2` control-JSON builder (byte-exact template,
 //!   `re/webrtc_session.md` §1).
 //! - [`sdp`] — parse/emit the Tuya-custom `m=application` + `a=aes-key` section

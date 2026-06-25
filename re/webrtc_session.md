@@ -148,6 +148,37 @@ dedicated WebRTC topic). `P2PMQTTServiceManager`:
 - **Outbound, LAN (`lan_mode=1`):** `homeCamera.lan302Publish(devId, jsonMsg, cb)`.
 - **Inbound:** `registerMqtt302(cb)` → `homeCamera.registerCameraP2P302Listener`.
 
+**The 302-payload AES cipher IS statically pinned** (a prior claim in
+`babymonitor-core` that the mode was "not statically pinnable / runtime
+`AESUtil.ALGO`" was FALSE — corrected by reading the decompile). Evidence:
+- `decompiled/jadx/sources/com/thingclips/sdk/mqtt/qpqddqd.java`:
+  `aESUtil.setALGO("AES")` (`:133`, `:234`, `:632`) — a **CONSTANT string `"AES"`**,
+  not a runtime numeric mode — then `aESUtil.setKeyValue(str.getBytes())`
+  (`:134`/`:235`/`:633`): the key is the **ASCII bytes of the `localKey` string**
+  (16 bytes). Output is chosen by the publish bean: `encrypt(data)` (`:136`),
+  `encryptWithBase64(jSONString)` (`:237`), or `encryptWithBytes(jSONString)` (`:635`).
+- `decompiled/jadx/sources/com/thingclips/smart/android/common/utils/AESUtil.java`:
+  `Cipher.getInstance(this.ALGO)` with `ALGO=="AES"` (`:526` encrypt, `:329` decrypt)
+  ⇒ the JCE default transformation **`AES/ECB/PKCS5Padding`**; `cipher.init(1/2,
+  key)` (`:527`/`:330`) with **NO `IvParameterSpec` ⇒ no IV (ECB)**; key =
+  `new SecretKeySpec(this.keyValue, this.ALGO)` (`:189`). `encrypt()` returns
+  **UPPERCASE** hex via `byte2hex` (`.toUpperCase()`, `:64`/`:528`);
+  `encryptWithBase64` returns base64 (`:586`); `encryptWithBytes` returns raw bytes
+  (`:593`).
+
+So the cipher = **AES-128 / ECB / PKCS5(=PKCS7) padding, key = `localKey` (16 ASCII
+bytes), NO IV**; output = hex (upper) | base64 | raw by the publish variant. This
+is implemented + KAT-tested in `babymonitor-core::stream::mqtt_crypto`
+(`aes128_ecb_encrypt`/`aes302_encrypt`, vector checked against `openssl enc
+-aes-128-ecb`).
+
+**What GENUINELY remains live-gated (residual, not the cipher):** (1) the **`pv` →
+output-variant binding** for message code 302 — which of `encrypt`/
+`encryptWithBase64`/`encryptWithBytes` a 302 publish uses at a given `pv` — and (2)
+the **outer Tuya MQTT envelope framing** around the AES payload. There is no
+offline oracle / captured live 302 to pin those, so they stay gated
+(`Error::MqttEnvelopePending`); see §9.
+
 The native side hands the JSON to Java via
 `ThingSmartP2PSDK::SendMessageThroughMQTT(char* target, char* jsonMsg, uint len)`
 (Ghidra `re/ghidra/ThingSmartP2PSDK_Initialize.c` callback `on_msg`, and
@@ -483,7 +514,8 @@ WebRTC ref `tuya-ipc-terminal` (same 302 + SDP architecture).)
 | **`connect_v2`/`set_remote_online` control JSON** | ❌ | **emit the cmd JSON (§1) — but only if talking to the device's native SDK; if peering directly via SDP it's the offer that matters** |
 | **`m=application` + `a=aes-key` + `imm` codec** (§3c) | ❌ | **parse/emit the application m-section; apply the SDP-carried AES key to the imm media** |
 | **KCP/ARQ reliability on the imm data path** (§3d) | ❌ | **Tuya-custom; only needed if using the imm transport rather than SRTP tracks** |
-| 302 payload AES (localKey) + `pv` | ❌ | **port from `com/thingclips/sdk/mqtt/` (TASK-0007/0013)** |
+| 302 payload AES (localKey) | ❌ | **DONE — AES-128/ECB/PKCS5, key=localKey, no IV (recovered §2a; impl `mqtt_crypto::aes128_ecb_encrypt`, KAT vs openssl)** |
+| 302 `pv`→output-variant binding + outer MQTT framing | ❌ | **live-gated residual — which of hex/base64/raw a 302 publish uses + the envelope framing need a live 302 capture (`Error::MqttEnvelopePending`)** |
 
 ---
 
@@ -562,6 +594,13 @@ the AC#2/#3 "which bytes a pcap unblocks" answer):
    public Tuya IPC ref, absent from this app's beans — §2b).
 4. **Exact candidate-vs-answer interleaving / renegotiation timing** (§5) — a
    capture pins it; webrtc-rs's trickle handling is tolerant of either order.
+5. **The 302-payload `pv`→output-variant binding + outer Tuya MQTT framing** (§2a).
+   The AES *cipher* is statically pinned and implemented (AES-128/ECB/PKCS5,
+   key=localKey, no IV); what a capture confirms is which output variant
+   (`encrypt` hex / `encryptWithBase64` / `encryptWithBytes` raw) a 302 publish
+   uses at a given `pv`, and the envelope framing around it
+   (`Error::MqttEnvelopePending`). This is NOT a cipher-mode unknown — it is a
+   wire-encoding/variant selection that one captured 302 resolves.
 
 None of these block writing the TASK-0034 scaffolding now (signaling envelope +
 webrtc-rs session + decoders, unit-tested offline); they gate only the final live

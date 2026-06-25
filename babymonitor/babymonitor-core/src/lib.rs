@@ -112,17 +112,30 @@ pub enum Error {
     #[error("SDP aes-key error: {0}")]
     SdpAesKey(String),
 
-    /// The 302-payload localKey-AES crypto is not yet implementable: the exact
-    /// AES mode/IV/padding is NOT statically pinned (the Tuya MQTT `AESUtil.ALGO`
-    /// is set at runtime; the obfuscated `Cipher.getInstance` arg is jadx-mangled
-    /// — `re/webrtc_session.md` §2a/§7). We surface this typed error rather than
-    /// guessing a mode (which would silently produce wrong ciphertext); filed as
-    /// a follow-up (TASK-0037). This is the same honesty as `BmpTokenPending`.
+    /// The 302-publish **envelope assembly** is pending — but NOT the AES
+    /// primitive itself, which is now recovered and implemented.
+    ///
+    /// The cipher IS statically pinned: `AESUtil.setALGO("AES")` (a CONSTANT
+    /// string, not a runtime numeric mode) ⇒ JCE default `AES/ECB/PKCS5Padding`,
+    /// `cipher.init(mode, key)` with NO `IvParameterSpec` (no IV), key = the
+    /// device `localKey` ASCII bytes; output is hex/base64/raw by publish variant
+    /// (`decompiled/.../AESUtil.java`, `.../sdk/mqtt/qpqddqd.java`;
+    /// `re/webrtc_session.md` §2a). [`stream::mqtt_crypto`] now AES-encrypts.
+    ///
+    /// What GENUINELY remains live-gated (no offline oracle, no captured 302):
+    /// (1) the **`pv` → output-variant binding** for message code 302 — which of
+    /// `encrypt` (hex) / `encryptWithBase64` / `encryptWithBytes` (raw) the
+    /// device expects at a given protocol version `pv`; and (2) the **outer Tuya
+    /// MQTT envelope framing** around the AES payload. We surface this typed error
+    /// for the *assembly* rather than guess the variant/framing (which the device
+    /// would reject). The AES primitive itself never returns this — it succeeds.
     #[error(
-        "302-payload localKey-AES is pending: the AES mode/IV is not statically \
-         pinned (runtime AESUtil.ALGO) — blocked on TASK-0037 (mode port / live capture)"
+        "302-publish envelope is pending: the AES primitive is implemented \
+         (AES-128/ECB/PKCS5, key=localKey, no IV), but the pv→output-variant \
+         binding for code 302 and the outer Tuya MQTT framing need a live 302 \
+         capture to pin — blocked on TASK-0037 (live capture)"
     )]
-    MqttCryptoPending,
+    MqttEnvelopePending,
 
     /// A frame model operation failed: an unrecognized `imm_p2p_rtc_frame_t.type`,
     /// an unsupported rtpmap codec, or an empty payload
@@ -142,11 +155,12 @@ pub enum Error {
     /// The honest **not-yet-live** state of the live A/V session: the client
     /// cannot actually stream because every runtime input is auth-gated and
     /// absent (token/p2pId/p2pKey/ices/session/localKey/pv — TASK-0032 +
-    /// the Wave-2 auth decision TASK-0035), the 302-payload AES mode is unpinned
-    /// ([`Error::MqttCryptoPending`]), and the WebRTC media engine is a follow-up
-    /// (no webrtc-rs in this build — TASK-0037). The live driver returns THIS
-    /// rather than a fabricated stream or `todo!()` — exactly the signer's
-    /// TOKEN-PENDING discipline.
+    /// the Wave-2 auth decision TASK-0035), the 302-publish envelope assembly is
+    /// pending ([`Error::MqttEnvelopePending`] — the AES primitive is implemented,
+    /// but the pv→variant binding + outer framing need a live capture), and the
+    /// WebRTC media engine is a follow-up (no webrtc-rs in this build —
+    /// TASK-0037). The live driver returns THIS rather than a fabricated stream
+    /// or `todo!()` — exactly the signer's TOKEN-PENDING discipline.
     #[error(
         "live A/V stream is pending: cannot stream until auth unblocks (device \
          creds + signing) and the WebRTC media engine lands (TASK-0037)"

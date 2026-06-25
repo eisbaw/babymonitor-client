@@ -100,9 +100,11 @@ fn live_login_then_device_list_finds_scd921() {
 /// (a) every runtime credential is auth-gated and absent (token/p2pId/p2pKey/
 /// ices/session/localKey/pv — needs TASK-0032 + the Wave-2 auth decision to fetch
 /// the device's `CameraInfoBean`/`P2pConfig`), (b) the 302-payload localKey-AES
-/// mode is not statically pinned (`Error::MqttCryptoPending` — TASK-0037), and
-/// (c) the WebRTC media engine (webrtc-rs) is a follow-up (TASK-0037). It makes
-/// NO network call and renders NO fabricated frame.
+/// PRIMITIVE is now implemented (AES-128/ECB/PKCS5, key=localKey), but the full
+/// 302 envelope assembly is pending (`Error::MqttEnvelopePending`: the
+/// pv→output-variant binding + outer Tuya MQTT framing need a live capture —
+/// TASK-0037), and (c) the WebRTC media engine (webrtc-rs) is a follow-up
+/// (TASK-0037). It makes NO network call and renders NO fabricated frame.
 ///
 /// FUTURE (once auth unblocks + a real SCD921 returns p2pType=4): replace the
 /// engine/transport fakes with the real `RumqttcTransport` (TLS feature on) + the
@@ -117,8 +119,8 @@ fn live_login_then_device_list_finds_scd921() {
 /// shot, `--test-threads=1`. Nothing here prints a secret.
 #[test]
 #[ignore = "live A/V stream: needs the user's real Tuya account + device creds \
-            (TASK-0032 + the Wave-2 auth decision TASK-0035), the pinned \
-            302-payload AES mode + webrtc-rs engine (TASK-0037), and a live SCD921 \
+            (TASK-0032 + the Wave-2 auth decision TASK-0035), the 302 envelope \
+            variant/framing binding + webrtc-rs engine (TASK-0037), and a live SCD921 \
             returning p2pType=4. Run manually with --ignored --test-threads=1. \
             Today it asserts the honest stream-pending state, not a fabricated \
             stream."]

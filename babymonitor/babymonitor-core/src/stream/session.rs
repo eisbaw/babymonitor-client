@@ -106,8 +106,9 @@ pub fn mint_connect_session<R: RandomSource>(rng: &R) -> Result<String, Error> {
 ///
 /// The offline tests implement this with an in-memory fake (no broker); the live
 /// path implements it with `rumqttc` against the device's Tuya MQTT channel. The
-/// payload bytes here are the ALREADY-localKey-AES-encrypted 302 payload (the
-/// crypto is [`super::mqtt_crypto`], currently pending).
+/// payload bytes here are the ALREADY-localKey-AES-encrypted 302 payload (the AES
+/// primitive lives in [`super::mqtt_crypto`] and is recovered; the full envelope
+/// variant/framing assembly is the part still live-gated).
 pub trait MqttTransport {
     /// Publish an (encrypted) 302 payload to the device's signaling channel.
     ///
@@ -223,9 +224,12 @@ impl<'a, T: MqttTransport, E: WebRtcEngine> LiveSessionDriver<'a, T, E> {
     ///
     /// # Honest gating (TASK-0034 AC#2)
     /// This CANNOT run in the current state and returns
-    /// [`Error::StreamPending`]: the 302 payload localKey-AES mode is unpinned
-    /// ([`super::mqtt_crypto`] pending — TASK-0037), the WebRTC media engine is a
-    /// follow-up (no webrtc-rs in this build), and every runtime credential is
+    /// [`Error::StreamPending`]: the 302-payload AES primitive is now implemented
+    /// (AES-128/ECB/PKCS5, key=localKey — [`super::mqtt_crypto`]), but the 302
+    /// envelope assembly is still pending ([`super::mqtt_crypto::encrypt_302_payload`]
+    /// returns [`Error::MqttEnvelopePending`]: the pv→output-variant binding +
+    /// outer framing need a live capture — TASK-0037), the WebRTC media engine is
+    /// a follow-up (no webrtc-rs in this build), and every runtime credential is
     /// auth-gated and absent (TASK-0032 + Wave-2 auth). We surface that honestly
     /// rather than fabricate a stream. The credential validation DOES run first,
     /// so a misconfigured call still fails loud with the precise reason.
@@ -240,11 +244,13 @@ impl<'a, T: MqttTransport, E: WebRtcEngine> LiveSessionDriver<'a, T, E> {
         // Build the (offline-valid) connect_v2 control JSON + the local offer,
         // splice the media key into the offer's application section, wrap it in a
         // 302 envelope — all of which is RE-derived and testable. Then ATTEMPT to
-        // encrypt it with the localKey and publish via the transport seam. The
-        // encrypt step is where the honest gate bites: the 302-payload AES mode
-        // is unpinned (mqtt_crypto pending), so we cannot produce a publishable
-        // payload. We exercise the real seam up to that point rather than
-        // short-circuiting, so the wiring is genuinely connected (no dead code).
+        // assemble the full 302 publish payload via the transport seam. The AES
+        // PRIMITIVE itself is now recovered + implemented (AES-128/ECB/PKCS5,
+        // key=localKey — `mqtt_crypto::aes128_ecb_encrypt`); the honest gate now
+        // bites only on the FULL ENVELOPE: the pv→output-variant binding for code
+        // 302 + the outer Tuya MQTT framing are unpinned (no live capture), so a
+        // publishable payload cannot be assembled yet. We exercise the real seam
+        // up to that point rather than short-circuiting (no dead code).
         let connect_json = self.build_connect_message(rng, trace_id)?;
 
         // The offer SDP comes from the (follow-up) WebRTC engine; building it
@@ -252,23 +258,23 @@ impl<'a, T: MqttTransport, E: WebRtcEngine> LiveSessionDriver<'a, T, E> {
         // minted and injected via sdp::inject_aes_key at the integration site.
         let _offer = self.engine.create_offer()?;
 
-        // Encrypt the control JSON with the device localKey for 302 publish.
-        // This returns MqttCryptoPending (mode unpinned) in this build.
+        // Assemble the 302 publish payload from the control JSON + device
+        // localKey. The AES bytes are produced, but the variant/framing binding
+        // is unpinned, so this returns MqttEnvelopePending in this build.
         match crate::stream::mqtt_crypto::encrypt_302_payload(
             connect_json.as_bytes(),
             self.creds.local_key.as_bytes(),
             &self.creds.pv,
         ) {
             Ok(payload) => {
-                // If the crypto were available, we would publish here. It is not,
-                // so this arm is unreachable today — but it keeps the transport
-                // seam genuinely wired for when the crypto lands.
+                // Once the pv→variant binding + framing are pinned, we publish
+                // here. Unreachable today, but it keeps the transport seam wired.
                 self.transport
                     .publish_302(&self.creds.dev_id, &self.creds.pv, &payload)?;
             }
-            Err(Error::MqttCryptoPending) => {
-                // Expected: the 302-payload AES mode is unpinned. Fall through to
-                // the honest StreamPending below.
+            Err(Error::MqttEnvelopePending) => {
+                // Expected: the AES bytes are computed, but the 302 envelope
+                // variant/framing is unpinned. Fall through to StreamPending.
             }
             Err(other) => return Err(other),
         }
@@ -432,10 +438,11 @@ mod tests {
                 "the live session cannot stream (auth + media engine gated); must report pending"
             );
         }
-        // The transport was wired but never published (crypto pending).
+        // The transport was wired but never published (the AES bytes compute, but
+        // the 302 envelope variant/framing assembly is still pending).
         assert!(
             t.published.is_empty(),
-            "no 302 published while crypto is pending"
+            "no 302 published while the envelope assembly is pending"
         );
     }
 

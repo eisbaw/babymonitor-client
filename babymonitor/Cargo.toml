@@ -20,6 +20,16 @@ dirs = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
+# 302-payload localKey-AES primitive (TASK-0037). The recovered cipher is
+# AES-128/ECB/PKCS5(=PKCS7), NO IV, key=localKey ASCII bytes — see
+# decompiled/.../AESUtil.java getInstance(this.ALGO="AES") + init(mode,key) with
+# no IvParameterSpec. We use the vetted RustCrypto `aes` block cipher and drive
+# raw ECB blocks via its `cipher::BlockEncrypt`/`BlockDecrypt` traits, adding
+# PKCS7 padding ourselves (small, auditable, KAT-checked against openssl). The
+# standalone `ecb` crate is NOT used: it is absent from the offline registry
+# index, so pulling it would break `just assert-offline`; `aes`+`cipher` are
+# already in the local cargo cache, keeping the offline gate green.
+aes = "0.8"
 # Inflate the (DEFLATE-compressed) APK signature block for the offline cert
 # hash. Pure-Rust miniz_oxide backend (no system zlib) keeps the e2e gate
 # self-contained and offline.

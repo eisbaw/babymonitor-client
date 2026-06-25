@@ -102,7 +102,7 @@ showcase:
     show "info"                info
     show "info --json"         info --json
     show "default (no subcommand)"
-    show "auth login (token-pending)" auth login
+    show "auth login (identity-gate blocked)" auth login
     show "auth login --json"   --json auth login
     show "auth status"         auth status
     show "auth status --json"  --json auth status
@@ -110,9 +110,10 @@ showcase:
     show "devices list --json" --json devices list
     show "devices show camera" devices show synth-dev-0001-camera
     show "devices show --json" --json devices show synth-dev-0001-camera
-    # NB: `devices list --live` is intentionally OMITTED — it is token-pending and
-    # exits non-zero by design (an honest "I couldn't do the live fetch"), which is
-    # correct error semantics but would (correctly) fail this all-must-pass gate.
+    # NB: `devices list --live` is intentionally OMITTED — it is blocked by the
+    # server-side identity gate (no session, no fetch) and exits non-zero by design
+    # (an honest "I couldn't do the live fetch"), which is correct error semantics
+    # but would (correctly) fail this all-must-pass gate.
     if [ "$fail" -ne 0 ]; then echo "showcase: a command failed"; exit 1; fi
     echo "showcase: OK (all read-only commands ran without panic)"
 

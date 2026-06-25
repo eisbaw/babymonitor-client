@@ -5,14 +5,19 @@
 //!
 //! - `auth status` / `auth logout` — work fully OFFLINE against the on-disk
 //!   [`SessionStore`] (no network).
-//! - `auth login` — **token-pending**: the client cannot actually log in yet. A
-//!   valid request signature needs the `bmp_token` decoded from `assets/t_s.bmp`
-//!   (TASK-0032). `login` reports that honestly via
-//!   [`babymonitor_core::Error::BmpTokenPending`] and NEVER fabricates a session.
+//! - `auth login` — **blocked by a server-side identity gate**: a from-scratch
+//!   static client cannot obtain a session. Tuya rejects `token.get` with
+//!   `ILLEGAL_CLIENT_ID` at the client-identity layer, *before* it ever evaluates
+//!   our request signature — proven sign-insensitive by a corrupted-sign
+//!   differential (TASK-0050) and host-exhausted (TASK-0048/0051). `login` reports
+//!   that honestly and NEVER fabricates a session. The client is nonetheless
+//!   **token-injectable**: supply one captured live session (TASK-0022) and the
+//!   same code path runs for real (see the top-level README §6).
 //! - `devices list` / `devices show <id>` — parse + display a device list. The
 //!   OFFLINE path reads a response **body** from a `--fixture` file (default: the
 //!   synthetic test fixture) so the model layer is exercised without a network.
-//!   The `--live` path is token-pending (same `bmp_token` gate) and says so.
+//!   The `--live` path is blocked by the same identity gate (it never obtains the
+//!   session a real fetch needs) and says so, touching no network.
 //!
 //! Output policy: every subcommand supports `--json` for machine consumption
 //! alongside the default human text.
@@ -71,12 +76,14 @@ struct Cli {
 enum Command {
     /// Print build/scaffold info. A safe smoke-test target for `just showcase`.
     Info,
-    /// Account session commands (status/logout offline; login is token-pending).
+    /// Account session commands (status/logout offline; login is blocked by the
+    /// server-side identity gate).
     Auth {
         #[command(subcommand)]
         action: AuthAction,
     },
-    /// Device-list commands (offline against a fixture body; live is token-pending).
+    /// Device-list commands (offline against a fixture body; live is blocked by
+    /// the server-side identity gate).
     Devices {
         #[command(subcommand)]
         action: DevicesAction,
@@ -86,9 +93,11 @@ enum Command {
 /// `auth` subcommands.
 #[derive(Debug, Subcommand)]
 enum AuthAction {
-    /// Attempt account login. TOKEN-PENDING: the client cannot log in yet — a
-    /// valid sign needs the bmp_token (TASK-0032). Reports the pending state
-    /// honestly; never fabricates a session.
+    /// Attempt account login. BLOCKED by a server-side identity gate: Tuya rejects
+    /// `token.get` with `ILLEGAL_CLIENT_ID` before it evaluates the signature
+    /// (proven sign-insensitive, TASK-0050; host-exhausted, TASK-0048/0051), so a
+    /// from-scratch static client cannot obtain a session. Reports that honestly;
+    /// never fabricates a session. The session slot is injectable (TASK-0022).
     Login,
     /// Show the on-disk session state (offline; no network).
     Status,
@@ -158,9 +167,11 @@ struct DevicesSource {
     /// the synthetic test fixture so the command always has something to show.
     #[arg(long)]
     fixture: Option<PathBuf>,
-    /// Attempt the LIVE cloud fetch instead of a fixture. TOKEN-PENDING: returns
-    /// the honest pending state (no network is touched) — a valid sign needs the
-    /// bmp_token (TASK-0032).
+    /// Attempt the LIVE cloud fetch instead of a fixture. BLOCKED: returns the
+    /// honest no-session state (no network is touched). A live fetch needs an
+    /// authenticated session, which the server-side identity gate prevents a
+    /// from-scratch client from obtaining (TASK-0050/0051). Inject a captured
+    /// session (TASK-0022) to drive the real path.
     #[arg(long)]
     live: bool,
     /// Reveal secret/PII fields (localKey, p2pKey, …) in the output. OFF by
@@ -212,14 +223,17 @@ fn print_info(json: bool) {
 
     if json {
         println!(
-            "{{\"cli\":\"babymonitor-cli\",\"cli_version\":{},\"core\":{},\"login\":\"token-pending\"}}",
+            "{{\"cli\":\"babymonitor-cli\",\"cli_version\":{},\"core\":{},\"login\":\"blocked\",\"login_blocked_on\":\"identity-gate\"}}",
             json_str(cli_version),
             json_str(&id)
         );
     } else {
         println!("babymonitor-cli {cli_version}");
         println!("core: {id}");
-        println!("login: token-pending (cannot log in yet — bmp_token / TASK-0032)");
+        println!(
+            "login: blocked (server-side identity gate ILLEGAL_CLIENT_ID; \
+             token-injectable — see README §6)"
+        );
     }
 }
 
@@ -348,23 +362,33 @@ fn auth_token_get_probe(args: &LiveLoginArgs, json: bool) -> Result<(), Error> {
     }
 }
 
-/// HONEST token-pending login. This is NOT a failure of the command — the
-/// command ran and correctly reported that login is not yet possible. So it
-/// returns `Ok(())` (exit 0) after printing the pending state; it never
-/// fabricates a session and never claims success at logging in.
+/// The single source of truth for WHY a from-scratch static client cannot log in.
+/// The blocker is NOT a missing sign ingredient: it is a server-side identity gate
+/// that Tuya enforces before it ever evaluates our signature. Proven by a
+/// corrupted-sign differential (TASK-0050: a one-nibble-flipped sign produces the
+/// byte-identical `ILLEGAL_CLIENT_ID`, so the reject precedes sign-verification)
+/// and host-exhausted across every datacenter gateway (TASK-0048/0051).
+const LOGIN_BLOCKED_REASON: &str = "Tuya rejects token.get with a server-side \
+    identity gate (ILLEGAL_CLIENT_ID) before it evaluates the request signature \
+    (proven sign-insensitive, TASK-0050; host-exhausted, TASK-0048/0051); a \
+    from-scratch static client cannot satisfy it. The client is token-injectable: \
+    supply one captured live session (TASK-0022) — see README §6 — to run the \
+    rest of the chain for real.";
+
+/// HONEST login-blocked report. This is NOT a failure of the command — the command
+/// ran and correctly reported that a from-scratch login is not possible against the
+/// server-side identity gate. So it returns `Ok(())` (exit 0) after printing the
+/// blocked state; it never fabricates a session and never claims success.
 fn auth_login(json: bool) -> Result<(), Error> {
-    // The pending state is sourced from the core's typed error so the CLI and
-    // library agree on the single source of truth for the message.
-    let pending = Error::BmpTokenPending.to_string();
     if json {
         println!(
-            "{{\"command\":\"auth login\",\"logged_in\":false,\"status\":\"token-pending\",\"reason\":{},\"blocked_on\":\"TASK-0032\"}}",
-            json_str(&pending)
+            "{{\"command\":\"auth login\",\"logged_in\":false,\"status\":\"blocked\",\"reason\":{},\"blocked_on\":\"identity-gate\"}}",
+            json_str(LOGIN_BLOCKED_REASON)
         );
     } else {
-        println!("auth login: NOT logged in — login is token-pending.");
-        println!("reason: {pending}");
-        println!("The client cannot authenticate until the bmp_token is ported (TASK-0032).");
+        println!("auth login: NOT logged in — login is blocked by a server-side identity gate.");
+        println!("reason: {LOGIN_BLOCKED_REASON}");
+        println!("Inject a captured live session to use the client (TASK-0022; see README §6).");
     }
     Ok(())
 }
@@ -406,7 +430,9 @@ fn auth_status(json: bool) -> Result<(), Error> {
                 println!("auth status: no session stored (not logged in).");
                 println!("store: {path}");
                 println!(
-                    "note: login is token-pending (TASK-0032), so no session can be created yet."
+                    "note: a from-scratch login is blocked by the server-side identity gate \
+                     (ILLEGAL_CLIENT_ID, TASK-0050/0051), so no session is created here. \
+                     Inject a captured session to populate this store (TASK-0022; README §6)."
                 );
             }
         }
@@ -458,14 +484,19 @@ fn run_devices(action: DevicesAction, json: bool) -> Result<(), Error> {
 
 /// Resolve the device-list body, then parse it.
 ///
-/// `--live` is token-pending: it threads through the same signer gate as the core
-/// and surfaces [`Error::BmpTokenPending`] without touching the network. Otherwise
-/// the body is read from `--fixture` (default: the synthetic fixture).
+/// `--live` is blocked: a real fetch needs an authenticated session, which the
+/// server-side identity gate prevents a from-scratch client from obtaining
+/// (ILLEGAL_CLIENT_ID, TASK-0050/0051). It threads through the same signer gate as
+/// the core and surfaces [`Error::BmpTokenPending`] without touching the network
+/// (the signer's un-validated 6th ingredient is its first stop; either way no
+/// session, no fetch). Otherwise the body is read from `--fixture` (default: the
+/// synthetic fixture).
 fn load_device_list(source: &DevicesSource) -> Result<DeviceList, Error> {
     if source.live {
-        // No network is touched: probe the (pending) signer and surface the
-        // honest token-pending state. This keeps the "live" wiring real and
-        // reviewable without fabricating a response.
+        // No network is touched: a from-scratch client has no session (server-side
+        // identity gate), so there is nothing to fetch. Surface the honest blocked
+        // state. This keeps the "live" wiring real and reviewable without
+        // fabricating a response.
         return live_device_list();
     }
     let path = source
@@ -477,10 +508,12 @@ fn load_device_list(source: &DevicesSource) -> Result<DeviceList, Error> {
     device::parse_device_list(&body)
 }
 
-/// The live fetch path: token-pending. Uses the default [`PendingBmpToken`] so it
-/// returns [`Error::BmpTokenPending`] the instant a signature would be required —
-/// it never makes a live call. (When TASK-0032 unblocks signing, the real fetch
-/// is wired here behind a rate-limited/single-shot HTTP client.)
+/// The live fetch path: blocked, makes no live call. A real fetch needs an
+/// authenticated session that the server-side identity gate denies a from-scratch
+/// client (ILLEGAL_CLIENT_ID, TASK-0050/0051). Uses the default [`PendingBmpToken`]
+/// so it returns [`Error::BmpTokenPending`] the instant a signature would be
+/// required (the signer's un-validated 6th ingredient — NOT the login blocker). The
+/// real fetch runs the moment a captured session is injected (TASK-0022).
 fn live_device_list() -> Result<DeviceList, Error> {
     use babymonitor_core::sign::{PendingBmpToken, SigningKeyMaterial};
     // Placeholder material: never read from secrets here, never used to sign
@@ -535,7 +568,7 @@ fn print_device_list(list: &DeviceList, json: bool, show_secrets: bool) {
 }
 
 /// Render a single device. If it is a camera, also note that the per-camera P2P
-/// record is fetched separately (token-pending / not wired here).
+/// record is fetched separately (needs an injected session / not wired here).
 fn print_device_show(dev: &DeviceBean, json: bool, show_secrets: bool) {
     warn_if_revealing(show_secrets);
     if json {
@@ -560,10 +593,11 @@ fn print_device_show(dev: &DeviceBean, json: bool, show_secrets: bool) {
     println!("sec_key: {}", secret_field(&dev.sec_key, show_secrets));
     if dev.is_camera() {
         // The CameraView pairing needs a separately-fetched CameraInfoBean; that
-        // fetch is token-pending. We surface the seam honestly rather than
-        // pretending we have the P2P handles here.
+        // fetch needs an authenticated session the identity gate denies a
+        // from-scratch client. We surface the seam honestly rather than pretending
+        // we have the P2P handles here.
         println!(
-            "p2p: per-camera CameraInfoBean is fetched separately (token-pending, TASK-0032);"
+            "p2p: per-camera CameraInfoBean is fetched separately (needs an injected session, TASK-0022);"
         );
         println!("     parse one offline with the core `parse_camera_info` + `CameraView::pair`.");
         let _ = CameraView::pair; // documents the intended composition seam.
@@ -650,9 +684,11 @@ mod tests {
         assert!(list.find_camera_device().is_some());
     }
 
-    // The live path must be token-pending and touch no network.
+    // The live path must be blocked (no session, no network). The signer's
+    // un-validated 6th ingredient trips first, so the concrete variant is still
+    // BmpTokenPending; either way no live call is made.
     #[test]
-    fn live_device_list_is_token_pending() {
+    fn live_device_list_is_blocked() {
         assert!(matches!(live_device_list(), Err(Error::BmpTokenPending)));
     }
 

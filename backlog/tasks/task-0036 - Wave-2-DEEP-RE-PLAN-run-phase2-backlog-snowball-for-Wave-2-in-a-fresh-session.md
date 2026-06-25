@@ -4,7 +4,7 @@ title: 'Wave-2 DEEP RE-PLAN: run phase2-backlog-snowball for Wave-2 in a fresh s
 status: To Do
 assignee: []
 created_date: '2026-06-25 07:14'
-updated_date: '2026-06-25 08:25'
+updated_date: '2026-06-25 08:38'
 labels:
   - phase-gate
   - replan
@@ -27,22 +27,7 @@ Terminal re-plan for Wave-1 (snowball discipline). Wave-1 (static RE) is COMPLET
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-FEED-FORWARD from TASK-0034 (stream client state for the Wave-2 re-plan):
+FEED-FORWARD from TASK-0008 (pairing flow mapped): A Rust PAIRING module is LOW PRIORITY for Wave-2. The user's camera is ALREADY PAIRED -> pairing is NOT on the critical path: an already-bound device appears in HomeBean.deviceList as a normal DeviceBean (carrying localKey/p2pId for the stream) and the device-list + CameraInfoBean fetch require only the login sid — NO pairing token, NO SmartLink. The critical path is the SAME auth+device-list spine the stream already depends on (TASK-0032 bmp_token + TASK-0035 auth decision + TASK-0012/0013). 
 
-WHAT'S BUILT (offline-complete, in babymonitor-core src/stream/): the full Tuya-custom WebRTC-over-MQTT protocol layer — 302 signaling envelope codec, SDP a=aes-key hex codec (byte-exact), connect_v2 builder (byte-exact template), SDP application-section parse/inject, imm_p2p_rtc_frame_t->Frame model + codec ids (H264/PCMU/Opus), session state machine, RandomSource+33-char connect_session minter, and a StreamCredentials injectable seam (Debug-redacted). rumqttc wired (default-features=false) behind a MqttTransport seam. 90 unit tests incl prove-the-check-bites negatives. just e2e/check-evidence/secret-scan/showcase all green; assert-offline still passes after rumqttc cached.
-
-WHAT'S LIVE-GATED (cannot run today):
-- Auth: every stream credential (token/p2pId/p2pKey/ices/session/localKey/pv) comes from ONE authed device-list/CameraInfoBean call -> blocked on TASK-0032 (bmp_token) + the Wave-2 auth DECISION (TASK-0035). The stream is downstream of auth, exactly as Wave-1 lesson #1 said.
-- 302-payload localKey-AES mode: NOT statically pinnable (runtime AESUtil.ALGO + jadx-mangled Cipher.il). stream::mqtt_crypto returns MqttCryptoPending. Needs a port of com/thingclips/sdk/mqtt/ crypto OR one live 302 capture.
-- Live device: must confirm the real SCD921 returns p2pType=4 (else PPCS fallback).
-
-WHAT MEDIA-DECODE/RENDER WORK REMAINS (FILED as TASK-0037, dep on TASK-0034):
-1. webrtc-rs PeerConnection engine implementing stream::session::WebRtcEngine (standard SDP/ICE/DTLS-SRTP/SRTP + H264(openh264)/PCMU/Opus de-packetize -> Frame). Deliberately deferred to protect the assert-offline gate from webrtc-rs's large dep tree; the WebRtcEngine trait seam is the clean plug-in point.
-2. 302-payload AES mode pinning (see above).
-3. MQTT TLS (rumqttc use-rustls) + the exact Tuya 302 topic + protocol-version binary framing.
-4. Actual frame RENDER/PLAYBACK (a video sink + audio out) — not yet scoped; Wave-2 re-plan should add a render/CLI-view task after TASK-0037.
-
-RE-PLAN IMPLICATION: the stream protocol layer is done and unblocked-by-design; the remaining stream work (TASK-0037 + render) is strictly downstream of the auth decision (TASK-0035). Sequence: TASK-0035 (auth) -> capture device creds + one 302 -> TASK-0037 (media engine + AES mode + TLS) -> render task.
-
-CORRECTION (cycle-23): line ~36's '302-payload AES NOT statically pinnable (runtime AESUtil.ALGO + Cipher.il) -> MqttCryptoPending' is FALSE/STALE. The AES is pinned (AES-128/ECB/PKCS5, key=localKey, no IV) and implemented; the residual is only the pv->variant binding + framing (MqttEnvelopePending). Wave-2 re-plan should carry the corrected scope.
+IF a future 'add a new camera' feature is wanted, the pairing protocol is mapped to implementable depth in re/pairing_flow.md (EZ packet-length scheme Ghidra-confirmed under re/ghidra/smartlink_*.c; AP {ssid,passwd,token,ccode}; QR {p,s,t}; token thing.m.device.token.create v2.0; bind-confirm poll thing.m.device.list.token v5.0). Only a few constants are live-gated (exact AP UDP port ~6669, on-wire action spelling, poll cadence). Recommendation: do NOT schedule a pairing crate in Wave-2 unless 'pair a new device' becomes an explicit goal; it adds UDP-broadcast/multicast-socket + soft-AP-join complexity for zero benefit to the already-paired view path.
 <!-- SECTION:NOTES:END -->

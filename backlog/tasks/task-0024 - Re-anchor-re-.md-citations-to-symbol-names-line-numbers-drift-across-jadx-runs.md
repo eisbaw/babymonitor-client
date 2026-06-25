@@ -11,8 +11,7 @@ labels:
   - re
   - review-followup
   - citation-hygiene
-dependencies:
-  - TASK-0021
+dependencies: []
 priority: medium
 ---
 

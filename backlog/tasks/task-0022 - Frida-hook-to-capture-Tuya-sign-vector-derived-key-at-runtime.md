@@ -4,6 +4,7 @@ title: Frida hook to capture Tuya sign vector + derived key at runtime
 status: To Do
 assignee: []
 created_date: '2026-06-25 01:22'
+updated_date: '2026-06-25 01:59'
 labels:
   - phase3
   - re
@@ -11,7 +12,7 @@ labels:
   - runtime
 dependencies:
   - TASK-0005
-priority: high
+priority: low
 ---
 
 ## Description
@@ -25,3 +26,9 @@ Spike TASK-0005 verdict was needs-runtime-hook: the mobile-app sign KEY is deriv
 - [ ] #1 A captured (string-to-sign,sign) vector is stored in secrets/ and a non-secret description (method+symbol) is in re/
 - [ ] #2 TASK-0012 Rust signer can validate against the captured vector
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+OUT OF SCOPE for this STATIC-ONLY effort (user directive 2026-06-25): do NOT run Frida/on-device dynamic capture. Superseded by TASK-0023 (fully-static Ghidra recovery of the sign key on libthing_security_algorithm.so). Leave To Do as a documented non-goal; the signing differential vector for TASK-0012 comes from TASK-0023, not from here.
+<!-- SECTION:NOTES:END -->

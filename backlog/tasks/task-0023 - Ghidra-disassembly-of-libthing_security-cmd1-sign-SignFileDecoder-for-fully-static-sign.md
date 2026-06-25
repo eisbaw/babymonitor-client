@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-06-25 01:22'
+updated_date: '2026-06-25 02:00'
 labels:
   - phase3
   - re
@@ -13,7 +14,7 @@ labels:
   - native
 dependencies:
   - TASK-0005
-priority: medium
+priority: high
 ---
 
 ## Description
@@ -27,3 +28,9 @@ Heavier alternative to the Frida hook (TASK-0005 follow-up). Disassemble the doC
 - [ ] #1 Combination order + hash primitive of the native sign key derivation documented in re/tuya_sign.md with offset citations
 - [ ] #2 t_s.bmp decode routine characterized at offset level
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+ELEVATED to the static-only critical path (user directive 2026-06-25): Frida (TASK-0022) is out of scope, so this Ghidra route is now THE way to recover a reproducible signer + the differential vector that TASK-0012 needs. No longer 'lower priority than Frida'.
+<!-- SECTION:NOTES:END -->

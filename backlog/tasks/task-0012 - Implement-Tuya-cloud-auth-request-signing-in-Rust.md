@@ -4,14 +4,16 @@ title: Implement Tuya cloud auth + request signing in Rust
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 01:44'
+updated_date: '2026-06-25 01:59'
 labels:
   - phase5
   - rust
   - wave1
   - auth
 dependencies:
-  - TASK-0022
+  - TASK-0011
+  - TASK-0007
+  - TASK-0023
 priority: high
 ---
 

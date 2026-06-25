@@ -4,7 +4,7 @@ title: 'SPIKE: libThingP2PSDK session + AV framing feasibility'
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:36'
-updated_date: '2026-06-24 23:16'
+updated_date: '2026-06-25 00:23'
 labels:
   - phase4
   - re
@@ -33,3 +33,9 @@ RISK SPIKE (skill phase 4). Deepest static dive: reconstruct P2P session establi
 - [ ] #2 MANDATORY verdict, exactly one of {recoverable-statically | partially | needs-live-capture}, with the precise evidence that a single pcap (if ever available) would unblock — this verdict drives Wave-2 planning
 - [ ] #3 TIME-BOXED probe (depth on session+framing path only). The verdict must also CHOOSE which transport Wave 2 pursues (P2P vs the WebRTC path from task 17), and name SPECIFICALLY which bytes a single pcap would unblock (e.g. handshake nonce / key-agreement)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+forward-carried from TASK-0001/0004: Strong static evidence the SCD921 stream is WebRTC-over-MQTT (review-gate F2 CONFIRMED at lib level). Java side: com/thingclips/smart/p2p/api/IThingP2P.java (connect/recvData/resendOffer=SDP) + utils/IMqttServiceUtils.java (send302MessageThroughMqtt, registerMqtt302 - "302" is Tuya camera signaling code over MQTT). Native libThingP2PSDK has full SDP/ICE/STUN/TURN/DTLS-SRTP + MQTT signaling strings. PPCS legacy path also present. connect_v2 skill field likely encodes capability negotiation. Likely task-10 verdict: partially (framing recoverable; per-session DTLS key exchange needs live pcap). Public ref: tuya/tuya-rtc-camera-sdk-android.
+<!-- SECTION:NOTES:END -->

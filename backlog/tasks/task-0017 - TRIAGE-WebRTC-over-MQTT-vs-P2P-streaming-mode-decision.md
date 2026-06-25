@@ -4,6 +4,7 @@ title: 'TRIAGE: WebRTC-over-MQTT vs P2P streaming-mode decision'
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:46'
+updated_date: '2026-06-25 00:23'
 labels:
   - phase3
   - re
@@ -30,3 +31,9 @@ WHY (re/review_gate_findings.md F2): modern Tuya cameras can stream via WebRTC s
 - [ ] #1 re/streaming_mode.md states whether the app prefers WebRTC-over-MQTT, Tuya P2P, or both, with evidence+confidence and the MQTT signaling topic shape if present; cross-ref seydx/tuya-ipc-terminal
 - [ ] #2 A recommendation for which transport Wave 2 should implement first, with the cheaper path called out
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+forward-carried from TASK-0001/0003/0004: TRIAGE LEANS WebRTC-over-MQTT. Native libThingP2PSDK.so carries SDP/ICE/DTLS-SRTP(mbedTLS)+MQTT-signaling(connect_v2, send302) AND legacy PPCS. JS: TUNIMQTTManager (createMQTTClient/publish/subscribe/onMessage) + TUNIIPCCameraManager.connect/createMediaDevice; PlayNetKit has 73 ice refs. Java: IThingP2P.resendOffer + IMqttServiceUtils.send302MessageThroughMqtt/registerMqtt302. Recommend webrtc-rs + MQTT signaling client over PPCS AV-framing reconstruction. Confirm which the SCD921 firmware negotiates via the connect_v2 skill field. Public ref: tuya/tuya-rtc-camera-sdk-android (WebRTC+MQTT, <300ms).
+<!-- SECTION:NOTES:END -->

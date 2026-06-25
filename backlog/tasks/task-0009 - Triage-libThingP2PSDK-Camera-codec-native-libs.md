@@ -4,7 +4,7 @@ title: Triage libThingP2PSDK/Camera/codec native libs
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:36'
-updated_date: '2026-06-24 22:46'
+updated_date: '2026-06-25 00:23'
 labels:
   - phase3
   - re
@@ -32,3 +32,9 @@ WHY (skill phase 3): before deep diving, map the P2P/camera/codec libs - exporte
 - [ ] #3 JS-FIRST: pass the JS bundle (bridge method names, P2P channel orchestration, signaling) BEFORE native decompilation; only dive into .so for what JS does not reveal
 - [ ] #4 Cross-reference named public sources: tuya/tuya-iotos-android-iot-p2p-demo (channel API surface) and WyzeCam tutk.py (IOTC/TUTK AV framing) — raises confidence toward 'confirmed'
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+forward-carried from TASK-0004: Symbol dumps already saved under re/symbols/ (libThingP2PSDK/Camera/VideoCodec/AudioEngine/SmartLink/P2PFileTrans .dynsym.txt + .dynamic.txt). KEY: libThingP2PSDK.so = WebRTC-over-MQTT (SDP a=ice-ufrag/rtcp-mux, STUN/TURN, DTLS-SRTP via STATICALLY-BUNDLED mbedTLS /Users/Pan/GitHub/mbedtls; MQTT signaling create signaling mqtt worker thread + SendMessageThroughMqtt; connect_v2 cmd with remote_id/dev_id/skill/token/lan_mode) AND legacy PPCS (ERROR_PPCS_* in CameraSDK). VideoCodec=OpenH264(Cisco). AudioEngine=Google WebRTC audio_processing (AEC/AGC/NS/VAD), build path leak ipc-tymedia-sdk. P2P version 3.10.0, Camera 1.2.x. P2P SDK does NOT link app OpenSSL (own mbedTLS).
+<!-- SECTION:NOTES:END -->

@@ -4,7 +4,7 @@ title: Implement device list/binding models + service in Rust
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-24 22:46'
+updated_date: '2026-06-25 00:23'
 labels:
   - phase5
   - rust
@@ -30,3 +30,9 @@ WHY: lets the client discover the SCD921 under the Tuya account - prerequisite f
 - [ ] #3 PROVE THE CHECK BITES: a negative test asserts the parser REJECTS/surfaces an error on a malformed device entry (missing camera P2P-credential handle / wrong type); the camera entry asserts required (non-Option) invariants (device id, p2p creds handle) so it is not a permissive serde sponge
 - [ ] #4 ANONYMIZE: any device-list JSON quoted in re/*.md, notes, or summaries has uid/homeId/localKey/gwId/email/GPS/IP replaced with synthetic placeholders; a sanitized committable fixture is produced and tests run against it; localKey + P2P creds treated as secrets
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+forward-carried from TASK-0003/0004: Device-list/binding model field names seen in JS bridge schemas (decompiled/js/assets/thing_uni_plugins): startDeviceActivate carries devId/pid/uuid/mac/localKey (currentMeshBean.localKey); CloudStorageSignatureManager.generateSignedUrl uses sk/ak/bucket/region/endpoint/token. Camera connect uses deviceId. localKey + P2P creds are SECRETS - anonymize fixtures before any committed file (CLAUDE.md rule). P2P session beans: com/thingclips/smart/camera/ipccamerasdk/bean/ (CameraInfoBean, DeviceAbilityBean, AudioParams).
+<!-- SECTION:NOTES:END -->

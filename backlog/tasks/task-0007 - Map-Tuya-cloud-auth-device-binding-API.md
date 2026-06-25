@@ -4,7 +4,7 @@ title: Map Tuya cloud auth + device-binding API
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:36'
-updated_date: '2026-06-24 23:16'
+updated_date: '2026-06-25 00:23'
 labels:
   - phase4
   - re
@@ -35,3 +35,9 @@ WHY (skill phase 3/4): model the request/response contract for account login, to
 - [ ] #4 Datacenter/region selection modeled as RUNTIME-from-login-response (F5), not static from assets/thing_domains_v1
 - [ ] #5 The signing test vector's expected output is produced by an INDEPENDENT reference (nalajcie tooling or a live-captured request), NOT hand-derived from our own decompilation (avoids a circular/self-confirming test); synthetic/PII-free inputs only
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+forward-carried from TASK-0001/0003: Cloud-auth code lives in DEX, not JS (login is ticket-based: TUNILoginManager.onTicketSuccess). Sign manager: com/thingclips/sdk/network/ThingApiSignManager.java (see task 5 notes for method lines). Account/login SDK: com/thingclips/sdk/user/ (obfuscated impls) + com/thingclips/smart/login*, com/thingclips/smart/api/loginapi. Two cloud gateways from JS: apiRequestByAtop (mobile-app atop, F1 sign) and apiRequestByHighwayRestful (host/api/header/query/body/method). Datacenter is runtime-from-login (F5); hostnames in native thing_domains_v1, not JS.
+<!-- SECTION:NOTES:END -->

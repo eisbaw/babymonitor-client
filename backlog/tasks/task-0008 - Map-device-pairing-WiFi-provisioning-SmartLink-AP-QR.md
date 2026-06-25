@@ -4,7 +4,7 @@ title: Map device pairing + WiFi provisioning (SmartLink/AP/QR)
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:36'
-updated_date: '2026-06-24 22:46'
+updated_date: '2026-06-25 00:23'
 labels:
   - phase5
   - re
@@ -31,3 +31,9 @@ WHY: to add a camera the app provisions WiFi (Tuya EZ/AP SmartLink via libThingS
 - [ ] #2 Identifies which steps are mandatory for an already-paired camera (our case) vs first-time setup, so the Rust client can target the minimal path first
 - [ ] #3 SCOPE NARROWING (already-paired camera): Wave-1 only confirms how an already-bound device appears in device-list and whether re-binding needs anything; defer full EZ/AP SmartLink packet + QR-payload reconstruction to a later wave as its own task
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+forward-carried from TASK-0001/0003/0004: Pairing code = com/thingclips/smart/activator/ (648 files). Native: libThingSmartLink.so JNI Java_com_thingclips_smart_android_device_ThingSmartLink_smartLink. JS contract = TUNIActivationManager.startDeviceActivate, full param model: scanType/token/ssid/password/cipher/gwId/uuid/mac/pid/devId + hgwBean(ip/gwId/productKey/encrypt/version/token/wf_cfg/ssid/apConfigType) + currentMeshBean(localKey/meshId/password). Also TUNIBLEPairingManager (BLE) + libbarhopper_v3.so (QR). EZ/AP/SmartLink/Matter all supported.
+<!-- SECTION:NOTES:END -->

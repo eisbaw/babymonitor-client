@@ -4,7 +4,7 @@ title: Implement Tuya cloud auth + request signing in Rust
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 01:33'
+updated_date: '2026-06-25 01:44'
 labels:
   - phase5
   - rust
@@ -34,11 +34,15 @@ WHY: the first genuinely buildable+testable slice. Implement Tuya HMAC request s
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-[from TASK-0005 SPIKE] Rust signing guidance (see re/tuya_sign.md):
-- Implement string-to-sign EXACTLY: sorted whitelist params joined by "||" with key=value; postData folded as swapSignString(md5AsBase64(body)); swapSignString(s)= s[8:16] + s[0:8] + s[24:32] + s[16:24] (i.e. B1+A+C+B2 where A=s[0:8],B=s[8:24],C=s[24:32]).
-- The keyed wire-sign is native (HMAC-SHA256 likely) over key=[app_cert_SHA256]_[bmp_token]_[appSecret]. appSecret is static (secrets/tuya_appkey.json). The bmp_token and the exact cert-hash combination are NOT static.
-- DIFFERENTIAL TEST VECTOR MUST BE LIVE: blocked on TASK-0022 (Frida hook) — capture (string-to-sign, sign) pairs on the user's device; do NOT self-derive the reference (circular, forbidden by TESTING.md). dep edge added.
-- The app-cert SHA-256 half can be computed offline from the APK signing cert if the combination order is learned (TASK-0023 Ghidra). Until then, treat the native sign as a black box validated against the captured vector.
-
-forward-carried from TASK-0005 review: Rust port traps — (1) string-to-sign segments are joined with literal '||' not '&' (pbbppqb.java:26-27); (2) ThingApiSignManager.java:161 SWALLOWS signer exceptions into a 'Exception Errorcode '+msg string — the Rust port must FAIL FAST instead of mirroring that silent fallback; (3) swapSignString = s[8:16]+s[0:8]+s[24:32]+s[16:24]. Differential vector comes from the live Frida hook (TASK-0022), not self-derived.
+[from TASK-0007: re/tuya_cloud_auth.md is the auth contract]
+EXACT ENDPOINTS (atop mobile gateway, NOT OpenAPI):
+- Login is 2-step ticket flow:
+  1) thing.m.user.username.token.get v2.0 (sessionRequire=false) -> TokenBean{token(ticket), publicKey, exponent, pExponent}. publicKey+exponent = RSA pubkey; RSA-encrypt the password with it (ifencrypt=1).
+  2) thing.m.user.email.password.login (email) / thing.m.user.mobile.passwd.login v4.0 (mobile) / uid variants. postData: countryCode, email|mobile, passwd(RSA-enc), token(ticket), ifencrypt(0/1), mfa blob {"group":1,"mfaCode":"..."}. Returns User{sid, uid, ecode, domain, timezoneId, ...}.
+- Other creds available: email.code.login, mobile.code.login, uid.password.login, uid.token.create, sso.ticket.user.get, qr.token.login. Primary path for this app = email/uid + region.
+ENVELOPE (signed URL/GET params): a(action), v(version), t/time(server epoch), sid(session, empty pre-login), requestId(UUID per req), et=3, lang, os=Android, appVersion, ttid(secrets/), clientId(appKey, secrets/), deviceId, sign. Body = postData (JSON). Defaults: sessionRequire/locationRequire true, apiVersion='*'. checkAPIName() rewrites thing.*->smartlife.* before sign.
+SIGN: see re/tuya_sign.md (NOT here). String-to-sign reproducible (sort whitelist, join with '||', postData->swap(md5b64)); keyed sign is NATIVE -> needs the TASK-0022 Frida vector to validate (this task depends on TASK-0022). Do NOT self-derive the vector.
+TOKEN MODEL: session=User.sid. No refresh-token; on session-invalid RE-LOGIN. Persist sid+uid to ~/.local/share/babymonitor/ (both SECRET).
+DATACENTER: do NOT hardcode base URL. Use User.domain.mobileApiUrl (+ gwApiUrl, gwMqttUrl, regionCode) from the login response (F5). Bootstrap login against the region candidate, then switch to domain.mobileApiUrl. Pre-login helpers: thing.m.user.region.list, thing.m.app.domain.query.
+LIMITATION: exact on-wire a= spelling + obfuscated device-list action need a live/Frida confirm.
 <!-- SECTION:NOTES:END -->

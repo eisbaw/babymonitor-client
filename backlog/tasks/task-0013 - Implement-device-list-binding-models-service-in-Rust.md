@@ -4,7 +4,7 @@ title: Implement device list/binding models + service in Rust
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 00:23'
+updated_date: '2026-06-25 01:44'
 labels:
   - phase5
   - rust
@@ -34,5 +34,15 @@ WHY: lets the client discover the SCD921 under the Tuya account - prerequisite f
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-forward-carried from TASK-0003/0004: Device-list/binding model field names seen in JS bridge schemas (decompiled/js/assets/thing_uni_plugins): startDeviceActivate carries devId/pid/uuid/mac/localKey (currentMeshBean.localKey); CloudStorageSignatureManager.generateSignedUrl uses sk/ak/bucket/region/endpoint/token. Camera connect uses deviceId. localKey + P2P creds are SECRETS - anonymize fixtures before any committed file (CLAUDE.md rule). P2P session beans: com/thingclips/smart/camera/ipccamerasdk/bean/ (CameraInfoBean, DeviceAbilityBean, AudioParams).
+[from TASK-0007: re/tuya_cloud_auth.md sections 5a-5c]
+DEVICE-LIST CONTAINER: HomeBean{homeId, deviceList: List<DeviceBean>, sharedDeviceList: List<DeviceBean>}. Populated via home-detail atop call (action obfuscated to 'n' in DEX -> exact a= needs live capture).
+DeviceBean record fields (src com/thingclips/smart/sdk/bean/DeviceBean.java:29-157):
+  devId(String), name(String, may be PII), localKey(String) SECRET, secKey(String) SECRET, uuid(String, anonymize), pv(String), productId(String), productVer(String), schema/schemaMap, skills(Map), category/categoryCode (camera=sp/ipc family), dps/dpCodes/dpName(Map, may be sensitive), mac/ip/lat/lon (lat/lon = PII), iconUrl/uiType/ui/bv/gwType.
+  -> SECRET fields: localKey, secKey. Anonymize devId/uuid/name/lat/lon in any fixture.
+CAMERA P2P/WebRTC record - CameraInfoBean (per-devId config, separate fetch; src camera/ipccamerasdk/bean/CameraInfoBean.java:9-26,140-175):
+  id(String), p2pId(String, sensitive handle), p2pType(int), p2pSpecifiedType(int), p2pPolicy(int), password(String) SECRET, sessionTid(String) SECRET, skill(String JSON: videos[]/audios[]/p2p/cloudGW/localStorage/sdk_version/video_num), mediaConsumerSkill(String), vedioClarity(int)/vedioClaritys(int[]), audioAttributes{hardwareCapability[],callMode[]}, p2pConfig(nested), panoramicInfo(String).
+  Nested P2pConfig: p2pKey(String) SECRET, initStr(String) SECRET, ices(List, WebRTC ICE servers), session(Object) SECRET, tcpRelay/udpRelay(Object, relay descriptors).
+  -> SECRET fields: password, sessionTid, p2pKey, initStr, session.
+IMPORTANT: moto_id does NOT exist in this app. The P2P credential handles are p2pId + P2pConfig.p2pKey + initStr/session/ices/relays (WebRTC-shaped, corroborates F2 WebRTC-over-MQTT).
+NEGATIVE TEST (per review gate): parser must REJECT a camera record missing the P2P handle (p2pId / p2pKey) and assert required-field invariants. Anonymize all real values before any committed fixture; localKey/p2pKey/password/sessionTid/initStr/session are secrets -> secrets/ only.
 <!-- SECTION:NOTES:END -->

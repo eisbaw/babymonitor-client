@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@reverser'
 created_date: '2026-06-24 22:36'
-updated_date: '2026-06-25 03:08'
+updated_date: '2026-06-25 03:14'
 labels:
   - phase3
   - re
@@ -28,10 +28,10 @@ WHY (skill phase 3): before deep diving, map the P2P/camera/codec libs - exporte
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 re/p2p_triage.md: exported functions of libThingP2PSDK/CameraSDK, candidate session-init + send/recv entry points, protocol magic strings, and a mapping to any known public Tuya/IOTC P2P documentation with confidence
-- [ ] #2 Lists the concrete next-dive targets (function offsets) for the deep spike task
-- [ ] #3 JS-FIRST: pass the JS bundle (bridge method names, P2P channel orchestration, signaling) BEFORE native decompilation; only dive into .so for what JS does not reveal
-- [ ] #4 Cross-reference named public sources: tuya/tuya-iotos-android-iot-p2p-demo (channel API surface) and WyzeCam tutk.py (IOTC/TUTK AV framing) — raises confidence toward 'confirmed'
+- [x] #1 re/p2p_triage.md: exported functions of libThingP2PSDK/CameraSDK, candidate session-init + send/recv entry points, protocol magic strings, and a mapping to any known public Tuya/IOTC P2P documentation with confidence
+- [x] #2 Lists the concrete next-dive targets (function offsets) for the deep spike task
+- [x] #3 JS-FIRST: pass the JS bundle (bridge method names, P2P channel orchestration, signaling) BEFORE native decompilation; only dive into .so for what JS does not reveal
+- [x] #4 Cross-reference named public sources: tuya/tuya-iotos-android-iot-p2p-demo (channel API surface) and WyzeCam tutk.py (IOTC/TUTK AV framing) — raises confidence toward 'confirmed'
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -56,6 +56,8 @@ GOTCHAS / findings:
 - The inner_p2p_type selector JSON in libThingCameraSDK.so ('PPCS_Write' vs 'thing_p2p_rtc_send_data') is the concrete runtime tie-break artifact for p2pType 2-vs-4.
 - HONEST LIMIT: no disassembly done. This is the API-surface + entry-point map only; arg SEMANTICS, skill bitmask, token/key derivation need Ghidra/r2 (TASK-0010) or a live device.
 ACs: #1 done (exported fns, session-init+send/recv, magic, public-ref map w/ confidence). #2 done (prioritized next-dive symbols, S5). #3 done (JS-first gate S0). #4 done (tuya p2p-demo + WyzeCam tutk.py mapped, S4). Gates check-evidence/secret-scan/e2e all GREEN.
+
+Cycle-11 review: both GO. Orchestrator fixed P1 (§1a table mislabeled JNI connect/disConnect as PPCS -> corrected to RTC v1 in libThingP2PSDK; real PPCS=connect4ppcs in libThingCameraSDK) + added startPreConnectV2 to reconcile the 26-JNI count.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

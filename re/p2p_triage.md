@@ -71,9 +71,9 @@ signaling verbs `setSignaling`/`setRemoteOnline`/`resendOffer` named in
 | Group | JNI exports (`Java_…_ThingP2PSDK_*`) | Transport |
 |---|---|---|
 | **Lifecycle** | `init`, `deInit`, `initLogModule`, `getVersion`, `getP2pVersion`, `uploadLog`, `activeCheck` | shared |
-| **WebRTC session connect** | `connectV2`, `connectV3`, `startPreConnect`, `closePreConnect`, `connectBreak` | **WebRTC** |
+| **WebRTC session connect** | `connectV2`, `connectV3`, `startPreConnect`, `startPreConnectV2`, `closePreConnect`, `connectBreak` | **WebRTC** |
 | **WebRTC signaling I/O** | `setSignaling`, `setSignalingSendResult`, `setRemoteOnline`, `setHttpResponse`, `sendAuthorizationInfo` | **WebRTC** |
-| **Legacy/v1 connect** | `connect`, `disConnect` | PPCS/legacy |
+| **RTC v1 connect** | `connect`, `disConnect` | RTC v1 (in `libThingP2PSDK`; NOT PPCS — real PPCS is `connect4ppcs` in `libThingCameraSDK`) |
 | **AV/data plane** (transport-agnostic at this layer) | `sendData`, `recvData` | both |
 | **Session mgmt** | `getP2PSessionList`, `freeP2PSessionList`, `closeAllSessions` | both |
 

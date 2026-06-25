@@ -51,6 +51,7 @@ stub-grep:
 [group('test')]
 test-bmp-decode:
     cd re/scripts && python3 test_bmp_token_decode.py
+    cd re/scripts && python3 test_bmp_token_aes.py
 
 # End-to-end gate (build+test+lint+fmt-check+stub-grep+offline). Green before any commit.
 [group('test')]

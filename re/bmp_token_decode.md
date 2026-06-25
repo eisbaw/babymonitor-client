@@ -19,9 +19,20 @@ relates to the public reference `nalajcie/tuya-sign-hacking`, and the precise wa
 
 ## Status (confidence: confirmed)
 
-**Decode: partially-ported** — framing/IO recovered and unit-tested; the core
-transform is **not-portable-via-reference** (a white-box table cipher, not the
-public matrix scheme).
+> **SUPERSEDED IN PART BY TASK-0030 (`re/bmp_token_whitebox.md`).** §3 below calls
+> `fcn.11658` an "un-portable white-box table cipher". Re-disassembly proves that is
+> WRONG: it is **standard AES-128-CBC** (canonical AES S-boxes @0x795f/0x7a5f,
+> InvMixColumns with the 0x1b GF reduction, 10 rounds, CBC). It is now **fully ported
+> and validated** (`re/scripts/bmp_token_aes.py`, FIPS-197 KAT + clean-JSON oracle).
+> The decrypted blob is the **TLS cert-pinning config** `{"securityOpen",…,
+> "data":[2×sha256]}`, not obviously the signer's `bmp_token` — see
+> `re/bmp_token_whitebox.md` §6 for the residual. Read that doc, not §3, for the
+> cipher.
+
+**Decode: fully-ported-validated (cipher); signer-token-mapping-open** — the AES
+transform is byte-exact and validated; the framing/IO is recovered; what remains open
+is which decrypted artifact the request-signer's middle `_`-part consumes (needs a
+live sign-accept). (Original §3 verdict "white-box wall" is retracted.)
 
 This is grounded by two independent sources: (1) the byte-level disassembly of the
 BMP decode driver and its callees in `libthing_security.so@0x1a030` (cited inline),

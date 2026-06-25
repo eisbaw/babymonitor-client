@@ -10,7 +10,28 @@ description = "CLI viewer for the Philips Avent Baby Monitor+ (white-labeled Tuy
 name = "babymonitor-cli"
 path = "src/main.rs"
 
+[features]
+# `live` gates the AUTHORIZED one-time live Tuya login path (TASK-0042) behind an
+# opt-in compile flag. It pulls reqwest (blocking + rustls TLS) and rsa, which are
+# NETWORK/TLS-heavy trees deliberately kept OUT of the default build so
+# `just e2e` / `just assert-offline` never compile or link them — the offline gate
+# stays green. Build the live path explicitly with `--features live`.
+live = ["dep:reqwest", "dep:rsa", "dep:rand", "dep:chrono", "dep:hex"]
+
 [dependencies]
 babymonitor-core = { path = "../babymonitor-core" }
 clap.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+
+# ── live-only (feature `live`) — see [features] above ────────────────────────
+# reqwest BLOCKING (no async runtime we manage) + rustls TLS (the live Tuya atop
+# gateway is HTTPS). default-features off to drop the default-TLS (native-tls/
+# openssl) path and select rustls explicitly.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"], optional = true }
+# RSA PKCS#1 v1.5 encryption of the password with the token.get pubkey (the
+# `ifencrypt=1` path, re/tuya_cloud_auth.md §2).
+rsa = { version = "0.9", optional = true }
+rand = { version = "0.8", optional = true }
+chrono = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }

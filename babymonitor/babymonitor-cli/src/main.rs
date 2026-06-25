@@ -34,6 +34,12 @@ use babymonitor_core::session::SessionStore;
 use babymonitor_core::Error;
 use clap::{Args, Parser, Subcommand};
 
+// The AUTHORIZED one-time live login path is compiled ONLY under `--features
+// live`, so the default build (and `just e2e`) never pulls reqwest/rsa or touches
+// the network (TASK-0042).
+#[cfg(feature = "live")]
+mod live;
+
 /// Path (relative to this crate) of the synthetic device-list fixture used as the
 /// default OFFLINE body. It is committed, obviously-synthetic test data — never a
 /// real capture.
@@ -88,6 +94,32 @@ enum AuthAction {
     Status,
     /// Clear the on-disk session (offline; idempotent).
     Logout,
+    /// AUTHORIZED one-time LIVE login against the REAL Tuya cloud (TASK-0042).
+    /// Compiled only under `--features live`. Hits real infra with the account
+    /// owner's real credentials from `secrets/`; READ-ONLY; attempts
+    /// `password.login` AT MOST ONCE; stops at 2FA. See `re/live_login.md`.
+    #[cfg(feature = "live")]
+    LiveLogin(LiveLoginArgs),
+}
+
+/// Args for the gated live login.
+#[cfg(feature = "live")]
+#[derive(Debug, Args)]
+struct LiveLoginArgs {
+    /// Directory holding the gitignored secrets (login/appkey/bmp_token).
+    #[arg(long, default_value = "secrets")]
+    secrets_dir: PathBuf,
+    /// Path to the extracted base APK (offline app-cert SHA-256 source).
+    #[arg(
+        long,
+        default_value = "extracted/xapk/com.philips.ph.babymonitorplus.apk"
+    )]
+    apk: PathBuf,
+    /// Override the atop gateway host (default: the EU mobile gateway). Use to
+    /// pin the appKey's provisioned regional gateway if the default is rejected
+    /// with ILLEGAL_CLIENT_ID. Network-level routing, not an extra login attempt.
+    #[arg(long)]
+    host: Option<String>,
 }
 
 /// `devices` subcommands.
@@ -185,6 +217,59 @@ fn run_auth(action: AuthAction, json: bool) -> Result<(), Error> {
         AuthAction::Login => auth_login(json),
         AuthAction::Status => auth_status(json),
         AuthAction::Logout => auth_logout(json),
+        #[cfg(feature = "live")]
+        AuthAction::LiveLogin(args) => auth_live_login(&args, json),
+    }
+}
+
+/// Drive the AUTHORIZED one-time live login (gated). Prints only NON-SECRET
+/// outcome facts; every captured value lands in `secrets/` (see `live`).
+#[cfg(feature = "live")]
+fn auth_live_login(args: &LiveLoginArgs, json: bool) -> Result<(), Error> {
+    match live::run_live_login(&args.secrets_dir, &args.apk, args.host.as_deref()) {
+        Ok(live::LiveOutcome::Needs2fa) => {
+            // The orchestrator contract: surface the literal phrase.
+            if json {
+                println!("{{\"command\":\"auth live-login\",\"signer_validated\":true,\"status\":\"NEED 2FA CODE\",\"state\":\"secrets/tuya_2fa_state.json\"}}");
+            } else {
+                println!("auth live-login: signer VALIDATED; reached 2FA email-code challenge.");
+                println!("NEED 2FA CODE");
+                println!(
+                    "Challenge state captured to secrets/tuya_2fa_state.json (values withheld)."
+                );
+            }
+            Ok(())
+        }
+        Ok(live::LiveOutcome::LoggedIn {
+            camera_found,
+            p2p_type,
+        }) => {
+            if json {
+                println!(
+                    "{{\"command\":\"auth live-login\",\"logged_in\":true,\"camera_found\":{},\"p2p_type\":{}}}",
+                    camera_found,
+                    p2p_type.map(|v| v.to_string()).unwrap_or_else(|| "null".into())
+                );
+            } else {
+                println!(
+                    "auth live-login: LOGIN SUCCESS (session + device-list captured to secrets/)."
+                );
+                println!("camera_found: {camera_found}");
+                match p2p_type {
+                    Some(t) => println!("p2p_type: {t}"),
+                    None => println!("p2p_type: (not surfaced in this response)"),
+                }
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // A live failure (sign-rejected / network / 2FA-capture). Surface the
+            // typed message (server code+msg only — no secret) and exit non-zero.
+            eprintln!("auth live-login: {e}");
+            Err(Error::NotImplemented(
+                "live login did not complete (see message above)",
+            ))
+        }
     }
 }
 

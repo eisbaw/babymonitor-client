@@ -46,10 +46,24 @@ use base64::Engine as _;
 use crate::Error;
 
 /// The fixed whitelist of envelope param keys the signer canonicalizes, in the
-/// spelling used by `ThingApiSignManager.bdpdqbp` (`re/tuya_sign.md` §1). Only
-/// keys in this set with a non-empty value enter the canonical string; all other
-/// params are ignored by the signer. Kept as a sorted-on-use slice; the builder
-/// sorts the *present* keys lexicographically (Tuya sorts `map.keySet()`).
+/// spelling used by `ThingApiSignManager.bdpdqbp` (`re/tuya_sign.md` §1;
+/// re-confirmed verbatim in `re/bmp_token_provenance.md` §2.1). Only keys in this
+/// set with a non-empty value enter the canonical string; all other params are
+/// ignored by the signer. Kept as a sorted-on-use slice; the builder sorts the
+/// *present* keys lexicographically (Tuya sorts `map.keySet()`).
+///
+/// CORRECTED (TASK-0042, live-login wiring): two entries were wrong against the
+/// recovered whitelist and would have silently produced a wrong signature —
+///   * `appId` → **`clientId`**: the appKey rides the envelope under the WIRE
+///     param `clientId` (`KEY_APP_ID` → wire `clientId`, `re/tuya_cloud_auth.md`
+///     §1; whitelist in `re/bmp_token_provenance.md` §2.1 spells it `clientId`).
+///     With `appId` whitelisted but the envelope keyed `clientId`, the appKey
+///     param was DROPPED from the canonical string → wrong `sign`.
+///   * `t` → **`time`**: the timestamp param's WIRE name is `time`
+///     (`KEY_TIMESTAMP="time"`, `re/tuya_cloud_auth.md` §1); the recovered
+///     whitelist lists `time`, not `t`. Same silent-drop failure mode.
+///
+/// These are load-bearing for a server-accepted sign; see the live path.
 pub const SIGN_WHITELIST: &[&str] = &[
     "a",
     "v",
@@ -62,9 +76,9 @@ pub const SIGN_WHITELIST: &[&str] = &[
     "h5",
     "h5Token",
     "os",
-    "appId",
+    "clientId",
     "postData",
-    "t",
+    "time",
     "requestId",
     "et",
     "n4h5",
@@ -163,6 +177,30 @@ pub fn md5_as_base64(bytes: &[u8]) -> String {
 pub fn post_data_digest(body: &[u8]) -> Result<String, Error> {
     let b64 = md5_as_base64(body);
     swap_sign_string(&b64)
+}
+
+/// `postData` fold via the **32-hex MD5** form: `swapSignString(md5_hex_lower(body))`.
+///
+/// This is the disambiguation of the length-24-vs-32 gotcha on
+/// [`post_data_digest`] (which uses the 24-char base64 form and therefore cannot
+/// feed the 32-char `swapSignString`). The standard Tuya mobile sign folds the
+/// **32-char lowercase-hex** MD5 of `postData` through `swapSignString` (the
+/// `provenance` §2.2 note: "the code substrings up to index 32, so treat it as
+/// the standard Tuya 32-hex MD5 path"). 32 hex chars satisfy `swapSignString`'s
+/// `[0:8]/[8:16]/[16:24]/[24:32]` block permutation exactly.
+///
+/// This is the variant the live login path (TASK-0042) uses for the `postData`
+/// envelope param, because it is the only one that yields a well-defined input to
+/// `swapSignString`. It is labelled `likely`-correct until a server-accepted live
+/// `sign` confirms it; we expose BOTH forms rather than silently pick one.
+///
+/// # Errors
+/// [`Error::InvalidSignInput`] only if [`md5_hex_lower`] ever produced a non-32
+/// string (it cannot — MD5 hex is always 32), so in practice infallible; the
+/// `Result` keeps the signature uniform with [`post_data_digest`].
+pub fn post_data_digest_hex(body: &[u8]) -> Result<String, Error> {
+    let hex = md5_hex_lower(body);
+    swap_sign_string(&hex)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -984,13 +1022,15 @@ mod tests {
         p.insert("v".into(), "1.0".into());
         p.insert("a".into(), "smartlife.m.user.email.password.login".into());
         p.insert("sid".into(), String::new()); // empty -> dropped (pre-login)
-        p.insert("t".into(), "1700000000".into());
+        p.insert("time".into(), "1700000000".into()); // WIRE name is `time` (not `t`)
+        p.insert("t".into(), "ignored".into()); // `t` is NOT whitelisted -> dropped
         p.insert("notinwhitelist".into(), "ignored".into()); // dropped
         let s = canonical_string(&p);
-        // sorted asc: a, t, v ; '||' joined ; empty sid dropped ; junk dropped
+        // sorted asc: a, time, v ; '||' joined ; empty sid dropped ; junk + bare
+        // `t` dropped (the whitelisted timestamp key is `time`, not `t`).
         assert_eq!(
             s,
-            "a=smartlife.m.user.email.password.login||t=1700000000||v=1.0"
+            "a=smartlife.m.user.email.password.login||time=1700000000||v=1.0"
         );
     }
 
@@ -1115,7 +1155,7 @@ mod tests {
         let signer = Signer::new(material, PendingBmpToken);
         let mut params = BTreeMap::new();
         params.insert("a".into(), "smartlife.m.user.email.password.login".into());
-        params.insert("t".into(), "1700000000".into());
+        params.insert("time".into(), "1700000000".into());
 
         let result = signer.sign(&params);
         assert!(
@@ -1160,12 +1200,12 @@ mod tests {
         let mut params = BTreeMap::new();
         params.insert("a".into(), "smartlife.m.user.email.password.login".into());
         params.insert("v".into(), "1.0".into());
-        params.insert("t".into(), "1700000000".into());
+        params.insert("time".into(), "1700000000".into());
 
         let got = signer.sign(&params).unwrap();
 
         // INDEPENDENT recomputation of the recovered pipeline:
-        let canonical = "a=smartlife.m.user.email.password.login||t=1700000000||v=1.0";
+        let canonical = "a=smartlife.m.user.email.password.login||time=1700000000||v=1.0";
         let key = format!(
             "{}_{}_{}",
             "ab".repeat(32),
@@ -1195,6 +1235,22 @@ mod tests {
             matches!(r, Err(Error::InvalidSignInput(_))),
             "24-char md5-base64 must surface the documented length ambiguity"
         );
+    }
+
+    // post_data_digest_hex: the 32-hex-MD5 fold IS well-defined for swapSignString.
+    // Independent recomputation: md5_hex("{}") then the documented block swap.
+    #[test]
+    fn post_data_digest_hex_swaps_32_char_md5() {
+        let body = b"{}";
+        let got = post_data_digest_hex(body).unwrap();
+        // INDEPENDENT: hex MD5 of body (32 chars), then swapSignString.
+        let hex = md5_hex_lower(body);
+        assert_eq!(hex.len(), 32);
+        let expected = swap_sign_string(&hex).unwrap();
+        assert_eq!(got, expected);
+        assert_eq!(got.len(), 32);
+        // The swap must actually permute (not identity) for a generic digest.
+        assert_ne!(got, hex, "swapSignString must permute the 32-char md5 hex");
     }
 
     // Offline validation of the RECOVERED app-cert ingredient against the

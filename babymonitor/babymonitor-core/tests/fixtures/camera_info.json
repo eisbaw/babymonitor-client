@@ -1,0 +1,19 @@
+{
+  "_comment": "SYNTHETIC CameraInfoBean fixture — NOT a real capture (static-analysis-only project; no real capture exists). All values are obviously-fake (SYNTH_*/synth-*). Shape grounded in re/tuya_cloud_auth.md §5c + decompiled CameraInfoBean. p2pType=4 -> THING/WebRTC transport (ThingCameraConstants.P2PType.P2P_TYPE_THING(4)).",
+  "id": "synth-dev-0001-camera",
+  "p2pId": "synth-p2pid-0001-not-a-real-handle",
+  "p2pType": 4,
+  "p2pSpecifiedType": 4,
+  "p2pPolicy": 0,
+  "password": "SYNTH-P2P-PASSWORD-not-real",
+  "sessionTid": "SYNTH-SESSIONTID-not-real",
+  "skill": "{\"cloudGW\":1,\"videos\":[{\"streamType\":2,\"codecType\":4,\"width\":1920,\"height\":1080}],\"audios\":[{\"codecType\":101,\"sampleRate\":8000,\"channels\":1}],\"p2p\":3,\"webrtc\":3,\"sdk_version\":\"5.0.1\",\"video_num\":2}",
+  "p2pConfig": {
+    "p2pKey": "SYNTH-P2PKEY-not-a-real-session-key",
+    "initStr": "SYNTH-INITSTR-not-a-real-init-string",
+    "ices": [ { "urls": "stun:stun.example.invalid:3478" } ],
+    "session": { "synthetic": true, "note": "redacted-in-debug" },
+    "tcpRelay": { "host": "relay.example.invalid", "port": 443 },
+    "udpRelay": { "host": "relay.example.invalid", "port": 3478 }
+  }
+}

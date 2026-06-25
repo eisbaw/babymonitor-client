@@ -28,6 +28,7 @@
 
 use thiserror::Error;
 
+pub mod device;
 pub mod session;
 pub mod sign;
 
@@ -74,6 +75,20 @@ pub enum Error {
     /// Reading or writing the on-disk session token store failed.
     #[error("session store I/O error: {0}")]
     SessionStore(String),
+
+    /// A device-list / camera-info response body could not be parsed into the
+    /// typed models — invalid JSON, or a missing required invariant (e.g. a
+    /// device record without `devId`, or a camera without `p2pId`/`p2pType`).
+    /// Carries the underlying serde context so the failure is traceable; the
+    /// models enforce required handles rather than being a permissive sponge.
+    #[error("device-list parse error: {0}")]
+    DeviceParse(String),
+
+    /// A camera view was constructed from mismatched parts (a non-camera
+    /// device, or a `CameraInfoBean` that does not correspond to the device).
+    /// We fail loud rather than connect with mismatched P2P handles.
+    #[error("device/camera mismatch: {0}")]
+    DeviceMismatch(String),
 }
 
 /// Convenience result alias for the core library.

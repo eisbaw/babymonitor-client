@@ -1,0 +1,29 @@
+{
+  "_comment": "SYNTHETIC fixture — NOT a real capture. This project is static-analysis-only and has NO real device-list capture. Every value here is obviously-fake (SYNTH_* / synth-* prefixes), so there is no PII/secret/anonymization concern. It exists only to exercise the typed serde models in babymonitor-core::device against the documented Tuya bean shape (re/tuya_cloud_auth.md §5). Field names match the atop camelCase wire shape.",
+  "deviceList": [
+    {
+      "devId": "synth-dev-0001-camera",
+      "name": "Synthetic Nursery Camera",
+      "localKey": "SYNTH-LOCALKEY-camera-0001-not-a-real-key",
+      "secKey": "SYNTH-SECKEY-camera-0001-not-a-real-key",
+      "uuid": "synth-uuid-camera-0001",
+      "pv": "2.2",
+      "productId": "synthprodid0001",
+      "category": "sp",
+      "isOnline": true,
+      "isLocalOnline": false,
+      "skills": { "webrtc": 3, "p2p": 3 }
+    },
+    {
+      "devId": "synth-dev-0002-plug",
+      "name": "Synthetic Smart Plug",
+      "localKey": "SYNTH-LOCALKEY-plug-0002-not-a-real-key",
+      "uuid": "synth-uuid-plug-0002",
+      "pv": "2.2",
+      "productId": "synthprodid0002",
+      "category": "cz",
+      "isOnline": false
+    }
+  ],
+  "sharedDeviceList": []
+}

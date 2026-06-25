@@ -22,7 +22,15 @@ tuya_appkey.json
 *appsecret*
 *.token
 token_store*
+# `fixtures/` is ignored defensively because a CAPTURED-response fixture would
+# carry real account PII/secrets. EXCEPTION: the Rust crate's test fixtures are
+# SYNTHETIC (obviously-fake SYNTH_*/synth-* values, no real capture exists — this
+# is a static-analysis-only project), so they are deliberately committable and
+# un-ignored below. `just secret-scan` still scans them. Never place a real
+# capture under this path.
 fixtures/
+!babymonitor/babymonitor-core/tests/fixtures/
+!babymonitor/babymonitor-core/tests/fixtures/**
 
 # Rust
 target/

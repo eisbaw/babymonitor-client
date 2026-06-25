@@ -4,7 +4,7 @@ title: 'SPIKE: libThingP2PSDK session + AV framing feasibility'
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:36'
-updated_date: '2026-06-25 01:04'
+updated_date: '2026-06-25 03:08'
 labels:
   - phase4
   - re
@@ -37,7 +37,20 @@ RISK SPIKE (skill phase 4). Deepest static dive: reconstruct P2P session establi
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-forward-carried from TASK-0001/0004: Strong static evidence the SCD921 stream is WebRTC-over-MQTT (review-gate F2 CONFIRMED at lib level). Java side: com/thingclips/smart/p2p/api/IThingP2P.java (connect/recvData/resendOffer=SDP) + utils/IMqttServiceUtils.java (send302MessageThroughMqtt, registerMqtt302 - "302" is Tuya camera signaling code over MQTT). Native libThingP2PSDK has full SDP/ICE/STUN/TURN/DTLS-SRTP + MQTT signaling strings. PPCS legacy path also present. connect_v2 skill field likely encodes capability negotiation. Likely task-10 verdict: partially (framing recoverable; per-session DTLS key exchange needs live pcap). Public ref: tuya/tuya-rtc-camera-sdk-android.
+FORWARD from TASK-0009 (re/p2p_triage.md) - PRIORITIZED next-dive targets (symbols, no offsets yet - the .dynsym addresses are the r2/Ghidra entry points):
 
-Forward-carried from TASK-0017 (streaming triage): if WebRTC is the live path (likely - p2pType=4 default, 302 MQTT signaling confirmed in libThingP2PSDK.so + Java P2PMQTTServiceManager, matches seydx/tuya-ipc-terminal), the PPCS AV-framing reconstruction this spike targets is LOWER priority. Recommend gating this spike behind a live check: only dive into PPCS framing if the real SCD921 device record returns p2pType=2. Otherwise Wave-2 should spike WebRTC-over-MQTT (webrtc-rs + rumqttc) instead. See re/streaming_mode.md.
+PRIORITY 1 (WebRTC, the CHOSEN transport per re/streaming_mode.md):
+1. ThingSmartP2PSDK::thing_p2p_rtc_connect_v2 (imm_p2p_rtc_connect_v2) - session-init; how skill/token/connect_session/lan_mode are consumed + how the SDP offer is kicked off. Demangled sig: (char* remote_id, char* dev_id, char* skill, uint, char* token, uint, char* trace_id, int timeout_ms, int lan_mode).
+2. imm_p2p_rtc_sdp_encode/_decode/_negotiate + _add_*_codec - offer/answer construction, codec list (OpenH264 H264 + 'imm' codec), trickle-ICE.
+3. imm_p2p_rtc_sdp_get_aes_key/_set_aes_key + imm_p2p_hmac_sha1/aes_decrypt_with_raw_key - MEDIA/SESSION KEY DERIVATION (review-gate F3's expected hard blocker; AES key appears CARRIED IN SDP - verify if statically recoverable or needs live DTLS pcap). THIS is the prime 'which bytes a pcap unblocks' candidate for AC#2/#3.
+4. ThingSmartP2PSDK::SendMessageThroughMQTT + set_signaling + the 302 {header,msg,token} envelope - pin byte shape vs P2PMQTTServiceManager.handleMqttAnswer + seydx/tuya-ipc-terminal.
+5. imm_p2p_rtc_frame_t + thing_p2p_rtc_recv_frame + imm_p2p_rtc_frame_list_* (ARQ) + imm_p2p_h264_packetize_nal_fua/_stapa - AV frame container + RTP/H264 framing the Rust depacketizer reads after SRTP.
+6. ThingSmartP2PSDK::Initialize 3-callback contract (on_msg/on_https/on_state) + enums rtc_state/rtc_active_state_e/rtc_connection_mode_e - the session state machine.
+
+PRIORITY 2 (PPCS fallback - LOW prio, gate behind a LIVE p2pType==2; statically only the demo bean shows p2pType=4):
+7. ThingCameraNative_connect4ppcs + the inner_p2p_type selector in libThingCameraSDK.so (PPCS_Write vs thing_p2p_rtc_send_data) - the runtime tie-break site.
+8. PPCS_Write/PPCS_Read call sites + RTP de-framer ('invalid RTP packet','Cannot write a 0 size RTP packet.') - proprietary AV framing over IOTC, templated by WyzeCam tutk.py.
+
+Structs/enums to recover: imm_p2p_rtc_frame_t, imm_p2p_rtc_options, imm_p2p_rtc_session_info_t, rtc_state, rtc_active_state_e, rtc_connection_mode_e.
+NOTE: since WebRTC won, the PPCS AV-framing reconstruction is now LOW priority; the verdict (AC#2) should likely steer Wave-2 to WebRTC-over-MQTT and name the SDP-carried AES key / DTLS handshake as the pcap-unblockable bytes.
 <!-- SECTION:NOTES:END -->

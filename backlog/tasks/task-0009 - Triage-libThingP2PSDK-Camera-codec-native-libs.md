@@ -1,10 +1,11 @@
 ---
 id: TASK-0009
 title: Triage libThingP2PSDK/Camera/codec native libs
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@reverser'
 created_date: '2026-06-24 22:36'
-updated_date: '2026-06-25 01:04'
+updated_date: '2026-06-25 03:08'
 labels:
   - phase3
   - re
@@ -33,10 +34,32 @@ WHY (skill phase 3): before deep diving, map the P2P/camera/codec libs - exporte
 - [ ] #4 Cross-reference named public sources: tuya/tuya-iotos-android-iot-p2p-demo (channel API surface) and WyzeCam tutk.py (IOTC/TUTK AV framing) — raises confidence toward 'confirmed'
 <!-- AC:END -->
 
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. Read symbol dumps (re/symbols/*.dynsym.txt) + demangle via c++filt; group exports by purpose (WebRTC signaling vs PPCS/IOTC) for libThingP2PSDK + CameraSDK + codec/audio libs.
+2. JS-FIRST (AC#3): confirm the JS bridge surface already mapped in streaming_mode.md/js_bundle_map.md gates the native dive; cite TUNIIPCCameraManager.connect(deviceId) -> native.
+3. String-grep .so for protocol magic/version/connect_v2/PPCS already cited; do not re-dump.
+4. Map each entry-point group to public lineage (tuya-rtc-camera-sdk-android WebRTC; tuya-iotos-android-iot-p2p-demo; WyzeCam tutk.py PPCS).
+5. Write re/p2p_triage.md: exported API surface (WebRTC vs PPCS), session-init+send/recv candidates labeled by transport, protocol magic, public-ref mapping, PRIORITIZED next-dive targets (WebRTC first, PPCS fallback low-prio).
+6. Gates: just check-evidence GREEN, just secret-scan GREEN, just e2e GREEN.
+7. Feed forward notes to TASK-0010 (prioritized targets) + TASK-0016 if WebRTC-Rust relevant. One commit, no AI trailer.
+<!-- SECTION:PLAN:END -->
+
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-forward-carried from TASK-0004: Symbol dumps already saved under re/symbols/ (libThingP2PSDK/Camera/VideoCodec/AudioEngine/SmartLink/P2PFileTrans .dynsym.txt + .dynamic.txt). KEY: libThingP2PSDK.so = WebRTC-over-MQTT (SDP a=ice-ufrag/rtcp-mux, STUN/TURN, DTLS-SRTP via STATICALLY-BUNDLED mbedTLS /Users/Pan/GitHub/mbedtls; MQTT signaling create signaling mqtt worker thread + SendMessageThroughMqtt; connect_v2 cmd with remote_id/dev_id/skill/token/lan_mode) AND legacy PPCS (ERROR_PPCS_* in CameraSDK). VideoCodec=OpenH264(Cisco). AudioEngine=Google WebRTC audio_processing (AEC/AGC/NS/VAD), build path leak ipc-tymedia-sdk. P2P version 3.10.0, Camera 1.2.x. P2P SDK does NOT link app OpenSSL (own mbedTLS).
-
-Forward-carried from TASK-0017 (streaming triage): WebRTC-over-MQTT is the LIKELY live path (p2pType=4 P2P_TYPE_THING default in SDK; 302 MQTT signaling + SDP/ICE/DTLS-SRTP in libThingP2PSDK.so; matches seydx/tuya-ipc-terminal). PPCS is the FALLBACK. So this P2P/PPCS triage is now LOWER priority than the WebRTC path. The PPCS-native-AV-framing dive only becomes primary if the real SCD921 returns p2pType=2 from a live obtainCameraConfig/device-list (statically we only see the SDK demo bean). See re/streaming_mode.md.
+GOTCHAS / findings:
+- check-evidence lint: re/symbols/*.dynsym.txt is NOT a citation token (.txt not in SOURCE_EXT; only java/kt/so/json/js/ts/bmp/xml/cfg/properties). Cite the lib*.so form (e.g. libThingP2PSDK.so) instead; the dump path is decoration. Also 'cross-confirmed' in prose trips the CONFIDENCE_RE as a stray 'confirmed' label - reworded to 'corroborated'.
+- Demangled full C++ signatures of class ThingSmartP2PSDK via c++filt (51 syms) - recovers ARG TYPES for connect_v2/v3, send/recv_data, send/recv_frame(imm_p2p_rtc_frame_t*), Initialize(3 callbacks). This is the richest surface for the Rust client; written into re/p2p_triage.md S1b.
+- NEW string finding: libThingVideoCodecSDK.so carries '1.5.0-Philips620.3' = OpenH264 fork with a Philips-specific build tag (confirmed literal). Logged in S3.
+- The inner_p2p_type selector JSON in libThingCameraSDK.so ('PPCS_Write' vs 'thing_p2p_rtc_send_data') is the concrete runtime tie-break artifact for p2pType 2-vs-4.
+- HONEST LIMIT: no disassembly done. This is the API-surface + entry-point map only; arg SEMANTICS, skill bitmask, token/key derivation need Ghidra/r2 (TASK-0010) or a live device.
+ACs: #1 done (exported fns, session-init+send/recv, magic, public-ref map w/ confidence). #2 done (prioritized next-dive symbols, S5). #3 done (JS-first gate S0). #4 done (tuya p2p-demo + WyzeCam tutk.py mapped, S4). Gates check-evidence/secret-scan/e2e all GREEN.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Produced re/p2p_triage.md: the exported API surface of libThingP2PSDK.so (26 JNI ThingP2PSDK_* exports + the full demangled C++ ThingSmartP2PSDK class with arg types + the imm_p2p_rtc_sdp_*/ice_*/frame_list ARQ families), grouped WebRTC-session vs legacy-PPCS; the session-init (thing_p2p_rtc_connect_v2/v3) and send/recv (send_data/recv_data, send_frame/recv_frame) entry points labeled per transport; the protocol magic (connect_v2 JSON envelope, signaling type validators, 302 {header,msg,token}, ERROR_PPCS_* family, inner_p2p_type selector); a confidence-graded mapping to public lineage (tuya-rtc-camera-sdk-android + seydx/tuya-ipc-terminal for WebRTC; tuya-iotos-android-iot-p2p-demo + WyzeCam tutk.py for PPCS); and a PRIORITIZED next-dive list (WebRTC first, PPCS fallback low-prio). JS-first gate confirmed the JS layer is transport-agnostic ({deviceId}-only) so the native dive is the correct next step. New finding: video codec is an OpenH264 fork tagged 1.5.0-Philips620.3. All 4 ACs met. Gates GREEN: check-evidence, secret-scan, e2e. Next-dive targets fed forward to TASK-0010; WebRTC-Rust-relevant surface fed to TASK-0016. LIMIT: no disassembly - arg semantics/skill bitmask/key derivation need Ghidra/r2 (TASK-0010) or a live device.
+<!-- SECTION:FINAL_SUMMARY:END -->

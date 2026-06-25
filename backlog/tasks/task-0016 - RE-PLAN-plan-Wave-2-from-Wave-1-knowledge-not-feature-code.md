@@ -4,7 +4,7 @@ title: 'RE-PLAN: plan Wave 2 from Wave-1 knowledge (not feature code)'
 status: To Do
 assignee: []
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 01:04'
+updated_date: '2026-06-25 03:08'
 labels:
   - phase-gate
   - replan
@@ -32,5 +32,10 @@ Re-plan task - NOT feature code. Re-invoke Skill phase2-backlog-snowball with: r
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Forward-carried from TASK-0017 (streaming-mode triage) for the Wave-2 re-plan: VERDICT = implement WebRTC-over-MQTT FIRST (cheaper than PPCS AV-framing). Transport is data-driven per device (p2pType 2=PPCS/4=WebRTC + skill.webrtc bitmask), MQTT msg code 302, envelope {header:{type:offer|answer|candidate,from,to,sessionid,trace_id},msg,token}, 302 payload AES-localKey at proto ver pv. Suggested Wave-2 tasks: (1) Tuya MQTT client + 302 message crypto (depends on localKey from device-list TASK-0013 + sign TASK-0007); (2) WebRTC session over webrtc-rs (SDP/trickle-ICE/DTLS-SRTP); (3) H264/Opus decode. DEPENDENCY/RISK EDGE: a live obtainCameraConfig call on the real SCD921 must confirm p2pType=4 BEFORE committing - the only finding that can flip the transport choice. De-prioritize the PPCS spikes (TASK-0009/0010) unless that live check returns p2pType=2. Full evidence: re/streaming_mode.md.
+FORWARD from TASK-0009 (re/p2p_triage.md) for the Wave-2 WebRTC Rust client: the native WebRTC signaling/session surface in libThingP2PSDK.so is now mapped with DEMANGLED C++ argument types (richest for porting):
+- Session-init: thing_p2p_rtc_connect_v2(remote_id, dev_id, skill, token, trace_id, timeout_ms, lan_mode) emits the {cmd:connect_v2} JSON over MQTT 302.
+- Signaling I/O: set_signaling (inbound sdp/candidate), SendMessageThroughMQTT (outbound), 302 envelope {header,msg,token}. Maps to rumqttc + the Tuya MQTT 302 codec (localKey-AES).
+- Media: imm_p2p_rtc_sdp_* (encode/decode/negotiate) + imm_p2p_ice_* + DTLS-SRTP via bundled mbedTLS -> maps onto webrtc-rs. AV frames via imm_p2p_rtc_frame_t / recv_frame; H264 RTP via imm_p2p_h264_packetize_*.
+- Codec: video is OpenH264 fork tagged '1.5.0-Philips620.3' (use an openh264-backed decode crate); audio = WebRTC audio_processing + Opus.
+OPEN RISK to flow into Wave-2 scope: the SDP-carried AES key (imm_p2p_rtc_sdp_get_aes_key) + session-key derivation is the likely hard blocker (review-gate F3) - TASK-0010 must verify static-recoverability; if not, Wave-2 needs a live pcap. The PPCS path stays a contingency branch gated behind a live p2pType==2.
 <!-- SECTION:NOTES:END -->

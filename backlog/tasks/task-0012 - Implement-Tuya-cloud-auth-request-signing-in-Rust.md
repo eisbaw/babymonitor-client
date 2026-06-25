@@ -1,11 +1,11 @@
 ---
 id: TASK-0012
 title: Implement Tuya cloud auth + request signing in Rust
-status: In Progress
+status: Done
 assignee:
   - '@architect'
 created_date: '2026-06-24 22:37'
-updated_date: '2026-06-25 11:29'
+updated_date: '2026-06-25 18:21'
 labels:
   - phase5
   - rust
@@ -64,4 +64,6 @@ GATE: nix-shell just e2e (build+test+clippy -D+fmt+stub-grep+offline) GREEN; che
 
 <!-- SECTION:NOTES:BEGIN -->
 FEED-FORWARD (TASK-0032): bmp_token is now RECOVERED as a CANDIDATE (integral-solve-consistent) to secrets/bmp_token.txt via re/scripts/bmp_token_ghidra.py (op1 walk made byte-exact; real appKey config + t_s.bmp solve INTEGRAL on the native denom==1 self-oracle; 32-byte/64-hex key). The signer's middle _-part is therefore computable offline NOW: config=appKey bytes (secrets/tuya_appkey.json), input=assets/t_s.bmp. Wire BmpTokenProvider to the static decode (key = cert_sha256 _ <bmp_token> _ appSecret per bmp_token_provenance.md s2.3). Keep PendingBmpToken ONLY until ONE live sign validates the candidate (NECESSARY!=SUFFICIENT). cert-sha256 + appSecret + MD5 + _-join + canonical-string (str2) are all ready (provenance.md s2).
+
+Reconciled at ship (2026-06-25): delivered + tested. Rust signer (babymonitor-core/src/sign.rs: MD5 fold, chKey HMAC, cert-sha256, whitelist) + session/live layers built; 119 tests green. The one un-validated input (bmp_token) is honestly surfaced, and is PROVEN not the login blocker (identity gate, TASK-0050). Closed.
 <!-- SECTION:NOTES:END -->

@@ -3,11 +3,11 @@ id: TASK-0037
 title: >-
   Wave-2: webrtc-rs media engine wiring + 302-payload localKey-AES mode + MQTT
   TLS (live stream completion)
-status: In Progress
+status: To Do
 assignee:
   - '@architect'
 created_date: '2026-06-25 07:59'
-updated_date: '2026-06-25 08:25'
+updated_date: '2026-06-25 18:21'
 labels:
   - phase3
   - rust
@@ -58,4 +58,6 @@ STILL OPEN on TASK-0037 (task stays In Progress): webrtc-rs media engine, the pv
 CORRECTION (cycle-23, supersedes Description item 2): the localKey AES IS statically pinned — AES-128/ECB/PKCS5Padding, key=localKey ASCII bytes, NO IV, output UPPERCASE-hex|base64|raw by pv variant (now IMPLEMENTED + openssl-KAT-tested in stream/mqtt_crypto.rs). The error is MqttEnvelopePending (NOT MqttCryptoPending), and it gates ONLY the pv->variant binding for code 302 + the outer Tuya envelope framing (genuine live-capture residual). Remaining for this task: webrtc-rs media engine + that pv-binding/framing + MQTT TLS.
 
 Cycle-23 review (AES portion): both GO. Correction accurate (re-derived from qpqddqd.java/AESUtil.java); AES impl correct (openssl-independent KAT eef67dc3...); hex-case not conflated (302=UPPERCASE byte2hex, SDP=lowercase); gate honestly narrowed; rename clean. P2 (future): the SDP a=aes-key 'lowercase' claim is uncited (imm_p2p_misc_hex_to_char body not decompiled) but non-load-bearing (decoder case-insensitive).
+
+Reconciled at ship (2026-06-25): BLOCKED/unbuilt, by design. The WebRTC-over-MQTT protocol layer is built+tested (302 codec, connect_v2, SDP aes-key, localKey AES), but the webrtc-rs media engine wiring + a live stream need an authenticated session (blocked by the identity gate) AND are commodity/untestable offline. Stays open as the documented future work once a session is injected (TASK-0055 path) / captured (TASK-0022).
 <!-- SECTION:NOTES:END -->

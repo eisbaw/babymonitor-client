@@ -29,7 +29,8 @@ severity coherence/honesty nits.** The two contradictions are: (1) the
 streaming-transport one in `js_bundle_map.md` (F1, P0/blocking, TASK-0025), and
 (2) the **sign-sufficiency** one in `milestone2_findings.md` (F5, P1/deferrable,
 TASK-0027) — milestone2 frames the appKey/appSecret as SUFFICIENT to sign,
-which the later TASK-0005 spike (`tuya_sign.md` verdict `needs-runtime-hook`)
+which the later TASK-0005 spike (`tuya_sign.md` verdict `needs-runtime-hook`,
+since SUPERSEDED → `partially-recoverable` per TASK-0023 `re/tuya_sign_static.md`)
 refutes. A prior version of this audit overclaimed "ONE contradiction"; F5 was
 missed and is now recorded below. The SOUND-foundation verdict stands (the gaps
 are honestly flagged and recoverable); only the completeness/ONE-contradiction
@@ -77,7 +78,7 @@ and the presence of the real signaling symbol
 | `js_bundle_map.md` | label OK, but **CONTENT wrong** in one confirmed row | self-refuted by streaming_mode | **DEFECT (F1, blocking)** |
 | `native_libs.md` | OK — SONAME/size confirmed, role per cited string | "no code-offset analysis" stated; version literals `likely` | SOUND |
 | `streaming_mode.md` | OK — honestly flags native+Java as one SDK source, leans on public ref | clearest static-vs-live boundary in the set (5 explicit live-only items) | SOUND (the canonical doc) |
-| `tuya_sign.md` | OK — every key/sign claim cited to Java + native | verdict `needs-runtime-hook` is contract-correct for TASK-0005 (not a violation) | SOUND |
+| `tuya_sign.md` | OK — every key/sign claim cited to Java + native | verdict `needs-runtime-hook` was contract-correct for TASK-0005, now **SUPERSEDED by `tuya_sign_static.md` (TASK-0023) → `partially-recoverable`** (banner added) | SOUND |
 | `tuya_cloud_auth.md` | OK — envelope/login/bean shapes cited; `DeviceBean` correctly `likely` (single source) | obfuscated `a=` action names honestly flagged needs-live | SOUND |
 | `tuya_cloud_config.md` | OK — encrypted-blob + atop-gateway claims two-sourced | datacenter-from-login boundary explicit | SOUND |
 | `review_gate_findings.md` | OK — process record labelled `confirmed` with script citations | F1–F5 hypotheses carry their own confidence | SOUND |
@@ -99,8 +100,8 @@ and the transport enum to `ThingCameraConstants` `P2P_TYPE_THING(4)`
 | **Streaming transport** | "cloud-brokered P2P", libThingP2PSDK = AV channel (stale) | "PlayNetKit … ICE 73 hits" (**WRONG**) | WebRTC-over-MQTT + PPCS fallback | WebRTC-over-MQTT preferred, PPCS fallback (VERDICT) | `CameraInfoBean.P2pConfig` has `ices`/`session` (WebRTC-shaped) | **NO — F1; streaming_mode WINS** |
 | **`p2pType` semantics** | — | — | `skill` in connect_v2 encodes capability | `P2P_TYPE_PPCS(2)`/`P2P_TYPE_THING(4)`, per-device from cloud | `CameraInfoBean.p2pType` int field | YES |
 | **MQTT signaling code 302** | MqttService is signaling candidate | `TUNIMQTTManager` publish | `SendMessageThroughMqtt` string | `send302MessageThroughMqtt`, code 302 | `Domain.*MqttUrl` brokers | YES |
-| **Sign scheme** | "Tuya cloud signs (HMAC) with appKey/appSecret" — implies appSecret-alone is **SUFFICIENT** (stale) | atop `apiRequestByAtop` carries sign | `libthing_security` whitebox flagged | (defers to tuya_sign) | atop envelope `sign` param | **milestone2 STALE (sign-sufficiency) — F5; tuya_sign WINS (TASK-0027)** |
-| **Sign verdict** | recovery is next task | — | flagged for task 5 | — | `needs-runtime-hook` (per tuya_sign) | YES |
+| **Sign scheme** | "Tuya cloud signs (HMAC) with appKey/appSecret" — implies appSecret-alone is **SUFFICIENT** (stale) | atop `apiRequestByAtop` carries sign | `libthing_security` whitebox flagged | (defers to tuya_sign) | atop envelope `sign` param | **milestone2 STALE (sign-sufficiency) — F5; tuya_sign WINS (TASK-0027). appSecret-alone-insufficient still holds; hash is plain MD5 not HMAC (TASK-0023, `tuya_sign_static.md`)** |
+| **Sign verdict** | recovery is next task | — | flagged for task 5 | — | ~~`needs-runtime-hook`~~ → **`partially-recoverable`** (SUPERSEDED per TASK-0023, `tuya_sign_static.md`: cert-SHA256 offline-computable + hash is MD5; only the `t_s.bmp` decode (TASK-0029) remains — no device needed) | YES |
 | **Datacenter selection** | region config bundled | not in JS (F5) | — | `Domain.*Url` brokers | runtime-from-login `User.domain` (F5) | YES |
 | **Static vs live boundary** | P2P wire = speculative | auth/creds are native/live | no code-offset done | 5 explicit live-only items | §7 live-unknowns table | YES |
 | **Secret handling** | location-only | schema names only, scan clean | symbol/string only | demo-bean values not reproduced | `localKey`/`p2pKey`/`password` = secret, secrets/ only | YES |
@@ -188,10 +189,16 @@ here for completeness, not re-filed.
 (~:84) states the embedded Tuya appKey/appSecret are the highest-value artifact
 because "Tuya cloud signs every API request (HMAC) with these; they are required
 to reimplement cloud auth" — framing appSecret as the SUFFICIENT sign key. The
-later TASK-0005 spike (`re/tuya_sign.md`) refutes this: its labelled `Verdict:
-needs-runtime-hook` proves appKey/appSecret ALONE are INSUFFICIENT. **This was
+later TASK-0005 spike (`re/tuya_sign.md`) refutes this: it proves appKey/appSecret
+ALONE are INSUFFICIENT. **This was
 MISSED by the first version of this audit, which overclaimed "ONE contradiction";
-it is the second.** Two independent grounds (decompiled-artifact, not sibling
+it is the second.** **SUPERSESSION (TASK-0023, `re/tuya_sign_static.md`):** the
+appSecret-alone-insufficient conclusion STILL HOLDS (the key also folds in the
+cert-SHA-256 and the decoded `t_s.bmp` token), but the earlier `needs-runtime-hook`
+verdict cited below is now superseded by `partially-recoverable` — the static dive
+showed the cert-SHA-256 is **offline-computable** from the APK signing cert and the
+keyed hash is plain MD5, so a **device is NOT required**; only the `t_s.bmp`
+token-decode port (TASK-0029) remains. Two independent grounds (decompiled-artifact, not sibling
 `.md`): (1) the keyed-sign step is native — `pbddddb.bdpdqbp(String)` calls
 `doCommandNative(context, 1, str2…)` (command code 1 = produce request signature)
 in `decompiled/jadx/sources/com/thingclips/sdk/network/pbddddb.java`, and the key
@@ -199,23 +206,31 @@ material (`generateCertificate`/`X509Certificate`/`SHA256`/`t_s.bmp` strings)
 clusters in `lib/arm64-v8a/libthing_security.so` — so the sign KEY is
 `key = [app_cert_SHA256]_[decoded_t_s.bmp_token]_[appSecret]` (review-gate F1),
 and (2) the public mobile-sign write-up `nalajcie/tuya-sign-hacking` documents the
-same cert+BMP+appSecret derivation, NOT a plain-appSecret HMAC. Two of the three
-key ingredients (the app-cert SHA-256, a *runtime* input; the matrix-deobfuscated
-`t_s.bmp` token) plus the keyed-hash routine are NOT statically reproducible
-(`tuya_sign.md` "What is and isn't statically reproducible" table). **Why
+same cert+BMP+appSecret derivation, NOT a plain-appSecret HMAC. The earlier framing
+held the app-cert SHA-256 to be a *runtime* input and the keyed-hash routine
+un-recovered (`tuya_sign.md` "What is and isn't statically reproducible" table);
+**TASK-0023 (`re/tuya_sign_static.md`) overturns the device-needed part:** the
+cert-SHA-256 is offline-computable from the APK signing cert and the keyed hash was
+disassembled to plain MD5, leaving ONLY the (deterministic, offline) `t_s.bmp`
+matrix-deobfuscated token un-ported (TASK-0029) — so the ingredients are
+statically/offline obtainable, not device-bound. **Why
 deferrable:** milestone2's point #3 carries no canonical confidence label on the
 sufficiency clause (it predates the spike), so this is a staleness/coherence
 defect — the same class as F3, not a P0 wire-error. A reader hitting milestone2
 first (the entry doc) is steered to believe appSecret alone unblocks cloud auth,
 which the set later reverses. **Winner: `tuya_sign.md`.** **Fix (filed TASK-0027,
 `--dep TASK-0005`/`TASK-0007`):** correct/forward-point milestone2 point #3 to the
-`tuya_sign.md` `needs-runtime-hook` verdict, stating appSecret alone is
-insufficient (also needs the app-cert SHA-256 + decoded `t_s.bmp` token, neither
-statically reproducible).
+`tuya_sign.md` verdict (now **`partially-recoverable`** per TASK-0023,
+`re/tuya_sign_static.md`), stating appSecret alone is insufficient (also needs the
+app-cert SHA-256 + decoded `t_s.bmp` token) — but note the app-cert SHA-256 is
+offline-computable and the hash is MD5, so only the `t_s.bmp` decode (TASK-0029) is
+un-ported and **no device is required**.
 
 ### Non-findings (avoided false positives, recorded for the reviewer)
 
-- **`tuya_sign.md` verdict token `needs-runtime-hook`** is NOT in TESTING.md's
+- **`tuya_sign.md` verdict token `needs-runtime-hook`** (now SUPERSEDED → see
+  `re/tuya_sign_static.md` / TASK-0023; retained here only as a token-set note) is
+  NOT in TESTING.md's
   canonical `{recoverable-statically|partially|needs-live-capture}` set, but
   TASK-0005 AC#3 explicitly defines THIS spike's token set as
   `{recoverable-statically|needs-runtime-hook|needs-live-capture}`, and the
@@ -286,8 +301,10 @@ the device/stream record symbols resolve (`DeviceBean`,
    (TASK-0009/0010).
 
 **Gaps a Rust implementer would trip on (all honestly flagged in the docs, none
-hidden):** the byte-exact `sign` is `needs-runtime-hook` (native key derivation,
-`tuya_sign.md`); the on-wire `a=` action names are R8-obfuscated to `n`
+hidden):** the byte-exact `sign` was `needs-runtime-hook` but is now
+**`partially-recoverable`** (SUPERSEDED, TASK-0023 `re/tuya_sign_static.md`: hash is
+MD5, cert-SHA-256 offline-computable; only the `t_s.bmp` decode (TASK-0029) remains —
+no device); the on-wire `a=` action names are R8-obfuscated to `n`
 (`tuya_cloud_auth.md` §6); the datacenter host is runtime-from-login. The contract is
 internally INCONSISTENT in TWO places, both stale `milestone2` framings the later
 spikes reverse: the streaming-transport evidence echoed in js_bundle_map (F1,
@@ -313,7 +330,7 @@ sibling `.md` cross-references.
 | F2 — PlayNetKit role overstated | P2 | folded into F1 task | fix with F1 |
 | F3 — milestone2 streaming staleness | P1 | new task `--dep TASK-0017` | **DEFERRABLE** — labelled, not a grounding violation; fix is a one-line forward-pointer; do before re-plan (TASK-0016) |
 | F4 — lint SHAPE-not-CONTENT | P1 | **already TASK-0021** | DEFERRED (open) — F1 is its concrete instance; cross-reference, do not re-file |
-| F5 — milestone2 sign-sufficiency staleness | P1 | new task `--dep TASK-0005`/`TASK-0007` (TASK-0027) | **DEFERRABLE** — staleness/coherence, not a P0 wire-error; fix is a forward-pointer to the `needs-runtime-hook` verdict; do before re-plan (TASK-0016). MISSED by the first audit version — the "ONE contradiction" headline was wrong. |
+| F5 — milestone2 sign-sufficiency staleness | P1 | new task `--dep TASK-0005`/`TASK-0007` (TASK-0027) | **DEFERRABLE** — staleness/coherence, not a P0 wire-error; fix is a forward-pointer to the sign verdict (now `partially-recoverable`, SUPERSEDING `needs-runtime-hook` per TASK-0023 `re/tuya_sign_static.md`); do before re-plan (TASK-0016). MISSED by the first audit version — the "ONE contradiction" headline was wrong. |
 
 The wave does not silently advance past F1: it is filed P0/blocking and deps the
 streaming gate. F3 and F5 are consciously deferred (low-risk, navigational/coherence)

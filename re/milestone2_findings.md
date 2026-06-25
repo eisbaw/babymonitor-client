@@ -83,14 +83,18 @@ references (tinytuya, tuya-iot SDKs).
 3. **Highest-value artifact to recover next:** the embedded **Tuya AppKey / AppSecret** (Philips'
    Tuya developer app credentials). They live somewhere in the APK (native string table,
    `assets/*config*.json`, or DEX) and are needed to reimplement cloud auth. → backlog task.
-   *CORRECTION/forward-pointer (TASK-0027):* an earlier draft framed appKey/appSecret as
-   **sufficient** to sign ("Tuya cloud signs every API request (HMAC) with these"). The later
-   TASK-0005 spike **refutes** that — see `re/tuya_sign.md`, `Verdict: needs-runtime-hook`:
-   appKey/appSecret **ALONE are insufficient**. The mobile sign KEY also folds in the running
-   APK's app-signing-certificate SHA-256 (a runtime input) **and** a token decoded from the
-   embedded `t_s.bmp` asset, and the keyed-hash routine runs in native (`libthing_security.so`,
-   command 1) — none of which is byte-reproducible from static analysis. So appKey/appSecret are
-   necessary but not sufficient; the full sign needs a runtime hook (`re/tuya_sign.md`).
+   *CORRECTION/forward-pointer (TASK-0027, updated TASK-0023):* an earlier draft framed
+   appKey/appSecret as **sufficient** to sign ("Tuya cloud signs every API request (HMAC) with
+   these"). The later TASK-0005 spike **refutes** that — appKey/appSecret **ALONE are
+   insufficient**. The mobile sign KEY also folds in the APK's app-signing-certificate SHA-256
+   **and** a token decoded from the embedded `t_s.bmp` asset, and the keyed-hash routine runs in
+   native (`libthing_security.so`, command 1). The fully-static dive (TASK-0023,
+   `re/tuya_sign_static.md`, **verdict `partially-recoverable`**, SUPERSEDING the earlier
+   `needs-runtime-hook`) then showed the cert-SHA-256 is **offline-computable** from the APK
+   signing cert and the keyed hash is **plain MD5** (not HMAC-SHA256) — so a **device is NOT
+   required**; only the deterministic `t_s.bmp` token decode (TASK-0029) remains un-ported. Net:
+   appKey/appSecret are necessary but not sufficient (also need cert-SHA-256 + BMP token), yet all
+   three are statically/offline obtainable — see `re/tuya_sign_static.md` (and `re/tuya_sign.md`).
 4. The hard core remains **`libThingP2PSDK`**: Tuya's P2P session establishment + the AV framing
    over it. Static-only, this is the riskiest piece; public Tuya-P2P work is the main lever.
    *Forward-pointer (TASK-0026):* the later streaming-mode triage refines this "cloud-brokered

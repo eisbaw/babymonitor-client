@@ -20,6 +20,19 @@ source lines live ONLY in `secrets/tuya_appkey.json` (gitignored). This doc reco
 
 ## Verdict (confidence: confirmed)
 
+> **SUPERSEDED by `re/tuya_sign_static.md` (TASK-0023).** The heavy static
+> (Ghidra/r2) dive recovered the signer — the verdict is now
+> **partially-recoverable** (NO device needed; only the `t_s.bmp` token-decode
+> port, filed as TASK-0029, remains). Concretely the static dive proved the keyed
+> hash is **plain MD5** (not HMAC-SHA256; MD5 IV constants in
+> `libthing_security.so@0x76c0`) and the app-cert SHA-256 is **computable offline**
+> from the APK signing cert (`META-INF/BNDLTOOL.RSA`), removing the runtime-cert
+> blocker. appSecret alone is still INSUFFICIENT (you also need the cert-SHA-256 +
+> decoded BMP token), but the device-needed conclusion below is **OVERTURNED** —
+> all three are statically/offline obtainable, modulo the TASK-0029 bmp port. The
+> `needs-runtime-hook` text below was a conservative *pre-disassembly* estimate;
+> it is kept as history, subordinate to `re/tuya_sign_static.md`.
+
 Verdict: needs-runtime-hook
 
 (Token set for THIS spike per task: {recoverable-statically | needs-runtime-hook |
@@ -150,6 +163,11 @@ Two independent sources: the literal constants AND the wiring that consumes them
 
 ## Hash primitive of the keyed sign (confidence: likely)
 
+- **CORRECTION (TASK-0023, see `re/tuya_sign_static.md`):** the keyed hash is **plain
+  MD5**, NOT HMAC-SHA256. The static dive disassembled the native cmd=1 path and proved
+  it (MD5 IV constants in `libthing_security.so@0x76c0`, 16-byte output, hex-encoded).
+  The `likely HMAC-SHA256` characterization below was a pre-disassembly estimate and is
+  now superseded; `SHA256`/AES strings in the lib serve other code paths, not this sign.
 - The Java half uses MD5 (`MD5Util.md5AsBase64`, `swapSignString`); the native cmd=1
   keyed step is the unknown. F1 (`re/review_gate_findings.md:16`) characterizes the
   mobile sign as `HMAC-SHA256(data, key)`, and `libthing_security.so` exposes `SHA256`
@@ -174,6 +192,10 @@ Two independent sources: the literal constants AND the wiring that consumes them
 Because two of the three key ingredients (cert SHA-256, decoded BMP token) plus the
 keyed-hash routine are NOT reproduced from static analysis, a byte-exact signature
 cannot be produced statically today → `needs-runtime-hook`.
+*(SUPERSEDED by TASK-0023, `re/tuya_sign_static.md`: the keyed hash was since
+disassembled to plain MD5 and the cert SHA-256 shown offline-computable, so the
+device-needed conclusion is overturned — only the `t_s.bmp` decode (TASK-0029)
+remains, making the signer **partially-recoverable** without a device.)*
 
 ## What a runtime hook (Frida) unblocks (confidence: likely)
 

@@ -364,11 +364,15 @@ P2P credential handles in THIS app are `p2pId` + `P2pConfig.p2pKey` +
 
 ## 6. Signing TEST-VECTOR plan (confidence: confirmed — plan, not a vector)
 
-Per `re/tuya_sign.md` (verdict **needs-runtime-hook**), the byte-exact `sign` is
-NOT statically reproducible: the keyed step is native (cmd=1 in
+Per `re/tuya_sign.md` (verdict **needs-runtime-hook**, since SUPERSEDED →
+**`partially-recoverable`** by TASK-0023, `re/tuya_sign_static.md`), the byte-exact
+`sign` was held NOT statically reproducible: the keyed step is native (cmd=1 in
 `libthing_security.so`) and the key mixes the app-cert SHA-256 + the `t_s.bmp`
-token + appSecret (`re/tuya_sign.md:87-171`). Therefore this doc **does not
-fabricate** a signature vector. AC #5 forbids a self-derived vector. What the later
+token + appSecret (`re/tuya_sign.md:87-171`). The static dive has since shown the
+cert-SHA-256 is offline-computable and the hash is plain MD5, leaving only the
+deterministic `t_s.bmp` token decode (TASK-0029) un-ported — so a device is not
+required, though a byte-exact vector still awaits that port. Therefore this doc
+**does not fabricate** a signature vector. AC #5 forbids a self-derived vector. What the later
 Rust differential test (TESTING.md Part-2 signal #2; TASK-0012) needs, to be
 produced by an INDEPENDENT reference (`nalajcie/tuya-sign-hacking` tooling or a
 live Frida capture on the user's own device, TASK-0022):

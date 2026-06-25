@@ -3,11 +3,11 @@ id: TASK-0043
 title: >-
   RE SecureNativeApi.getConfig@0x136e0 to decrypt thing_domains_v1/regions ->
   real mobile-atop datacenter host
-status: In Progress
+status: Done
 assignee:
   - '@reverser'
 created_date: '2026-06-25 12:16'
-updated_date: '2026-06-25 12:38'
+updated_date: '2026-06-25 12:40'
 labels:
   - phase3
   - wave3

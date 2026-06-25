@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@me'
 created_date: '2026-06-24 22:36'
-updated_date: '2026-06-25 02:49'
+updated_date: '2026-06-25 02:52'
 labels:
   - phase-gate
   - review
@@ -53,4 +53,6 @@ REVIEW TASK (read-only). Run mped-architect over re/*.md produced so far. Check:
 
 <!-- SECTION:NOTES:BEGIN -->
 META-REVIEW NO-GO (post-completion): the audit MISSED a second cross-doc contradiction and overclaimed 'ONE contradiction'. Missed finding = F5: re/milestone2_findings.md 'What this means' point #3 (~:84) frames appKey/appSecret as SUFFICIENT to sign Tuya requests ('Tuya cloud signs every API request (HMAC) with these'), refuted by the later TASK-0005 spike re/tuya_sign.md (Verdict: needs-runtime-hook) and review_gate_findings.md F1 (sign key = [app_cert_SHA256]_[decoded t_s.bmp token]_[appSecret], native+runtime-cert-dependent). Same staleness class as the streaming F3 - milestone2 is the stale entry doc. FIX APPLIED: (1) filed TASK-0027 (FIX milestone2 sign-key staleness, P1, --dep TASK-0005/TASK-0007, with 2 structured ACs); (2) edited re/review_wave1_analysis.md - added F5 finding (confidence: confirmed, grounded in pbddddb.java doCommandNative cmd=1 + libthing_security.so + nalajcie/tuya-sign-hacking), fixed the matrix 'Sign scheme' row to 'milestone2 STALE (sign-sufficiency)' -> tuya_sign WINS, softened the 'ONE contradiction'/'everywhere else converges'/'ONE place internally INCONSISTENT' headlines to TWO recorded contradictions (F1+F5) bounded-by-spot-check, kept the SOUND-foundation verdict; (3) added structured ACs to TASK-0025 and TASK-0026 (they had only inline FIX/VERIFY prose). Gates GREEN after edit: check-evidence (11 docs, 0 active), secret-scan, e2e. The overall SOUND-for-Rust-slice verdict stands; only the completeness/ONE-contradiction claim was wrong.
+
+Cycle-9 review: initial GO from qa but NO-GO from 2nd architect (audit missed the milestone2 sign-sufficiency contradiction F5, overclaimed 'ONE contradiction'). Fixed in cffc1e7: F5 recorded, matrix Sign-scheme row corrected, headline softened, SOUND verdict retained, TASK-0027 filed. Re-review GO. Residual nit: 'F5' label overloaded with datacenter-F5 in the matrix -> note on TASK-0027.
 <!-- SECTION:NOTES:END -->

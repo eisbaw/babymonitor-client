@@ -3,11 +3,11 @@ id: TASK-0033
 title: >-
   Ghidra-headless port of the bmp_token imath+matrix decode (byte-exact,
   2nd-tool corroboration)
-status: In Progress
+status: Done
 assignee:
   - '@reverser'
 created_date: '2026-06-25 06:35'
-updated_date: '2026-06-25 06:57'
+updated_date: '2026-06-25 06:58'
 labels:
   - phase3
   - re
@@ -42,22 +42,5 @@ USER DIRECTIVE 2026-06-25: actually USE Ghidra (analysis so far was radare2-only
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Decode: fully-ported-unvalidated.
-
-GHIDRA INVOCATION THAT WORKED (successors reuse this):
-  nixpkgs ghidra 11.4.2 ships the wrapper at $(dirname ghidra)/ghidra-analyzeHeadless.
-  ghidra-analyzeHeadless analysis/ghidra bmptok -import <lib.so> -scriptPath analysis/ghidra -postScript DumpDecomp.py re/ghidra <spec...>
-  - spec = NAME (exported symbol) or NAME@0xADDR. Ghidra applies image base 0x100000, so a file-offset 0x4b28 must be passed as 0x104b28. Exported symbols resolve directly.
-  - DO NOT pass -deleteProject if you want to re-run -process later (it nukes the project). Re-import the SECOND lib into the SAME project name with a fresh -import (not -process) run.
-  - DumpDecomp.py (analysis/ghidra/, gitignored) uses DecompInterface + createFunction for raw addrs; writes one .c per fcn to re/ghidra/.
-
-KEY FINDINGS:
-1. The decode is the nalajcie Vandermonde scheme CONFIRMED byte-exact via Ghidra: strhash(config)->selector pixel->op1(direct bytes)/op2(LSB-packed bytes)->coeff (a,b) hex pairs->Vandermonde over imath mp_rat->Gauss-elim->require denom==1->mp_int_to_binary numerator->%02x hex key. transform@0x6c58 is a NO-OP stub.
-2. r2-vs-Ghidra DIVERGENCE: r2 trace (bmp_token_whitebox s8) attributed read_keys_from_content + fcn.13b5c to cmd=1; Ghidra doCommandNative.c shows cmd=0 runs the decode (caches '_'-joined key in DAT_00139070); cmd=1/cmd=2 MD5 that cache. Model unchanged, cmd-number corrected.
-3. BIG FINDING: config arg = RUNTIME JNI byte[] (param_6), NOT static. So even the complete port cannot emit the production token offline -- refutes the 'no runtime input' claim in tuya_sign_static.md s5 / whitebox s8. Residual shifts from 'port the matrix' (DONE) to 'obtain the runtime SDK-config byte[]' or a live vector.
-
-GOTCHAS:
-- objdump -d produced near-empty output on this .so; use r2 (default base, no reloc-shift) for cross-checking disassembly. r2 -e bin.relocs.apply=true SHIFTS addresses and broke .rodata px reads; objdump -s -j .rodata read the format strings cleanly (DAT_00102b69 = '%02x').
-- Ghidra dropped the 3rd arg on two FUN_0010583c (xorstep) calls in decode_op1; recovered them from r2 disasm of 0x5138 (start off = xorstep(px,base+1)^r; per-pair off = xorstep(px,off)^off).
-- BmpTokenProvider kept PendingBmpToken (NOT wired to a fake) -- correct since no production token is computable offline yet.
+FINAL SUMMARY: Ghidra-headless port COMPLETE. Decode: fully-ported-unvalidated. Ran Ghidra 11.4.2 (ghidra-analyzeHeadless) on both libs; decompiled 21 functions to C (re/ghidra/*.c) as the primary source; ported the t_s.bmp imath+matrix bmp_token decode byte-exact to re/scripts/bmp_token_ghidra.py (16 tests, all green). The decode is the nalajcie Vandermonde/rational-interpolation scheme, CONFIRMED byte-exact: strhash(config) selector -> op1(direct bytes)/op2(LSB-packed bytes) -> (a,b) hex coeff pairs -> Vandermonde over imath mp_rat -> Gauss-elim -> denom==1 gate -> mp_int_to_binary numerator -> %02x key; transform is a no-op stub. Ghidra-vs-r2: AGREE on the chain; Ghidra adds the exact math; DIVERGENCE recorded (decode runs on cmd=0 not cmd=1; r2 was off-by-one). NEW finding: config input is a RUNTIME JNI byte[], not static -> the production token is NOT computable from assets alone (refutes the prior 'no runtime input' claim); residual shifts from the matrix (done) to the runtime config blob / a live vector. Labeling fixed: task-0023 title + 4 doc headers attribute radare2 (prior) vs Ghidra (this). Gates e2e/check-evidence/secret-scan GREEN. Commit 90cacc8. BmpTokenProvider stays PendingBmpToken (honest). HONEST LIMITATION: no static oracle exists, so 'unvalidated'; a 1-byte error in the offset-walk would fail silently, and the full production path additionally needs the runtime config blob.
 <!-- SECTION:NOTES:END -->

@@ -3,11 +3,11 @@ id: TASK-0041
 title: >-
   Trace bmp_token config-byte[] provenance + exact login sign construction
   (complete the signer, static)
-status: In Progress
+status: Done
 assignee:
   - '@reverser'
 created_date: '2026-06-25 10:54'
-updated_date: '2026-06-25 11:07'
+updated_date: '2026-06-25 11:08'
 labels:
   - phase3
   - wave3

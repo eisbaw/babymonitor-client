@@ -109,9 +109,13 @@ fn live_login_then_device_list_finds_scd921() {
 ///
 /// CURRENT (stream-pending) behaviour, asserted honestly when run with
 /// `--ignored`: the live session driver surfaces [`Error::StreamPending`] because
-/// (a) every runtime credential is auth-gated and absent (token/p2pId/p2pKey/
-/// ices/session/localKey/pv — needs TASK-0032 + the Wave-2 auth decision to fetch
-/// the device's `CameraInfoBean`/`P2pConfig`), (b) the 302-payload localKey-AES
+/// (a) every runtime credential (token/p2pId/p2pKey/ices/session/localKey/pv)
+/// rides an authenticated session that cannot be obtained — `token.get` is
+/// rejected by the server-side identity gate (`ILLEGAL_CLIENT_ID`, proven
+/// sign-insensitive — TASK-0050/0051), so login never issues a `sid` to fetch the
+/// device's `CameraInfoBean`/`P2pConfig` (the signer's un-validated 6th
+/// ingredient, the `bmp_token` — TASK-0032 — is a sign input, not this blocker),
+/// (b) the 302-payload localKey-AES
 /// PRIMITIVE is now implemented (AES-128/ECB/PKCS5, key=localKey), but the full
 /// 302 envelope assembly is pending (`Error::MqttEnvelopePending`: the
 /// pv→output-variant binding + outer Tuya MQTT framing need a live capture —
@@ -130,12 +134,14 @@ fn live_login_then_device_list_finds_scd921() {
 /// own SCD921; creds from `secrets/` (gitignored), never a tracked file; single
 /// shot, `--test-threads=1`. Nothing here prints a secret.
 #[test]
-#[ignore = "live A/V stream: needs the user's real Tuya account + device creds \
-            (TASK-0032 + the Wave-2 auth decision TASK-0035), the 302 envelope \
-            variant/framing binding + webrtc-rs engine (TASK-0037), and a live SCD921 \
-            returning p2pType=4. Run manually with --ignored --test-threads=1. \
-            Today it asserts the honest stream-pending state, not a fabricated \
-            stream."]
+#[ignore = "live A/V stream: needs an authenticated session, which a from-scratch \
+            client cannot obtain — token.get is rejected by the server-side identity \
+            gate (ILLEGAL_CLIENT_ID, TASK-0050/0051), so the device creds it would \
+            fetch are unreachable; needs an injected captured session (TASK-0022). It \
+            also needs the 302 envelope variant/framing binding + webrtc-rs engine \
+            (TASK-0037) and a live SCD921 returning p2pType=4. Run manually with \
+            --ignored --test-threads=1. Today it asserts the honest stream-pending \
+            state, not a fabricated stream."]
 fn live_webrtc_session_renders_first_frame() {
     // A panicking engine/transport: if the (gated) driver ever reached real I/O
     // these would explode, proving no live path runs while stream-pending.

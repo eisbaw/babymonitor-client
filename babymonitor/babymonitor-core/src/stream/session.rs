@@ -11,9 +11,13 @@
 //!
 //! # The driver is honestly gated (TASK-0034 AC#2)
 //! [`LiveSessionDriver::run`] returns [`crate::Error::StreamPending`]: it cannot
-//! actually stream because every runtime input is auth-gated (no token / device
-//! creds — TASK-0032 + Wave-2 auth) and the media engine is a follow-up. This is
-//! the signer's discipline: never a fake stream, never `todo!()`.
+//! actually stream because every runtime input rides an authenticated session
+//! that cannot be obtained — `token.get` is rejected by the server-side identity
+//! gate (`ILLEGAL_CLIENT_ID`, TASK-0050/0051) before login issues a `sid`, so the
+//! per-device creds it would fetch are unreachable — and the media engine is a
+//! follow-up. (The signer also still lacks its un-validated 6th ingredient, the
+//! `bmp_token` — TASK-0032 — but that is a sign ingredient, not the blocker.)
+//! This is the signer's discipline: never a fake stream, never `todo!()`.
 
 use crate::stream::connect::{build_connect_v2, ConnectV2Args, LanMode, CONNECT_SESSION_LEN};
 use crate::stream::frame::Frame;
@@ -229,9 +233,12 @@ impl<'a, T: MqttTransport, E: WebRtcEngine> LiveSessionDriver<'a, T, E> {
     /// envelope assembly is still pending ([`super::mqtt_crypto::encrypt_302_payload`]
     /// returns [`Error::MqttEnvelopePending`]: the pv→output-variant binding +
     /// outer framing need a live capture — TASK-0037), the WebRTC media engine is
-    /// a follow-up (no webrtc-rs in this build), and every runtime credential is
-    /// auth-gated and absent (TASK-0032 + Wave-2 auth). We surface that honestly
-    /// rather than fabricate a stream. The credential validation DOES run first,
+    /// a follow-up (no webrtc-rs in this build), and every runtime credential
+    /// rides an authenticated session that cannot be obtained — `token.get` is
+    /// rejected by the server-side identity gate (`ILLEGAL_CLIENT_ID`, proven
+    /// sign-insensitive — TASK-0050/0051), so login never issues a `sid` and the
+    /// per-device creds stay unfetchable. We surface that honestly rather than
+    /// fabricate a stream. The credential validation DOES run first,
     /// so a misconfigured call still fails loud with the precise reason.
     ///
     /// # Errors

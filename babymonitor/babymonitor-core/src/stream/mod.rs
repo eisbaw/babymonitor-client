@@ -34,9 +34,14 @@
 //!    tree risks that discipline. The *valuable, RE-recovered* protocol surface
 //!    is the Tuya-custom delta above, which is fully unit-testable with no media
 //!    stack at all.
-//! 2. **Honest scope.** The live media path cannot run until auth unblocks (no
-//!    `bmp_token` / no device-list creds — TASK-0032/Wave-2 auth) AND a real
-//!    SCD921 returning `p2pType=4` is present. Wiring webrtc-rs now would be a
+//! 2. **Honest scope.** The live media path cannot run until login unblocks AND
+//!    a real SCD921 returning `p2pType=4` is present. The device-list /
+//!    `CameraInfoBean` creds the session needs are unfetchable because there is
+//!    no authenticated session: `token.get` is rejected by a server-side identity
+//!    gate (`ILLEGAL_CLIENT_ID`, proven sign-insensitive — TASK-0050/0051), so
+//!    the cloud never issues a `sid`. (The signer separately still lacks its
+//!    un-validated 6th ingredient, the `bmp_token` — TASK-0032 — but that is a
+//!    sign ingredient, not the fetch blocker.) Wiring webrtc-rs now would be a
 //!    large dependency that cannot be exercised end-to-end, i.e. an unflagged
 //!    half-add. Instead we define the [`session::WebRtcEngine`] trait seam so the
 //!    media engine plugs in WITHOUT touching the protocol layer, and FILE the
@@ -50,8 +55,10 @@
 //!
 //! This layer **builds + unit-tests pass static-only**. It **cannot stream**: the
 //! live driver returns [`crate::Error::StreamPending`] because every runtime input
-//! (token, p2pId, p2pKey, ices, session, localKey, pv) is auth-gated and absent,
-//! and the WebRTC media engine is a follow-up. Exactly the signer's
+//! (token, p2pId, p2pKey, ices, session, localKey, pv) rides an authenticated
+//! session that cannot be obtained — `token.get` is rejected by the server-side
+//! identity gate (`ILLEGAL_CLIENT_ID`, TASK-0050/0051) before login ever issues a
+//! `sid` — and the WebRTC media engine is a follow-up. Exactly the signer's
 //! TOKEN-PENDING discipline: never a fake stream, never `todo!()`.
 
 pub mod connect;

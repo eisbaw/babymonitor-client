@@ -153,14 +153,17 @@ pub enum Error {
     WebRtcEngine(String),
 
     /// The honest **not-yet-live** state of the live A/V session: the client
-    /// cannot actually stream because every runtime input is auth-gated and
-    /// absent (token/p2pId/p2pKey/ices/session/localKey/pv — TASK-0032 +
-    /// the Wave-2 auth decision TASK-0035), the 302-publish envelope assembly is
-    /// pending ([`Error::MqttEnvelopePending`] — the AES primitive is implemented,
-    /// but the pv→variant binding + outer framing need a live capture), and the
-    /// WebRTC media engine is a follow-up (no webrtc-rs in this build —
-    /// TASK-0037). The live driver returns THIS rather than a fabricated stream
-    /// or `todo!()` — exactly the signer's TOKEN-PENDING discipline.
+    /// cannot actually stream because every runtime input
+    /// (token/p2pId/p2pKey/ices/session/localKey/pv) rides an authenticated
+    /// session that cannot be obtained — `token.get` is rejected by the
+    /// server-side identity gate (`ILLEGAL_CLIENT_ID`, proven sign-insensitive —
+    /// TASK-0050/0051), so login never issues a `sid` and the per-device creds
+    /// stay unfetchable — the 302-publish envelope assembly is pending
+    /// ([`Error::MqttEnvelopePending`] — the AES primitive is implemented, but the
+    /// pv→variant binding + outer framing need a live capture), and the WebRTC
+    /// media engine is a follow-up (no webrtc-rs in this build — TASK-0037). The
+    /// live driver returns THIS rather than a fabricated stream or `todo!()` —
+    /// exactly the signer's TOKEN-PENDING discipline.
     #[error(
         "live A/V stream is pending: cannot stream until auth unblocks (device \
          creds + signing) and the WebRTC media engine lands (TASK-0037)"

@@ -52,11 +52,14 @@
 //!
 //! [`parse_device_list`] takes a response **body** (injected bytes) so it is
 //! fully testable offline. A real HTTP fetch is intentionally NOT implemented
-//! here: it is blocked on the same TOKEN-PENDING signer state as TASK-0012 (a
-//! valid `sign` needs the `bmp_token`, TASK-0032). [`list_devices`] therefore
-//! threads the signer/session through and returns [`Error::BmpTokenPending`]
-//! when asked to actually sign — it never makes a live call and never fabricates
-//! a response.
+//! here: the device list rides an authenticated session, and there is none — a
+//! from-scratch `token.get` is rejected by the server-side identity gate
+//! (`ILLEGAL_CLIENT_ID`, proven sign-insensitive — TASK-0050/0051), so the cloud
+//! never issues a `sid` to authorize a home-detail call. [`list_devices`]
+//! additionally cannot even sign without the un-validated `bmp_token` (the
+//! signer's 6th ingredient — TASK-0032), so it threads the signer/session through
+//! and returns [`Error::BmpTokenPending`] the moment a signature is required.
+//! Either way it never makes a live call and never fabricates a response.
 
 use std::collections::BTreeMap;
 
@@ -525,12 +528,17 @@ pub fn parse_camera_info(body: &[u8]) -> Result<CameraInfoBean, Error> {
 /// material, a token provider, a session, and a home id, it would build a signed
 /// home-detail request, POST it, and [`parse_device_list`] the response.
 ///
-/// **No live call is made in this task.** A valid `sign` is TOKEN-PENDING (it
-/// needs the `bmp_token`, TASK-0032), so this function threads the signer
+/// **No live call is made in this task.** The home-detail call needs an
+/// authenticated session, and there is none: a from-scratch `token.get` is
+/// rejected by the server-side identity gate (`ILLEGAL_CLIENT_ID`, proven
+/// sign-insensitive — TASK-0050/0051), so the cloud never issues a `sid`.
+/// Independently, this function also cannot sign without the un-validated
+/// `bmp_token` (the signer's 6th ingredient, TASK-0032), so it threads the signer
 /// through and returns [`Error::BmpTokenPending`] the moment a signature is
-/// required — exactly the TASK-0012 discipline. This keeps the request-decoration
-/// wiring real and reviewable without fabricating a response or hitting the
-/// network. The real HTTP path lands when signing unblocks (a follow-up task).
+/// required — exactly the TASK-0012 discipline. Either way the request-decoration
+/// wiring stays real and reviewable without fabricating a response or hitting the
+/// network. The real HTTP path lands when an authenticated session is injected
+/// (one on-device capture, TASK-0022 — a follow-up).
 ///
 /// `_material`/`_token_provider`/`_session_sid`/`_home_id` are accepted now so
 /// the call signature is stable for callers (the CLI, TASK-0014) — they are
@@ -544,12 +552,17 @@ pub fn list_devices<P: BmpTokenProvider>(
     _session_sid: &str,
     _home_id: &str,
 ) -> Result<DeviceList, Error> {
-    // Probe the signer dependency: if the bmp_token is pending, we cannot sign,
-    // so we cannot make the request. Surface that honestly rather than touching
-    // the network or returning an empty list.
+    // The fetch is blocked first by the absent authenticated session (the
+    // server-side identity gate rejects token.get with ILLEGAL_CLIENT_ID,
+    // TASK-0050/0051, so no sid is issued). On top of that, the signer cannot even
+    // produce a signature without the un-validated bmp_token: probe that dependency
+    // here, and if it is pending we cannot sign, so we cannot make the request.
+    // Surface that honestly rather than touching the network or returning an empty
+    // list.
     token_provider.bmp_token()?;
-    // If a token ever becomes available, the live HTTP path is still not wired
-    // in this task — that is a separate follow-up (request decoration + POST).
+    // Even if a token became available, the request would still need an authed
+    // session (identity gate above), and the live HTTP path is not wired in this
+    // task either — that is a separate follow-up (request decoration + POST).
     Err(Error::NotImplemented(
         "list_devices live HTTP fetch (signer unblocked but fetch not wired \
          yet — follow-up task)",
@@ -621,8 +634,11 @@ mod tests {
     }
 
     // With the default pending token provider, list_devices must NOT touch the
-    // network and must surface the honest TOKEN-PENDING state (TASK-0032), the
-    // same discipline as the signer.
+    // network and must surface the honest pending state — the same discipline as
+    // the signer. (The deeper reason the fetch is unreachable is the absent
+    // authenticated session / identity gate, TASK-0050/0051; the concrete variant
+    // here is BmpTokenPending because the signer's un-validated 6th ingredient,
+    // the bmp_token — TASK-0032 — is its first stop.)
     #[test]
     fn list_devices_is_token_pending_without_token() {
         let material = synth_material();

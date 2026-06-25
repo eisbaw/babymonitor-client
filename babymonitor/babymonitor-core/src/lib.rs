@@ -32,6 +32,7 @@ use thiserror::Error;
 pub mod device;
 pub mod session;
 pub mod sign;
+pub mod stream;
 
 /// The crate version, surfaced so the CLI can print a single source of truth.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -91,6 +92,66 @@ pub enum Error {
     /// We fail loud rather than connect with mismatched P2P handles.
     #[error("device/camera mismatch: {0}")]
     DeviceMismatch(String),
+
+    /// A 302 MQTT signaling envelope could not be parsed/serialized — invalid
+    /// JSON, a missing required field (`header`/`msg`/`token`), or an unknown
+    /// `header.type` (`re/webrtc_session.md` §2). Mirrors the native validators
+    /// (`no header/msg/token field`); the models enforce the required shape.
+    #[error("302 signaling parse error: {0}")]
+    SignalingParse(String),
+
+    /// A `StreamCredentials`/`connect_v2` input was malformed (an empty required
+    /// handle, a non-JSON unquoted `skill`/`token`, or a wrong-length
+    /// `connect_session`). Carries context so the failure is traceable.
+    #[error("stream config error: {0}")]
+    StreamConfig(String),
+
+    /// The SDP `a=aes-key:<hex>` media-key codec failed: malformed hex, an
+    /// oversized key (native max 23 bytes), or a missing `a=aes-key`/
+    /// `m=application` section (`re/webrtc_session.md` §3c).
+    #[error("SDP aes-key error: {0}")]
+    SdpAesKey(String),
+
+    /// The 302-payload localKey-AES crypto is not yet implementable: the exact
+    /// AES mode/IV/padding is NOT statically pinned (the Tuya MQTT `AESUtil.ALGO`
+    /// is set at runtime; the obfuscated `Cipher.getInstance` arg is jadx-mangled
+    /// — `re/webrtc_session.md` §2a/§7). We surface this typed error rather than
+    /// guessing a mode (which would silently produce wrong ciphertext); filed as
+    /// a follow-up (TASK-0037). This is the same honesty as `BmpTokenPending`.
+    #[error(
+        "302-payload localKey-AES is pending: the AES mode/IV is not statically \
+         pinned (runtime AESUtil.ALGO) — blocked on TASK-0037 (mode port / live capture)"
+    )]
+    MqttCryptoPending,
+
+    /// A frame model operation failed: an unrecognized `imm_p2p_rtc_frame_t.type`,
+    /// an unsupported rtpmap codec, or an empty payload
+    /// (`re/webrtc_session.md` §4).
+    #[error("frame model error: {0}")]
+    Frame(String),
+
+    /// The MQTT transport seam failed (publish/receive), or an unexpected inbound
+    /// message was seen on the receive path.
+    #[error("stream transport error: {0}")]
+    Transport(String),
+
+    /// The standard-WebRTC engine seam (webrtc-rs) failed.
+    #[error("webrtc engine error: {0}")]
+    WebRtcEngine(String),
+
+    /// The honest **not-yet-live** state of the live A/V session: the client
+    /// cannot actually stream because every runtime input is auth-gated and
+    /// absent (token/p2pId/p2pKey/ices/session/localKey/pv — TASK-0032 +
+    /// the Wave-2 auth decision TASK-0035), the 302-payload AES mode is unpinned
+    /// ([`Error::MqttCryptoPending`]), and the WebRTC media engine is a follow-up
+    /// (no webrtc-rs in this build — TASK-0037). The live driver returns THIS
+    /// rather than a fabricated stream or `todo!()` — exactly the signer's
+    /// TOKEN-PENDING discipline.
+    #[error(
+        "live A/V stream is pending: cannot stream until auth unblocks (device \
+         creds + signing) and the WebRTC media engine lands (TASK-0037)"
+    )]
+    StreamPending,
 }
 
 /// Convenience result alias for the core library.

@@ -39,6 +39,9 @@
 //! and are asserted by SHAPE (presence / camera-ness), never echoed.
 
 use babymonitor_core::sign::{PendingBmpToken, SigningKeyMaterial};
+use babymonitor_core::stream::frame::Frame;
+use babymonitor_core::stream::session::{LiveSessionDriver, MqttTransport, OsRandom, WebRtcEngine};
+use babymonitor_core::stream::StreamCredentials;
 use babymonitor_core::{device, Error};
 
 /// The gold-oracle live path. `#[ignore]`d: excluded from the offline suite.
@@ -85,6 +88,105 @@ fn live_login_then_device_list_finds_scd921() {
         other => panic!(
             "live device-list expected token-pending (TASK-0032 not yet landed); got {other:?}. \
              If login now works, update this harness to assert the real SCD921 discovery."
+        ),
+    }
+}
+
+/// The gold-oracle LIVE A/V STREAM path (TASK-0034). `#[ignore]`d: excluded from
+/// the offline suite; never opens an MQTT/WebRTC socket in `just e2e`/CI.
+///
+/// CURRENT (stream-pending) behaviour, asserted honestly when run with
+/// `--ignored`: the live session driver surfaces [`Error::StreamPending`] because
+/// (a) every runtime credential is auth-gated and absent (token/p2pId/p2pKey/
+/// ices/session/localKey/pv — needs TASK-0032 + the Wave-2 auth decision to fetch
+/// the device's `CameraInfoBean`/`P2pConfig`), (b) the 302-payload localKey-AES
+/// mode is not statically pinned (`Error::MqttCryptoPending` — TASK-0037), and
+/// (c) the WebRTC media engine (webrtc-rs) is a follow-up (TASK-0037). It makes
+/// NO network call and renders NO fabricated frame.
+///
+/// FUTURE (once auth unblocks + a real SCD921 returns p2pType=4): replace the
+/// engine/transport fakes with the real `RumqttcTransport` (TLS feature on) + the
+/// webrtc-rs engine, load `StreamCredentials` from `secrets/`, and assert ≥1
+/// decoded video frame is received (`engine.recv_frame()` yields a
+/// [`FrameKind::VideoKeyframe`]) — asserting SHAPE only, never echoing payload or
+/// the per-session media key.
+///
+/// ## Authorized scope / manual setup
+/// Same contract as the login harness above: ONLY the user's own account + their
+/// own SCD921; creds from `secrets/` (gitignored), never a tracked file; single
+/// shot, `--test-threads=1`. Nothing here prints a secret.
+#[test]
+#[ignore = "live A/V stream: needs the user's real Tuya account + device creds \
+            (TASK-0032 + the Wave-2 auth decision TASK-0035), the pinned \
+            302-payload AES mode + webrtc-rs engine (TASK-0037), and a live SCD921 \
+            returning p2pType=4. Run manually with --ignored --test-threads=1. \
+            Today it asserts the honest stream-pending state, not a fabricated \
+            stream."]
+fn live_webrtc_session_renders_first_frame() {
+    // A panicking engine/transport: if the (gated) driver ever reached real I/O
+    // these would explode, proving no live path runs while stream-pending.
+    struct UnreachableTransport;
+    impl MqttTransport for UnreachableTransport {
+        fn publish_302(&mut self, _d: &str, _p: &str, _b: &[u8]) -> Result<(), Error> {
+            panic!("transport must NOT be driven while the stream is pending");
+        }
+        fn try_recv_302(&mut self) -> Result<Option<Vec<u8>>, Error> {
+            panic!("transport must NOT be driven while the stream is pending");
+        }
+    }
+    struct UnreachableEngine;
+    impl WebRtcEngine for UnreachableEngine {
+        fn create_offer(&mut self) -> Result<String, Error> {
+            // The driver DOES build an offer (proving the seam is wired) before
+            // hitting the crypto gate; return a minimal Tuya-shaped offer so the
+            // gate (not this fake) is what stops the run.
+            Ok("v=0\r\nm=application 9 x 98\r\na=ice-options:trickle\r\na=mid:2\r\n".into())
+        }
+        fn set_answer(&mut self, _s: &str) -> Result<(), Error> {
+            panic!("engine answer must NOT run while the stream is pending");
+        }
+        fn add_remote_candidate(&mut self, _c: &str) -> Result<(), Error> {
+            panic!("engine candidate must NOT run while the stream is pending");
+        }
+        fn recv_frame(&mut self) -> Result<Option<Frame>, Error> {
+            panic!("frame recv must NOT run while the stream is pending");
+        }
+    }
+
+    // SYNTHETIC creds: the real ones come from secrets/ once auth unblocks. A
+    // full set passes validation so the driver reaches the honest pending gate
+    // (not a config error). local_key is AES-128-sized synthetic material.
+    let creds = StreamCredentials {
+        token: "SYNTH_TOKEN".into(),
+        p2p_id: "SYNTH_P2PID".into(),
+        dev_id: "SYNTH_DEVID".into(),
+        skill: "{}".into(),
+        p2p_key: "SYNTH_P2PKEY".into(),
+        ices: "[]".into(),
+        session: "{}".into(),
+        local_key: "0123456789abcdef".into(), // secret-scan:allow (synthetic test value)
+        pv: "2.2".into(),
+    };
+
+    let mut transport = UnreachableTransport;
+    let mut engine = UnreachableEngine;
+    let mut driver = LiveSessionDriver::new(&creds, &mut transport, &mut engine);
+
+    let result = driver.run(&OsRandom, "live-trace-0001");
+
+    // HONEST assertion: the live stream is blocked. We assert StreamPending
+    // rather than a stream we cannot produce. This goes RED the day someone makes
+    // it pretend to stream without auth + the media engine — the negative-feedback
+    // property we want.
+    match result {
+        Err(Error::StreamPending) => {
+            // Expected today. When auth (TASK-0035) + the media engine (TASK-0037)
+            // land, replace the fakes with the real transport/engine and assert
+            // ≥1 decoded frame.
+        }
+        other => panic!(
+            "live stream expected stream-pending (auth + webrtc-rs not landed); got {other:?}. \
+             If streaming now works, update this harness to assert a real decoded frame."
         ),
     }
 }

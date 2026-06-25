@@ -24,6 +24,15 @@ chrono = { version = "0.4", features = ["serde"] }
 # hash. Pure-Rust miniz_oxide backend (no system zlib) keeps the e2e gate
 # self-contained and offline.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# MQTT signaling transport for the Tuya WebRTC-over-MQTT 302 channel (TASK-0034).
+# We use rumqttc's SYNCHRONOUS `Client`/`Connection` (no async runtime spun by
+# us) behind the `stream::session::MqttTransport` seam. default-features OFF on
+# purpose: it drops the TLS stack (rustls/ring) — a large, network/C-build-heavy
+# tree that would jeopardise the `just assert-offline` gate. The live Tuya broker
+# IS TLS, so the `use-rustls` feature must be re-enabled on the live path; that is
+# a live-only follow-up (TASK-0035), gated like the rest of the live stream.
+# webrtc-rs is deliberately NOT added — see babymonitor-core/src/stream/mod.rs.
+rumqttc = { version = "0.24", default-features = false }
 
 [workspace.package]
 edition = "2021"

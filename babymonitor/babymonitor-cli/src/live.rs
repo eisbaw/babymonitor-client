@@ -264,6 +264,23 @@ pub enum LiveOutcome {
     },
 }
 
+/// The outcome of a PROBE-ONLY run (TASK-0048 Stage B). A probe sends EXACTLY ONE
+/// `token.get` to ONE host and STOPS — it NEVER proceeds to `password.login`,
+/// even on success. This is the guardrail-faithful path for sweeping the
+/// un-tried iotbing/px datacenter gateways: the whole point is to learn whether a
+/// host clears `ILLEGAL_CLIENT_ID`, not to log in. No variant carries a secret.
+#[derive(Debug)]
+pub enum ProbeOutcome {
+    /// `token.get` was ACCEPTED (success=true). The sign oracle is reachable on
+    /// this host — the signer (bmp_token + fold) can finally be validated. We
+    /// STOP here (the caller must NOT chain into password.login).
+    Accepted,
+    /// The server returned an application error (success=false). Carries the
+    /// server-supplied code + message (non-secret) so the caller can classify
+    /// `ILLEGAL_CLIENT_ID` vs a DIFFERENT (informative) error.
+    ServerError { code: String, msg: String },
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Secret loading + offline ingredient assembly
 // ─────────────────────────────────────────────────────────────────────────────
@@ -942,6 +959,87 @@ fn restrict_permissions(path: &Path) {
 
 #[cfg(not(unix))]
 fn restrict_permissions(_path: &Path) {}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PROBE-ONLY path (TASK-0048 Stage B): ONE token.get to ONE host, then STOP.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Send EXACTLY ONE `token.get` to ONE host and STOP. This is the
+/// guardrail-faithful probe for the un-tried iotbing/px datacenter gateways: it
+/// NEVER proceeds to `password.login` (not even on success), NEVER retries, and
+/// makes exactly one signed account call.
+///
+/// Returns:
+/// - [`ProbeOutcome::Accepted`] if the gateway accepted our `token.get`
+///   (success=true) — the sign oracle is reachable; the caller MUST stop.
+/// - [`ProbeOutcome::ServerError`] with the server code+msg if the gateway
+///   returned success=false (e.g. still `ILLEGAL_CLIENT_ID`, or a DIFFERENT —
+///   informative — error meaning our identity was accepted and a later stage was
+///   reached).
+/// - `Err` only for transport/parse/config failures (no account semantics).
+///
+/// The raw response is captured to `secrets/tuya_live_debug.json` by
+/// [`send_atop`] (gitignored); no secret/value is ever logged.
+pub fn run_token_get_probe(
+    secrets_dir: &Path,
+    apk_path: &Path,
+    host: &str,
+) -> Result<ProbeOutcome, LiveError> {
+    let cfg = load_config(secrets_dir, apk_path)?;
+    eprintln!("probe: config loaded (all secret values withheld).");
+
+    // Same most-likely fold as the login path (re/tuya_sign_static.md §7).
+    let sign_body = SignBody::KeyAndCanonical;
+
+    // Non-account reachability check first (NOT a signed call).
+    probe_host(host)?;
+    eprintln!("probe: host {host} reachable (non-account TLS probe ok).");
+
+    let user_agent = format!(
+        "Thing-UA=APP/Android/{}/SDK/{}",
+        cfg.app_version, THING_SDK_VERSION
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(user_agent)
+        .build()
+        .map_err(|e| LiveError::Network(format!("build http client: {e}")))?;
+
+    // Build the SAME signed token.get envelope the login path uses, send it ONCE.
+    // We deliberately do NOT call do_token_get (which maps !success to a typed
+    // Err and discards code/msg) — we want the raw code/msg for classification
+    // and we must NOT treat a server error as a hard failure that hides the code.
+    let post_data = serde_json::json!({
+        "countryCode": COUNTRY_CODE_DK,
+        "username": cfg.creds.email,
+        "isUid": false,
+    })
+    .to_string();
+    let (envelope, body) = build_signed_envelope(
+        &cfg,
+        TOKEN_GET_ACTION,
+        TOKEN_GET_VERSION,
+        &post_data,
+        sign_body,
+    )?;
+
+    eprintln!("probe: sending ONE token.get to {host} (no password.login will follow)...");
+    let resp = send_atop(&client, host, &cfg, &envelope, &body)?;
+
+    if resp.success {
+        // The sign oracle is reachable. STOP — do NOT chain into password.login.
+        eprintln!("probe: token.get ACCEPTED by {host} — sign oracle reachable. STOP (no login).");
+        return Ok(ProbeOutcome::Accepted);
+    }
+
+    let code = resp.error_code.clone().unwrap_or_default();
+    let msg = resp.error_msg.clone().unwrap_or_default();
+    eprintln!(
+        "probe: {host} returned server error (success=false). code+msg captured to \
+         secrets/tuya_live_debug.json (not echoed here beyond the code)."
+    );
+    Ok(ProbeOutcome::ServerError { code, msg })
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Orchestration: the one-shot live login

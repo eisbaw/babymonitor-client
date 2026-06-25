@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@implementer'
 created_date: '2026-06-25 14:42'
-updated_date: '2026-06-25 14:55'
+updated_date: '2026-06-25 15:01'
 labels:
   - phase3
   - wave3
@@ -30,7 +30,7 @@ Review gate (TASK-0046) caught a false-exhaustion: the ILLEGAL_CLIENT_ID host hy
 <!-- AC:BEGIN -->
 - [x] #1 regions_decrypt.py emits all regionConfig host fields; the authoritative full EU host list is recorded (hosts are public, non-secret); over-claimed host docs corrected to likely/scoped
 - [x] #2 token.get envelope reconciled to the full initUrlParams shape; TASK-0047 wire-ttid resolved statically
-- [ ] #3 Each un-tried host (apigw-eu.iotbing.com, a1-us.iotbing.com, px.tuyaeu.com, a3.tuyaeu.com) probed with exactly one token.get under guardrails; outcome per host recorded in re/live_login.md (method/outcome, no values); if any clears ILLEGAL_CLIENT_ID it is reported, else host avenue declared genuinely exhausted
+- [x] #3 Each un-tried host (apigw-eu.iotbing.com, a1-us.iotbing.com, px.tuyaeu.com, a3.tuyaeu.com) probed with exactly one token.get under guardrails; outcome per host recorded in re/live_login.md (method/outcome, no values); if any clears ILLEGAL_CLIENT_ID it is reported, else host avenue declared genuinely exhausted
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -54,4 +54,14 @@ STAGE A done (static, no network). Gates green: just e2e, just secret-scan, just
 - Over-claimed verdicts downgraded confirmed->likely + scoped to mobileApiUrl-only, inside CORRECTED frames (verdict-overturn guard stays green): regions_decrypt.md "REFUTED by ground truth", live_login.md host-exhaustion note.
 - TASK-0047 RESOLVED statically (confirmed, >=2 methods): wire ttid = sdk_international@<appKey>, wire channel = oem. The sdk_<ver>@appKey rewrite hits the CHANNEL arg in AppInitializer.d:334-335, which the ThingSdk.init 6-arg->CHANNEL_OEM overload (ThingSdk.java:1152) routes into the ttid slot (mTtid). <channel>=UMENG_CHANNEL "international" (AndroidManifest:91). Recorded re/tuya_cloud_auth.md §1b; corrected identity_enumeration.md §1/§2a.
 - live.rs reconciled to initUrlParams: wire_ttid() helper sends sdk_international@<appKey> as ttid (signed); channel=oem; appRnVersion=5.92 (BuildConfig non-empty, app emits it). getCommonParams() NOT folded: addCommonParams has zero callers -> mCommonParams empty (documented, not invented).
+
+STAGE B done (live, guardrails held). Added a guardrail-faithful PROBE-ONLY path: live.rs run_token_get_probe + CLI `auth live-login --probe-only --host <h>` sends EXACTLY ONE token.get to ONE host and STOPS (never password.login, even on success; --host required). The existing run_live_login chains to password.login, so a dedicated probe path was REQUIRED to honor "token.get only".
+
+Per-host outcomes (one token.get each for reachable hosts; raw -> gitignored secrets/tuya_live_debug.json; no values):
+1. apigw-eu.iotbing.com (fusionUrl): HTTP 200, success=false, ILLEGAL_CLIENT_ID.
+2. a1-us.iotbing.com (AZ mobileApiUrl): HTTP 200, success=false, ILLEGAL_CLIENT_ID.
+3. px.tuyaeu.com (pxApiUrl): DNS NXDOMAIN (does not resolve publicly); regionConfig lists it http:80, not an HTTPS atop host -> no token.get sent.
+4. a3.tuyaeu.com (deviceHttpsPskUrl): TLS/connect fail (HTTPS-PSK device endpoint, not a cert-based atop API host) -> no token.get sent.
+
+Budget: 2 token.get spent (hosts 1+2), 0 password.login, 2FA not reached. Verdict: static host avenue GENUINELY EXHAUSTED. ILLEGAL_CLIENT_ID is an identity/provisioning gate (app-attestation / appKey<->package binding), NOT a host/sign/ttid problem. Filed follow-up TASK-0049. Gates green: e2e, secret-scan, check-evidence, live clippy/tests (20 pass).
 <!-- SECTION:NOTES:END -->

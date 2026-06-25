@@ -120,6 +120,12 @@ struct LiveLoginArgs {
     /// with ILLEGAL_CLIENT_ID. Network-level routing, not an extra login attempt.
     #[arg(long)]
     host: Option<String>,
+    /// PROBE-ONLY (TASK-0048 Stage B): send EXACTLY ONE `token.get` to `--host`
+    /// and STOP — never proceed to `password.login`, even on success. Use this to
+    /// sweep the un-tried iotbing/px datacenter gateways for ILLEGAL_CLIENT_ID
+    /// without risking the lockout-sensitive login step.
+    #[arg(long)]
+    probe_only: bool,
 }
 
 /// `devices` subcommands.
@@ -226,6 +232,9 @@ fn run_auth(action: AuthAction, json: bool) -> Result<(), Error> {
 /// outcome facts; every captured value lands in `secrets/` (see `live`).
 #[cfg(feature = "live")]
 fn auth_live_login(args: &LiveLoginArgs, json: bool) -> Result<(), Error> {
+    if args.probe_only {
+        return auth_token_get_probe(args, json);
+    }
     match live::run_live_login(&args.secrets_dir, &args.apk, args.host.as_deref()) {
         Ok(live::LiveOutcome::Needs2fa) => {
             // The orchestrator contract: surface the literal phrase.
@@ -268,6 +277,52 @@ fn auth_live_login(args: &LiveLoginArgs, json: bool) -> Result<(), Error> {
             eprintln!("auth live-login: {e}");
             Err(Error::NotImplemented(
                 "live login did not complete (see message above)",
+            ))
+        }
+    }
+}
+
+/// Drive the PROBE-ONLY token.get sweep (TASK-0048 Stage B). Sends EXACTLY ONE
+/// `token.get` to `--host` and STOPS — never `password.login`. Prints only the
+/// server error code (non-secret) or the ACCEPTED verdict; the raw response is in
+/// the gitignored `secrets/tuya_live_debug.json`. `--host` is REQUIRED (no
+/// silent default — a probe must target an explicit host).
+#[cfg(feature = "live")]
+fn auth_token_get_probe(args: &LiveLoginArgs, json: bool) -> Result<(), Error> {
+    let host = match args.host.as_deref() {
+        Some(h) => h,
+        None => {
+            eprintln!("auth live-login --probe-only: --host is REQUIRED for a probe.");
+            return Err(Error::NotImplemented("probe requires an explicit --host"));
+        }
+    };
+    match live::run_token_get_probe(&args.secrets_dir, &args.apk, host) {
+        Ok(live::ProbeOutcome::Accepted) => {
+            if json {
+                println!(
+                    "{{\"command\":\"auth live-login --probe-only\",\"host\":\"{host}\",\"accepted\":true,\"errorCode\":null}}"
+                );
+            } else {
+                println!("probe {host}: token.get ACCEPTED — sign oracle reachable. STOPPED before login.");
+            }
+            Ok(())
+        }
+        Ok(live::ProbeOutcome::ServerError { code, msg }) => {
+            // Print the server-supplied code (non-secret). The msg may echo the
+            // code's human text; print it too — it is server-side, not ours.
+            if json {
+                println!(
+                    "{{\"command\":\"auth live-login --probe-only\",\"host\":\"{host}\",\"accepted\":false,\"errorCode\":\"{code}\"}}"
+                );
+            } else {
+                println!("probe {host}: token.get server error — errorCode={code} ({msg})");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("auth live-login --probe-only ({host}): {e}");
+            Err(Error::NotImplemented(
+                "probe did not complete (see message above)",
             ))
         }
     }

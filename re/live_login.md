@@ -109,14 +109,36 @@ TASK-0048 probes the four ranked un-tried hosts with EXACTLY ONE read-only
 next stage, finally making the sign oracle reachable.
 
 Outcome per host (METHOD + OUTCOME only; no secret values; raw capture in the
-gitignored `secrets/tuya_live_debug.json`):
+gitignored `secrets/tuya_live_debug.json`). Probed via
+`auth live-login --probe-only --host <h>` (the new guardrail-faithful path:
+ONE signed `token.get` to `/api.json`, then STOP — never `password.login`):
 
 | rank | host (source field) | method | HTTP status | errorCode | classification |
 |---|---|---|---|---|---|
-| 1 | `apigw-eu.iotbing.com` (EU fusionUrl) | _pending Stage B_ | _–_ | _–_ | _–_ |
-| 2 | `a1-us.iotbing.com` (AZ mobileApiUrl) | _pending Stage B_ | _–_ | _–_ | _–_ |
-| 3 | `px.tuyaeu.com` (EU pxApiUrl) | _pending Stage B_ | _–_ | _–_ | _–_ |
-| 4 | `a3.tuyaeu.com` (EU deviceHttpsPskUrl) | _pending Stage B_ | _–_ | _–_ | _–_ |
+| 1 | `apigw-eu.iotbing.com` (EU fusionUrl) | POST `/api.json`, 1× signed `token.get` | 200 | `ILLEGAL_CLIENT_ID` | same identity rejection (NOT cleared) |
+| 2 | `a1-us.iotbing.com` (AZ mobileApiUrl) | POST `/api.json`, 1× signed `token.get` | 200 | `ILLEGAL_CLIENT_ID` | same identity rejection (NOT cleared) |
+| 3 | `px.tuyaeu.com` (EU pxApiUrl) | pre-account TLS reachability probe | — (DNS NXDOMAIN) | — (no call sent) | not a public atop host — hostname does not resolve; regionConfig lists it as `http://…:80`, not an HTTPS atop API host |
+| 4 | `a3.tuyaeu.com` (EU deviceHttpsPskUrl) | pre-account TLS reachability probe | — (TLS/connect fail) | — (no call sent) | not a public mobile-atop host — it is the device **HTTPS-PSK** endpoint (PSK ciphers), does not serve a cert-based `/api.json` GET; no token.get sent |
+
+**Probe budget:** exactly **2** signed `token.get` calls were spent (hosts 1+2,
+the two reachable atop-capable gateways). Hosts 3+4 were stopped by the
+pre-account TLS-reachability gate, so NO `token.get` was sent to them (token
+budget preserved). ZERO `password.login` calls (across all cycles). 2FA NOT
+reached.
+
+**Verdict (confidence: likely — one live capture per host):** the static host
+avenue is now GENUINELY EXHAUSTED for the recovered identity. Both reachable
+EU-family iotbing gateways (`apigw-eu.iotbing.com`, `a1-us.iotbing.com`) return
+the SAME `ILLEGAL_CLIENT_ID` as the legacy `a1.tuyaeu.com`/`a1.tuyaus.com`, with
+the corrected app-faithful envelope (wire `ttid=sdk_international@<appKey>`,
+`channel=oem`, `appRnVersion=5.92`, full `initUrlParams` shape). `px.tuyaeu.com`
+and `a3.tuyaeu.com` are not public mobile-atop API gateways (px does not resolve;
+a3 is HTTPS-PSK), so they are not valid `token.get` targets. No host in the
+decrypted EU regionConfig clears the rejection. `ILLEGAL_CLIENT_ID` is therefore
+NOT a wrong-datacenter-host problem — it is an identity/provisioning gate
+(app-attestation / app-cert-pin / a server-side appKey↔package binding) that a
+standalone client cannot reproduce from static material alone. The sign oracle
+remains unreachable; the `bmp_token` candidate + MD5 fold stay un-validated.
 
 ## Validation outcome — signer (confidence: likely)
 

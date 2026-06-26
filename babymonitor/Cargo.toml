@@ -31,6 +31,13 @@ aes-gcm = "0.10"
 # index, so pulling it would break `just assert-offline`; `aes`+`cipher` are
 # already in the local cargo cache, keeping the offline gate green.
 aes = "0.8"
+# Media-plane (PATH A) crypto (TASK-0037). All three are already in the local
+# cargo cache, so adding them keeps `just assert-offline` green:
+#   - `cbc`  (cbc-0.1.2)  → AES-128-CBC per-KCP-segment decrypt (suite 3, inline 16B IV).
+#   - `hmac` (hmac-0.12.1)→ datagram HMAC-SHA256 integrity tag (suite 3, key=16B SDP aes-key).
+# `aes-gcm` (already pinned by the cli crate) covers suite 4 (AES-128-GCM, [G]).
+cbc = "0.1"
+hmac = "0.12"
 # Inflate the (DEFLATE-compressed) APK signature block for the offline cert
 # hash. Pure-Rust miniz_oxide backend (no system zlib) keeps the e2e gate
 # self-contained and offline.

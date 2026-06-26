@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@architect'
 created_date: '2026-06-25 07:14'
-updated_date: '2026-06-25 08:08'
+updated_date: '2026-06-26 20:21'
 labels:
   - phase3
   - rust
@@ -69,4 +69,8 @@ GOTCHAS / HONEST LIMITATIONS:
 GATES (actual): just e2e GREEN (88 lib + 10 fixtures + 2 ignored live; clippy -D; fmt-check; stub-grep; assert-offline OK AFTER rumqttc cached; bmp-decode). check-evidence GREEN. secret-scan GREEN. showcase GREEN. Live tests pass honestly (--ignored). FEED-FORWARD appended to TASK-0036.
 
 Cycle-22 review: both GO. Protocol layer (302 codec, a=aes-key codec, connect_v2 byte-exact, frame model, rumqttc seam) sound + 88 lib tests; webrtc-rs honestly behind WebRtcEngine seam (offline-gate rationale verified); StreamPending discipline (no fake stream). P1 (architect read the decompile): the 'AES not statically pinnable' claim is FALSE — qpqddqd.java setALGO("AES") + AESUtil getInstance("AES") = AES-128/ECB/PKCS5Padding, key=localKey bytes, no IV (hex or base64 by pv). The deferral is legit (no offline oracle for pv-binding/framing) but named the wrong reason. Being corrected + the AES primitive implemented now via TASK-0037 AES-portion.
+
+Transport CONFIRMED live (TASK-0065): genuine SCD921 skills.p2pType=4=WebRTC, so the WebRTC-over-MQTT signaling path in this task is correct (PPCS not needed).
+
+SUPERSEDED by TASK-0069: the webrtc-rs scaffolding here was based on the inferred 302 schema and the (now-disproven) DTLS-SRTP assumption. cap3 ground truth corrected both — see TASK-0069 (real 302 codec, byte-validated) and TASK-0037 (AES/KCP transport, not webrtc-rs).
 <!-- SECTION:NOTES:END -->

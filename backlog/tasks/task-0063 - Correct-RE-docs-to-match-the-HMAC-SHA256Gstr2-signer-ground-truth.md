@@ -4,7 +4,7 @@ title: 'Correct RE docs to match the HMAC-SHA256(G,str2) signer ground truth'
 status: To Do
 assignee: []
 created_date: '2026-06-26 00:56'
-updated_date: '2026-06-26 13:53'
+updated_date: '2026-06-26 18:36'
 labels:
   - auth
   - docs
@@ -34,4 +34,6 @@ Also stale after Fix-4: re/chkey_static.md:194-195 and task-0044 still describe 
 Also: re/chkey_static.md documents chKey as hex[8..24]/16-char throughout (lines ~24,37,77-81,190) — now WRONG. Capture-verified chKey is hex[8..16]/8 chars. Mark superseded + correct to [8..16].
 
 Also reconcile PRD/CLAUDE.md: static-analysis-only is SUPERSEDED — live capture is available via ../android_emulator_re (see memory live-capture-available). Update the methodology constraint + the in-code CAPTURE-VERIFIED/LIVE-VALIDATED comments are now accurate.
+
+Also correct re/webrtc_session.md: §2a/§3c/§3d/§4/§7 describe cap3 media as DTLS-SRTP — WRONG. That is PATH B (return-audio SRTP worker FUN_0016b3f0). cap3 AES/KCP (PT 6001) is PATH A = AES-128-CBC + HMAC-SHA256 over KCP, keyed by the SDP a=aes-key (no DTLS). See re/media_decode_spec.md.
 <!-- SECTION:NOTES:END -->

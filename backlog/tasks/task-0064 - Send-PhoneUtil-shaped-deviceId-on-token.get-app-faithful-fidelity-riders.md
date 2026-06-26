@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-06-26 01:43'
-updated_date: '2026-06-26 02:04'
+updated_date: '2026-06-26 15:20'
 labels:
   - auth
   - illegal-client-id
@@ -59,10 +59,14 @@ Gate results (all green):
 Status left IN PROGRESS: the live A/B re-test (send token.get with the deviceId and observe whether the server response differs) is NOT statically performable - it needs an authorized live probe against the user's own Tuya account. Unblock path: the existing run_token_get_probe one-shot token.get.
 
 LIVE A/B FIRED (2026-06-26, authorized, codes-only): candidate-sign token.get -> ILLEGAL_CLIENT_ID; corrupt-sign (one nibble of the valid 64-hex sign flipped) -> identical ILLEGAL_CLIENT_ID. Clean differential proves ICI is sign-insensitive (server rejects on identity before sign-verify). deviceId is therefore DEFINITIVELY refuted as the ICI cause (request is now byte-faithful + valid sign, ICI persists). Recorded in re/live_login.md. deviceId/h5/appVersion fidelity fixes stand on their own merit.
+
+Signer whitelist field-name corrections (pairs with appId->clientId in TASK-0042): SIGN_WHITELIST/envelope key t -> time (KEY_TIMESTAMP). With the old t key the timestamp param was dropped from the canonical sign. Both clientId (was appId) and time (was t) must be the wire keys or the appKey/timestamp never enter the sign.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
 
 <!-- SECTION:FINAL_SUMMARY:BEGIN -->
 Restored app-faithful deviceId (PhoneUtil.getRemoteDeviceID shape: 44 lc-hex, md5 segments), always sent+signed+persisted; fixed SIGN_WHITELIST h5->isH5; guarded appVersion placeholder. Live A/B with the corrected signer confirmed ICI is a sign-insensitive server-side identity gate (deviceId not the cause). e2e + --features live + secret-scan green.
+
+SUPERSEDED (2026-06-26, TASK-0062): the closing claim that ICI is a sign-insensitive server-side identity gate is WRONG. ICI root cause was chKey length ([8..24]->[8..16]). deviceId was correctly refuted as the cause, but the gate framing is superseded — token.get succeeds after the chKey fix.
 <!-- SECTION:FINAL_SUMMARY:END -->

@@ -6,6 +6,15 @@ license.workspace = true
 rust-version.workspace = true
 description = "Core library for a Rust client to the Philips Avent Baby Monitor+ (white-labeled Tuya IPC camera). Scaffold only."
 
+[features]
+# Live-only TLS for the Tuya MQTT broker (port 8883). OFF by default so the
+# default build / `just e2e` / `just assert-offline` never pull rustls+ring and
+# the offline gate stays green. Enable on the live path: `--features live-tls`.
+# Wires rumqttc's rustls transport in stream::transport (the CONNECT creds are
+# still injected — and the broker password is native-derived, see
+# re/mqtt_signaling.md).
+live-tls = ["rumqttc/use-rustls"]
+
 [dependencies]
 thiserror.workspace = true
 md5.workspace = true
@@ -19,3 +28,10 @@ chrono.workspace = true
 flate2.workspace = true
 rumqttc.workspace = true
 aes.workspace = true
+# Media-plane (PATH A) decrypt engine (TASK-0037): AES-128-CBC per KCP segment
+# (suite 3), datagram HMAC-SHA256 integrity (suite 3), and AES-128-GCM (suite 4,
+# [G]). All resolve from the offline cargo cache so the `just assert-offline`
+# gate stays green (see workspace Cargo.toml notes).
+cbc.workspace = true
+hmac.workspace = true
+aes-gcm.workspace = true

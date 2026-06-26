@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@reverser'
 created_date: '2026-06-24 22:46'
-updated_date: '2026-06-25 01:11'
+updated_date: '2026-06-26 15:20'
 labels:
   - phase3
   - re
@@ -53,6 +53,8 @@ GOTCHAS / corrections from this triage:
 - THE ONE HYPOTHESIS THAT CAN BE WRONG: whether the real SCD921 firmware returns p2pType=4 (WebRTC) vs 2 (PPCS). Statically we only see the SDK demo bean. Needs one live obtainCameraConfig/device-list call. If it returns 2, the recommendation flips to PPCS.
 
 Cycle-4 review: both GO. Orchestrator fixed P1 (mis-attributed nin/nout topic citation -> now attributed to public ref + corrected) and 2 P2 prose overstatements (layer-independence framing, webrtc 'bitmask' softened). Gate-coverage gap (shape-not-content) -> TASK-0021.
+
+SUPERSEDE (2026-06-26, live-confirmed via TASK-0065): the one flippable hypothesis in this triage (does the real SCD921 advertise p2pType=4 WebRTC vs 2 PPCS) is RESOLVED. Live device discovery (m.life.my.group.device.list v2.2) returned skills.p2pType=4 for the genuine device (Philips Avent Baby Monitor, productId kzm54lhabeeucq5a). Transport = Tuya WebRTC-over-MQTT, CONFIRMED on real hardware. The WebRTC-over-MQTT-first recommendation stands; the needs-one-live-obtainCameraConfig gap is closed.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

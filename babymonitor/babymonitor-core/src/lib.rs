@@ -112,28 +112,20 @@ pub enum Error {
     #[error("SDP aes-key error: {0}")]
     SdpAesKey(String),
 
-    /// The 302-publish **envelope assembly** is pending — but NOT the AES
-    /// primitive itself, which is now recovered and implemented.
+    /// **RESOLVED (cap3) — retained for API stability.** Formerly returned while
+    /// the 302 `pv → output-variant` binding + outer MQTT framing were unpinned.
     ///
-    /// The cipher IS statically pinned: `AESUtil.setALGO("AES")` (a CONSTANT
-    /// string, not a runtime numeric mode) ⇒ JCE default `AES/ECB/PKCS5Padding`,
-    /// `cipher.init(mode, key)` with NO `IvParameterSpec` (no IV), key = the
-    /// device `localKey` ASCII bytes; output is hex/base64/raw by publish variant
-    /// (`decompiled/.../AESUtil.java`, `.../sdk/mqtt/qpqddqd.java`;
-    /// `re/webrtc_session.md` §2a). [`stream::mqtt_crypto`] now AES-encrypts.
-    ///
-    /// What GENUINELY remains live-gated (no offline oracle, no captured 302):
-    /// (1) the **`pv` → output-variant binding** for message code 302 — which of
-    /// `encrypt` (hex) / `encryptWithBase64` / `encryptWithBytes` (raw) the
-    /// device expects at a given protocol version `pv`; and (2) the **outer Tuya
-    /// MQTT envelope framing** around the AES payload. We surface this typed error
-    /// for the *assembly* rather than guess the variant/framing (which the device
-    /// would reject). The AES primitive itself never returns this — it succeeds.
+    /// The cap3 capture pinned both: the variant is **Base64** (the decrypt seam
+    /// `qpqddqd.bdpdqbp(ct, localKey)` is `AESUtil.decryptWithBase64`,
+    /// `emulator_captures/cap3/DECRYPT.md` §2) and the outer frame is
+    /// `{data, gwId, protocol, pv, t}` (`pbbppqb.java:399-406`). Both are now
+    /// implemented in [`stream::mqtt_crypto`] ([`stream::mqtt_crypto::build_302_frame`]),
+    /// so this variant is no longer produced by the 302 path. (Honest residual:
+    /// cap3 logged decrypted plaintext only, so the AES→base64→frame layer is
+    /// round-trip-tested, not byte-compared against captured ciphertext.)
     #[error(
-        "302-publish envelope is pending: the AES primitive is implemented \
-         (AES-128/ECB/PKCS5, key=localKey, no IV), but the pv→output-variant \
-         binding for code 302 and the outer Tuya MQTT framing need a live 302 \
-         capture to pin — blocked on TASK-0037 (live capture)"
+        "302-publish envelope pending (RESOLVED by cap3: Base64 variant + \
+         {{data,gwId,protocol,pv,t}} frame — see stream::mqtt_crypto)"
     )]
     MqttEnvelopePending,
 

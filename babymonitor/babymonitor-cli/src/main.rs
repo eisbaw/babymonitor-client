@@ -48,6 +48,11 @@ use clap::{Args, Parser, Subcommand};
 #[cfg(feature = "live")]
 mod live;
 
+// The `stream` subcommand: drives the media decode -> MPEG-TS mux/serve path. The
+// OFFLINE replay path (no network) is always compiled; the live path only reads
+// the on-disk session and honestly reports its gate (TASK-0070).
+mod stream;
+
 /// Path (relative to this crate) of the synthetic device-list fixture used as the
 /// default OFFLINE body. It is committed, obviously-synthetic test data — never a
 /// real capture.
@@ -91,6 +96,10 @@ enum Command {
         #[command(subcommand)]
         action: DevicesAction,
     },
+    /// Live A/V: decode the H.264/PCMU feed and re-mux it into MPEG-TS over HTTP
+    /// for `vlc`/`mpv`/`ffplay`. The live path is honestly gated; `--replay-annexb`
+    /// runs the depacketize -> mux/serve path OFFLINE (no camera). See its --help.
+    Stream(stream::StreamArgs),
 }
 
 /// `auth` subcommands.
@@ -196,6 +205,7 @@ fn main() -> ExitCode {
         }
         Some(Command::Auth { action }) => run_auth(action, json),
         Some(Command::Devices { action }) => run_devices(action, json),
+        Some(Command::Stream(args)) => stream::run_stream(&args, json),
     };
 
     match result {

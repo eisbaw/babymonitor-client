@@ -35,6 +35,94 @@ use crate::Error;
 /// (`a=aes-key:%s`, string at file `0x11ac06`; `re/webrtc_session.md` §3c).
 pub const AES_KEY_ATTR_PREFIX: &str = "a=aes-key:";
 
+/// The application-section media line of the Tuya `imm` offer (cap3 offer:
+/// `m=application 9 imm 6001`; the answer uses `m=application 9 tuya 6001`).
+pub const OFFER_MEDIA_LINE: &str = "m=application 9 imm 6001";
+
+/// Inputs to [`build_offer_sdp`]. These come from the session (ids/stream) and a
+/// freshly minted ICE/media-key set; `o_session` is the numeric in the `o=`/SDP
+/// origin line (cap3 uses a unix-time-shaped value).
+#[derive(Debug, Clone)]
+pub struct OfferSdpParams {
+    /// The numeric in `o=- <o_session> 1 IN IP4 127.0.0.1`.
+    pub o_session: u64,
+    /// The media stream id in `a=msid-semantic: WMS <stream_id>` (= sessionid).
+    pub stream_id: String,
+    /// Local ICE ufrag (`a=ice-ufrag:`).
+    pub ice_ufrag: String,
+    /// Local ICE pwd (`a=ice-pwd:`).
+    pub ice_pwd: String,
+    /// The raw per-session media AES key (hex-encoded into `a=aes-key:`).
+    pub media_key: Vec<u8>,
+    /// The `a=ssrc:0 cname:<cname>` value (= the app/user `from` id).
+    pub cname: String,
+    /// The `a=rtpmap:6001 AES/KCP <param>` trailing parameter (cap3 offer = 330).
+    pub rtpmap_param: u32,
+}
+
+/// Build the Tuya `imm` **offer** SDP byte-for-byte in the cap3 shape
+/// (`emulator_captures/cap3/signaling_plaintext.jsonl` message 1). This is the
+/// SDP the native `imm_p2p_rtc_sdp_encode` emits for the `imm` profile
+/// (`re/webrtc_session.md` §3); webrtc-rs does not produce this custom section,
+/// so we build it directly.
+///
+/// Every line is CRLF-terminated (RFC 4566) and the section order matches the
+/// capture exactly, so a builder run with the captured inputs reproduces the
+/// captured offer SDP.
+///
+/// # Errors
+/// [`Error::SdpAesKey`] (propagated) if the media key is too long to hex-encode
+/// into the `a=aes-key` line.
+pub fn build_offer_sdp(p: &OfferSdpParams) -> Result<String, Error> {
+    let aes_key = mqtt_crypto::encode_aes_key_hex(&p.media_key)?;
+    Ok(format!(
+        "v=0\r\n\
+         o=- {o} 1 IN IP4 127.0.0.1\r\n\
+         s=-\r\n\
+         t=0 0\r\n\
+         a=group:BUNDLE imm0\r\n\
+         a=msid-semantic: WMS {stream}\r\n\
+         {media}\r\n\
+         c=IN IP4 0.0.0.0\r\n\
+         a=rtcp:9 IN IP4 0.0.0.0\r\n\
+         a=ice-ufrag:{ufrag}\r\n\
+         a=ice-pwd:{pwd}\r\n\
+         a=ice-options:trickle\r\n\
+         a=aes-key:{aes_key}\r\n\
+         a=mid:imm0\r\n\
+         a=rtpmap:6001 AES/KCP {param}\r\n\
+         a=ssrc:0 cname:{cname}\r\n",
+        o = p.o_session,
+        stream = p.stream_id,
+        media = OFFER_MEDIA_LINE,
+        ufrag = p.ice_ufrag,
+        pwd = p.ice_pwd,
+        param = p.rtpmap_param,
+        cname = p.cname,
+    ))
+}
+
+/// Extract `(ice-ufrag, ice-pwd)` from an SDP's application section (the READ
+/// side, used on the device ANSWER to recover the remote ICE creds).
+///
+/// # Errors
+/// [`Error::SdpAesKey`] if either `a=ice-ufrag:` or `a=ice-pwd:` is missing — a
+/// valid answer must carry both for ICE to proceed; their absence is a hard
+/// failure, not a silent empty cred.
+pub fn extract_ice_creds(sdp: &str) -> Result<(String, String), Error> {
+    let ufrag = sdp_lines(sdp)
+        .find_map(|l| l.strip_prefix("a=ice-ufrag:"))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| Error::SdpAesKey("answer SDP has no a=ice-ufrag line".into()))?;
+    let pwd = sdp_lines(sdp)
+        .find_map(|l| l.strip_prefix("a=ice-pwd:"))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| Error::SdpAesKey("answer SDP has no a=ice-pwd line".into()))?;
+    Ok((ufrag.to_string(), pwd.to_string()))
+}
+
 /// SDP lines are CRLF-terminated per RFC 4566; we split tolerantly on `\n` and
 /// trim a trailing `\r` so a `\n`-only test SDP still parses.
 fn sdp_lines(sdp: &str) -> impl Iterator<Item = &str> {
@@ -237,6 +325,74 @@ mod tests {
         let offer = "m=application 9 x 98\r\na=mid:2\r\n";
         assert!(matches!(
             inject_aes_key(offer, &[0x01, 0x02]),
+            Err(Error::SdpAesKey(_))
+        ));
+    }
+
+    // BYTE-EXACT against the cap3 offer SDP STRUCTURE (synthetic ids substituted
+    // for the real session's): the builder must reproduce the captured offer SDP
+    // line-for-line (m=application imm 6001, ufrag/pwd, aes-key, AES/KCP 330,
+    // ssrc cname). The media key 0x55..6a is the cap3 a=aes-key value; the
+    // ids/ufrag/pwd are synthetic (no real session id committed).
+    #[test]
+    fn build_offer_sdp_reproduces_cap3_structure() {
+        let params = OfferSdpParams {
+            o_session: 1782489574,
+            stream_id: "SYNTHSESSID1782489574vhBJTOjV".into(),
+            ice_ufrag: "SYN1".into(),
+            ice_pwd: "SYNTHICEPWD1111111111111".into(),
+            // cap3 a=aes-key:***REMOVED-MEDIAKEY***
+            media_key: hex::decode("***REMOVED-MEDIAKEY***").unwrap(),
+            cname: "SYNTH_USER_ID".into(),
+            rtpmap_param: 330,
+        };
+        let sdp = build_offer_sdp(&params).unwrap();
+        let expected = "v=0\r\n\
+             o=- 1782489574 1 IN IP4 127.0.0.1\r\n\
+             s=-\r\n\
+             t=0 0\r\n\
+             a=group:BUNDLE imm0\r\n\
+             a=msid-semantic: WMS SYNTHSESSID1782489574vhBJTOjV\r\n\
+             m=application 9 imm 6001\r\n\
+             c=IN IP4 0.0.0.0\r\n\
+             a=rtcp:9 IN IP4 0.0.0.0\r\n\
+             a=ice-ufrag:SYN1\r\n\
+             a=ice-pwd:SYNTHICEPWD1111111111111\r\n\
+             a=ice-options:trickle\r\n\
+             a=aes-key:***REMOVED-MEDIAKEY***\r\n\
+             a=mid:imm0\r\n\
+             a=rtpmap:6001 AES/KCP 330\r\n\
+             a=ssrc:0 cname:SYNTH_USER_ID\r\n";
+        assert_eq!(sdp, expected, "offer SDP must match the cap3 structure");
+        // And it round-trips through our own extractors.
+        assert_eq!(extract_aes_key(&sdp).unwrap(), params.media_key);
+        let (u, p) = extract_ice_creds(&sdp).unwrap();
+        assert_eq!(u, "SYN1");
+        assert_eq!(p, "SYNTHICEPWD1111111111111");
+    }
+
+    // The answer SDP (m=application tuya 6001) ICE creds extract correctly.
+    #[test]
+    fn extract_ice_creds_from_answer() {
+        let answer = "v=0\r\nm=application 9 tuya 6001\r\n\
+             a=ice-ufrag:SYN0\r\na=ice-pwd:SYNTHICEPWD0000000000000\r\n\
+             a=aes-key:00112233445566778899aabbccddeeff\r\n";
+        let (u, p) = extract_ice_creds(answer).unwrap();
+        assert_eq!(u, "SYN0");
+        assert_eq!(p, "SYNTHICEPWD0000000000000");
+    }
+
+    // NEGATIVE: an SDP missing ice-ufrag/pwd is a hard error (no silent empty).
+    #[test]
+    fn extract_ice_creds_rejects_missing() {
+        let no_ufrag = "m=application 9 tuya 6001\r\na=ice-pwd:abc\r\n";
+        assert!(matches!(
+            extract_ice_creds(no_ufrag),
+            Err(Error::SdpAesKey(_))
+        ));
+        let no_pwd = "m=application 9 tuya 6001\r\na=ice-ufrag:abc\r\n";
+        assert!(matches!(
+            extract_ice_creds(no_pwd),
             Err(Error::SdpAesKey(_))
         ));
     }

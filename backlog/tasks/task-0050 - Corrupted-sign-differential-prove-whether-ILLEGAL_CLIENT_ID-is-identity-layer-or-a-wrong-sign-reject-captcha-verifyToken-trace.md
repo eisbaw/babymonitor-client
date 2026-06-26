@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-06-25 15:10'
-updated_date: '2026-06-26 10:31'
+updated_date: '2026-06-26 15:20'
 labels:
   - phase3
   - wave3
@@ -87,4 +87,6 @@ Stage B (captcha/verifyToken static trace, NO network) — re/tuya_cloud_auth.md
 Gates: just e2e, just secret-scan, just check-evidence all green; cargo clippy --features live -D warnings clean; cargo test --features live compiles and new tests pass.
 
 No follow-up tasks filed (the sign-insensitive outcome does not call for the bmp_token re-attack; TASK-0049 decision is now unblocked, noted on that task).
+
+SUPERSEDED (2026-06-26, TASK-0062): the sign-INSENSITIVE identity-gate verdict above is WRONG. Root cause of ILLEGAL_CLIENT_ID was a CLIENT bug — chKey computed at [8..24] (16 chars) instead of [8..16] (8). The gateway rejected the malformed chKey BEFORE sign-verification, which is exactly why this corrupt-sign A/B looked sign-insensitive (both arms carried the same wrong 16-char chKey). After the chKey-length fix, token.get succeeds. There is no server-side provisioning/attestation gate.
 <!-- SECTION:FINAL_SUMMARY:END -->

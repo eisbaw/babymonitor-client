@@ -40,12 +40,16 @@
 //!    recovered primitive, with a known-answer test (KAT) checked against an
 //!    independent oracle (`openssl enc -aes-128-ecb`), NOT self-derived.
 //!
-//!    What GENUINELY remains live-gated — and ONLY this — is surfaced as
-//!    [`crate::Error::MqttEnvelopePending`] by [`encrypt_302_payload`]: the
-//!    **`pv` → output-variant binding** for message code 302 (which of
-//!    hex/base64/raw the device expects at a given `pv`) and the **outer Tuya
-//!    MQTT envelope framing**. There is no offline oracle / captured live 302 to
-//!    pin those, so we do not guess them. The AES bytes themselves are produced.
+//!    The `pv → output-variant` binding for code 302 — previously gated as
+//!    [`crate::Error::MqttEnvelopePending`] — is now **resolved to Base64** by
+//!    the cap3 capture: its decrypt seam `qpqddqd.bdpdqbp(ct, localKey)` is
+//!    `AESUtil.decryptWithBase64` (`emulator_captures/cap3/DECRYPT.md` §2). The
+//!    outer Tuya frame `{data, gwId, protocol, pv, t}` is recovered from the
+//!    publish-map builder `pbbppqb.java:399-406`. Both are implemented here
+//!    ([`encrypt_302_payload`] / [`build_302_frame`]). Honest residual: cap3
+//!    logged only the *decrypted* plaintext, not raw ciphertext, so the
+//!    AES→base64→frame layer is round-trip-tested but not byte-compared against
+//!    captured ciphertext; the *inner* plaintext IS byte-validated.
 
 use crate::Error;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
@@ -111,8 +115,8 @@ pub fn decode_aes_key_hex(hex_str: &str) -> Result<Vec<u8>, Error> {
 /// - [`Base64`](Aes302Output::Base64) — `encryptWithBase64()` ⇒ standard base64.
 /// - [`Raw`](Aes302Output::Raw) — `encryptWithBytes()` ⇒ the raw ciphertext bytes.
 ///
-/// Which variant a given `pv` / message-code-302 publish uses is the part that is
-/// NOT yet pinned (no live capture); see [`encrypt_302_payload`].
+/// For message code 302 the variant is [`Base64`](Aes302Output::Base64), pinned
+/// by the cap3 decrypt seam (`decryptWithBase64`); see [`encrypt_302_payload`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Aes302Output {
     /// `encrypt()` → uppercase hex (Tuya `byte2hex`, `AESUtil.java:64` `.toUpperCase()`).
@@ -264,47 +268,145 @@ pub fn aes302_decrypt(encoded: &[u8], key: &[u8], variant: Aes302Output) -> Resu
     aes128_ecb_decrypt(&ct, key)
 }
 
-/// Encrypt a 302 signaling JSON payload with the device `localKey`
-/// (`homeCamera.publish(devId, pv, localKey, jsonMsg, 302)`).
+/// The 302 message code (Tuya WebRTC signaling over the device MQTT channel).
+pub const PROTOCOL_302: i64 = 302;
+
+/// Encrypt a 302 signaling JSON payload with the device `localKey` and return the
+/// **base64** `data` value that goes into the outer MQTT frame (see
+/// [`build_302_frame`]).
 ///
-/// The AES primitive itself is recovered and applied here (AES-128/ECB/PKCS5,
-/// key = `localKey` bytes, NO IV — see the module docs and [`aes128_ecb_encrypt`]).
+/// # Variant — now pinned to Base64 (cap3)
+/// `AESUtil` exposes three outputs (`encrypt` ⇒ hex, `encryptWithBase64`,
+/// `encryptWithBytes` ⇒ raw). The cap3 capture's decrypt seam is
+/// `com.thingclips.sdk.mqtt.qpqddqd.bdpdqbp(ciphertext, localKey)` =
+/// `AESUtil.decryptWithBase64` (`emulator_captures/cap3/DECRYPT.md` §2), i.e. the
+/// 302 `data` field for this device's `pv` is **base64(AES-128/ECB/PKCS5)**. So
+/// the previously-gated `pv → variant` binding is resolved to
+/// [`Aes302Output::Base64`] for code 302; this no longer returns
+/// [`Error::MqttEnvelopePending`].
 ///
-/// # Honesty — what is still gated (and ONLY this)
-/// This returns [`Error::MqttEnvelopePending`] because the **`pv` → output-variant
-/// binding** for message code 302 is NOT yet pinned: `AESUtil` exposes three
-/// outputs (`encrypt` ⇒ hex, `encryptWithBase64`, `encryptWithBytes` ⇒ raw) and
-/// `qpqddqd.java` selects between them by the publish-bean type, but which one a
-/// 302 publish at a given `pv` uses — and the outer Tuya MQTT framing around it —
-/// needs a live 302 capture to confirm. We refuse to guess the variant (it would
-/// produce a payload the device rejects). To get the actual AES bytes for a known
-/// variant, call [`aes302_encrypt`] directly with an explicit [`Aes302Output`].
+/// > Honest caveat: cap3 captured only the *decrypted* 302 plaintext (the Frida
+/// > hook logged post-decrypt), NOT the raw ciphertext/outer frame bytes. So the
+/// > AES→base64→frame layer is implemented + round-trip-tested, but it is **not**
+/// > byte-validated against captured ciphertext (none exists in cap3). The
+/// > *inner* plaintext IS byte-validated against the capture.
 ///
 /// # Errors
-/// - [`Error::SdpAesKey`] if `key` is not a 16-byte `localKey` (fails fast).
-/// - [`Error::MqttEnvelopePending`] otherwise — the variant/framing is unpinned.
+/// [`Error::SdpAesKey`] if `key` is not a 16-byte `localKey`.
 pub fn encrypt_302_payload(plaintext: &[u8], key: &[u8], _pv: &str) -> Result<Vec<u8>, Error> {
-    // Validate the key shape we DO know (a 16-byte localKey) so a clearly wrong
-    // key fails before the pending gate — fail fast, fail loud. We compute the
-    // AES bytes to prove the primitive runs, but withhold the (unpinned) framing.
-    let _ = aes128_ecb_encrypt(plaintext, key)?;
-    Err(Error::MqttEnvelopePending)
+    aes302_encrypt(plaintext, key, Aes302Output::Base64)
 }
 
-/// Decrypt a 302 signaling payload with the device `localKey`.
-///
-/// See [`encrypt_302_payload`]: the AES primitive is recovered (use
-/// [`aes302_decrypt`] for a known [`Aes302Output`]), but the full-envelope
-/// variant/framing binding for code 302 is unpinned, so this returns
-/// [`Error::MqttEnvelopePending`].
+/// Decrypt a base64 302 `data` value with the device `localKey` — inverse of
+/// [`encrypt_302_payload`] (variant [`Aes302Output::Base64`], cap3 §2).
 ///
 /// # Errors
 /// - [`Error::SdpAesKey`] if `key` is not a 16-byte `localKey`.
-/// - [`Error::MqttEnvelopePending`] otherwise — the variant/framing is unpinned.
-pub fn decrypt_302_payload(_ciphertext: &[u8], key: &[u8], _pv: &str) -> Result<Vec<u8>, Error> {
-    // Validate the key shape; the inbound variant/framing is the unpinned part.
-    aes128(key)?;
-    Err(Error::MqttEnvelopePending)
+/// - [`Error::StreamConfig`] if the base64/ciphertext is malformed or the
+///   padding is invalid (wrong key / corrupt frame).
+pub fn decrypt_302_payload(data_b64: &[u8], key: &[u8], _pv: &str) -> Result<Vec<u8>, Error> {
+    aes302_decrypt(data_b64, key, Aes302Output::Base64)
+}
+
+/// The outer Tuya MQTT message frame that wraps the (encrypted) 302 payload.
+///
+/// Recovered from the publish-map builder
+/// `decompiled/.../com/thingclips/sdk/mqtt/pbbppqb.java:399-406`, which puts
+/// `{data, gwId, protocol, pv, t}` into a `ConcurrentHashMap<String,String>` —
+/// i.e. all values are JSON **strings** (`protocol`/`t` via `String.valueOf`).
+/// `data` is the base64 AES-ECB(localKey) ciphertext of the inner signaling JSON.
+///
+/// On parse we are tolerant: unknown fields (e.g. the `dataId` seen on the
+/// inbound shape in `cap3/DECRYPT.md`) are ignored, and `protocol`/`t` accept
+/// either a JSON string or number.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Frame302 {
+    /// The base64 AES-ECB(localKey) ciphertext of the inner signaling JSON.
+    pub data: String,
+    /// The target device id (`gwId`).
+    #[serde(rename = "gwId")]
+    pub gw_id: String,
+    /// The message code — `"302"` for WebRTC signaling. String per the publish
+    /// map; tolerant to a number on parse.
+    #[serde(with = "stringy_i64")]
+    pub protocol: i64,
+    /// The device protocol version (`pv`).
+    pub pv: String,
+    /// The publish timestamp. String per the publish map; tolerant to a number.
+    #[serde(with = "stringy_i64")]
+    pub t: i64,
+}
+
+/// (De)serialize an `i64` that Tuya emits as a JSON **string** (`String.valueOf`)
+/// but that an inbound shape may carry as a number — accept both, emit a string.
+mod stringy_i64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &i64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&v.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StrOrNum {
+            S(String),
+            N(i64),
+        }
+        match StrOrNum::deserialize(d)? {
+            StrOrNum::N(n) => Ok(n),
+            StrOrNum::S(s) => s.parse::<i64>().map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+/// Build the outer 302 MQTT frame JSON: AES-ECB(localKey)-encrypt the inner
+/// signaling `plaintext`, base64 it into `data`, and wrap it in the Tuya publish
+/// map `{data, gwId, protocol:"302", pv, t}` (`pbbppqb.java:399-406`).
+///
+/// This is what `rumqttc` publishes on the device's signaling topic.
+///
+/// # Errors
+/// [`Error::SdpAesKey`] if `key` is not a 16-byte `localKey`;
+/// [`Error::SignalingParse`] if the frame fails to serialize.
+pub fn build_302_frame(
+    plaintext: &[u8],
+    key: &[u8],
+    gw_id: &str,
+    pv: &str,
+    t: i64,
+) -> Result<Vec<u8>, Error> {
+    let data = encrypt_302_payload(plaintext, key, pv)?;
+    let data = String::from_utf8(data)
+        .map_err(|e| Error::StreamConfig(format!("302 base64 data not UTF-8: {e}")))?;
+    let frame = Frame302 {
+        data,
+        gw_id: gw_id.to_string(),
+        protocol: PROTOCOL_302,
+        pv: pv.to_string(),
+        t,
+    };
+    serde_json::to_vec(&frame).map_err(|e| Error::SignalingParse(e.to_string()))
+}
+
+/// Parse the outer 302 MQTT frame JSON and AES-ECB(localKey)-decrypt its `data`
+/// back to the inner signaling plaintext. Inverse of [`build_302_frame`].
+///
+/// # Errors
+/// - [`Error::SignalingParse`] if the frame JSON is malformed.
+/// - [`Error::StreamConfig`] if `protocol` is not 302, or the payload is
+///   malformed / wrong-key.
+/// - [`Error::SdpAesKey`] if `key` is not a 16-byte `localKey`.
+pub fn parse_302_frame(frame_json: &[u8], key: &[u8]) -> Result<Vec<u8>, Error> {
+    let frame: Frame302 =
+        serde_json::from_slice(frame_json).map_err(|e| Error::SignalingParse(e.to_string()))?;
+    if frame.protocol != PROTOCOL_302 {
+        return Err(Error::StreamConfig(format!(
+            "outer MQTT frame protocol is {}, expected {PROTOCOL_302}",
+            frame.protocol
+        )));
+    }
+    decrypt_302_payload(frame.data.as_bytes(), key, &frame.pv)
 }
 
 #[cfg(test)]
@@ -486,33 +588,84 @@ mod tests {
         ));
     }
 
-    // ── 302 ENVELOPE assembly (honestly gated — pv→variant + framing) ──────
+    // ── 302 payload + outer frame (variant pinned Base64 by cap3) ──────────
 
-    // The AES PRIMITIVE is implemented, but the pv→output-variant binding for
-    // code 302 + the outer Tuya MQTT framing need a live capture. The full
-    // envelope helpers MUST surface MqttEnvelopePending — never fabricate a
-    // publishable payload by guessing the variant/framing.
+    // The 302 `data` value is base64(AES-ECB(localKey)) — pinned to Base64 by
+    // cap3 DECRYPT.md §2 (the decrypt seam is decryptWithBase64). Round-trip an
+    // inner signaling JSON through encrypt_302_payload/decrypt_302_payload.
     #[test]
-    fn envelope_assembly_is_pending_not_the_primitive() {
-        let r = encrypt_302_payload(b"{\"header\":{}}", SYNTH_KEY, "2.2");
-        assert!(
-            matches!(r, Err(Error::MqttEnvelopePending)),
-            "the pv→variant binding + framing are unpinned; must report pending"
+    fn payload_302_base64_round_trips() {
+        let inner = br#"{"header":{"type":"offer"},"msg":{"sdp":"v=0\r\n"}}"#;
+        let data = encrypt_302_payload(inner, SYNTH_KEY, "2.2").unwrap();
+        // base64 alphabet only (the data field value).
+        let s = std::str::from_utf8(&data).unwrap();
+        assert!(s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
+        // And it is exactly the Base64 aes302 variant.
+        assert_eq!(
+            data,
+            aes302_encrypt(inner, SYNTH_KEY, Aes302Output::Base64).unwrap()
         );
-        let r = decrypt_302_payload(b"\x00\x01\x02", SYNTH_KEY, "2.2");
-        assert!(matches!(r, Err(Error::MqttEnvelopePending)));
+        assert_eq!(decrypt_302_payload(&data, SYNTH_KEY, "2.2").unwrap(), inner);
     }
 
-    // NEGATIVE: the envelope helpers still fail fast on a clearly-wrong key length
-    // BEFORE the pending gate — proving input validation, not blanket pending.
+    // The outer frame {data, gwId, protocol:"302", pv, t} builds + parses back to
+    // the inner plaintext, and protocol/t are emitted as JSON strings (Tuya
+    // publish-map shape, pbbppqb.java:399-406).
     #[test]
-    fn envelope_assembly_rejects_bad_key_length() {
+    fn outer_302_frame_round_trips_and_is_stringy() {
+        let inner = br#"{"header":{"type":"offer"},"msg":{"candidate":""}}"#;
+        let frame = build_302_frame(inner, SYNTH_KEY, "SYNTH_DEV", "2.2", 1782489574).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        // protocol + t are JSON strings.
+        assert_eq!(v["protocol"], "302");
+        assert_eq!(v["t"], "1782489574");
+        assert_eq!(v["gwId"], "SYNTH_DEV");
+        assert!(v["data"].is_string());
+        // round-trip back to the inner plaintext.
+        assert_eq!(parse_302_frame(&frame, SYNTH_KEY).unwrap(), inner);
+    }
+
+    // Parse tolerates a numeric `protocol`/`t` (inbound shape) too.
+    #[test]
+    fn outer_302_frame_parse_tolerates_numeric_protocol() {
+        let inner = br#"{"header":{"type":"answer"},"msg":{}}"#;
+        let data = encrypt_302_payload(inner, SYNTH_KEY, "2.2").unwrap();
+        let data = String::from_utf8(data).unwrap();
+        let numeric = format!(
+            "{{\"data\":\"{data}\",\"gwId\":\"D\",\"protocol\":302,\"pv\":\"2.2\",\"t\":1}}"
+        );
+        assert_eq!(
+            parse_302_frame(numeric.as_bytes(), SYNTH_KEY).unwrap(),
+            inner
+        );
+    }
+
+    // NEGATIVE: a frame whose protocol is not 302 is rejected (not silently run).
+    #[test]
+    fn outer_302_frame_rejects_wrong_protocol() {
+        let inner = br#"{"header":{"type":"offer"},"msg":{}}"#;
+        let data = encrypt_302_payload(inner, SYNTH_KEY, "2.2").unwrap();
+        let data = String::from_utf8(data).unwrap();
+        let bad = format!(
+            "{{\"data\":\"{data}\",\"gwId\":\"D\",\"protocol\":\"301\",\"pv\":\"2.2\",\"t\":\"1\"}}"
+        );
+        assert!(matches!(
+            parse_302_frame(bad.as_bytes(), SYNTH_KEY),
+            Err(Error::StreamConfig(_))
+        ));
+    }
+
+    // NEGATIVE: the payload helpers still fail fast on a wrong key length.
+    #[test]
+    fn payload_302_rejects_bad_key_length() {
         assert!(matches!(
             encrypt_302_payload(b"x", b"short", "2.2"),
             Err(Error::SdpAesKey(_))
         ));
         assert!(matches!(
-            decrypt_302_payload(b"x", b"short", "2.2"),
+            build_302_frame(b"x", b"short", "D", "2.2", 0),
             Err(Error::SdpAesKey(_))
         ));
     }

@@ -6,18 +6,28 @@
 //! engineering of `libThingP2PSDK.so` + the Java `P2PMQTTServiceManager` actually
 //! recovered (`re/webrtc_session.md`, the implementable spec). Concretely:
 //!
-//! - [`signaling`] — the MQTT **302** signaling envelope `{header,msg,token}`
-//!   (offer/answer/candidate/disconnect) serde codec (`re/webrtc_session.md` §2).
+//! - [`signaling`] — the MQTT **302** inner-envelope `{header, msg}` serde codec
+//!   (offer/answer/candidate), matching the cap3 capture: `msg` is an OBJECT
+//!   (`{sdp|candidate, token:[ices], tcp_token, log}`), not a string
+//!   (`re/webrtc_session.md` §2 + `emulator_captures/cap3/signaling_plaintext.jsonl`).
 //! - [`mqtt_crypto`] — the SDP `a=aes-key:<hex>` media-key hex codec (byte-exact,
-//!   `re/webrtc_session.md` §3c) + the 302-payload localKey-AES primitive
-//!   (recovered + KAT-pinned: AES-128/ECB/PKCS5, key=localKey, no IV; only the
-//!   pv→output-variant binding + outer framing stay live-gated — see the module).
+//!   `re/webrtc_session.md` §3c) + the 302-payload localKey-AES (AES-128/ECB/PKCS5,
+//!   key=localKey, no IV, **Base64** variant — pinned by cap3) + the outer
+//!   `{data,gwId,protocol,pv,t}` MQTT frame codec.
 //! - [`connect`] — the `connect_v2` control-JSON builder (byte-exact template,
 //!   `re/webrtc_session.md` §1).
 //! - [`sdp`] — parse/emit the Tuya-custom `m=application` + `a=aes-key` section
 //!   (`re/webrtc_session.md` §3c).
 //! - [`frame`] — the `imm_p2p_rtc_frame_t` → typed [`frame::Frame`] model + codec
 //!   ids (`re/webrtc_session.md` §4).
+//! - [`media`] — the cap3 **PATH A** media receive→decode engine
+//!   ([`media::MediaEngine`]): UDP → (suite-3) HMAC verify+strip → hand-rolled
+//!   ikcp RX with a per-segment AES-128-CBC/GCM decrypt hook → `frg` reassembly →
+//!   12-byte RTP parse → [`media::MediaUnit`], plus H.264 STAP-A/FU-A depacketize
+//!   and ICE candidate parse/select (`re/media_decode_spec.md`). This is the
+//!   AES/KCP transport the cap3 `a=rtpmap:6001 AES/KCP` codec negotiates — fully
+//!   offline-unit-tested against synthetic vectors; live UDP/ICE connectivity is
+//!   gated (no camera in-sandbox).
 //! - [`session`] — the session **state machine** + a [`session::WebRtcEngine`]
 //!   trait seam + an [`session::MqttTransport`] seam + the **#[ignore]d live
 //!   driver** that is honestly gated on auth + a live device.
@@ -48,17 +58,24 @@
 //! [`session::MqttTransport`] seam so the offline tests feed 302 messages through
 //! a fake transport with no live broker.
 //!
-//! # Honest status (TASK-0034 AC#2)
+//! # Honest status
 //!
-//! This layer **builds + unit-tests pass static-only**. It **cannot stream**: the
-//! live driver returns [`crate::Error::StreamPending`] because every runtime input
-//! (token, p2pId, p2pKey, ices, session, localKey, pv) rides an authenticated
-//! device session that this core module does not establish, the 302 envelope
-//! framing is still pending, and the WebRTC media engine is a follow-up. Exactly
-//! the signer's TOKEN-PENDING discipline: never a fake stream, never `todo!()`.
+//! This layer **builds + unit-tests pass static-only**, and the signaling is now
+//! byte-validated against the cap3 capture (offer SDP structure + inner 302
+//! plaintext). It still **cannot stream**: the live driver returns
+//! [`crate::Error::StreamPending`] because (1) the live MQTT broker needs CONNECT
+//! creds whose password is **native-derived** (`doCommandNative(2, ecode)`) and
+//! not statically recoverable (`re/mqtt_signaling.md`), (2) the WebRTC media
+//! engine (webrtc-rs) is a follow-up, and (3) every runtime input (token, p2pId,
+//! p2pKey, ices, session, localKey, pv) rides an authenticated device session this
+//! core module does not establish. The 302 envelope framing is **no longer**
+//! pending — it is implemented + round-trip-tested. Exactly the signer's
+//! TOKEN-PENDING discipline: never a fake stream, never `todo!()`.
 
 pub mod connect;
 pub mod frame;
+pub mod media;
+pub mod mqtt_auth;
 pub mod mqtt_crypto;
 pub mod sdp;
 pub mod session;

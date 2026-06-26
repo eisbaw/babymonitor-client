@@ -4,6 +4,7 @@ title: 'secret-scan RED: tracked emulator_captures dumps leak real tokens/emails
 status: To Do
 assignee: []
 created_date: '2026-06-26 11:28'
+updated_date: '2026-06-26 15:20'
 labels:
   - auth
   - secrets
@@ -24,3 +25,9 @@ just secret-scan fails with ~215 findings, ALL from the TRACKED emulator_capture
 - [ ] #2 cap1 flows.json still available (gitignored/secrets) for re/scripts/decrypt_capture_login.py offline validation
 - [ ] #3 No real token/email/JWT remains in any git-tracked file
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+cap0 = clean pre-login capture (hits US node a1-us.iotbing.com); cap1 = full login+sync (token.get on a1.tuyaeu.com, DC switches to EU after password.login), 76 flows. Both carry real PII (authToken JWTs, email-shaped sequences) and must be gitignored/quarantined before any push.
+<!-- SECTION:NOTES:END -->

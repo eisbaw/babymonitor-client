@@ -61,5 +61,5 @@ result-*
 # Backlog tool runtime artifact
 backlog/email-preferences.json
 
-# Live emulator network captures (contain real deviceId/appKey/signatures)
-emulator_captures/
+# Live emulator network captures (contain real deviceId/appKey/signatures).
+# Tracked intentionally for RE; LOCAL ONLY — do NOT push without redacting.

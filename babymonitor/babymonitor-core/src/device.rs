@@ -244,17 +244,45 @@ impl DeviceBean {
     /// (`re/tuya_cloud_auth.md` §5b: "camera = `sp`/ipc family".)
     pub const CATEGORY_CAMERA: &'static str = "sp";
 
-    /// Whether this device is a camera. A device with no category is
-    /// conservatively NOT treated as a camera.
+    /// Whether this device is a camera, by either grounded signal:
     ///
-    /// `sp` is the grounded camera category (`re/tuya_cloud_auth.md` §5b). The
-    /// `"ipc"` arm is **(inferred)** — it is the common Tuya IPC-family shorthand
-    /// but is NOT grounded by a citation here; it is kept as a lenient extra match
-    /// so a future capture using it still resolves, and should be confirmed (or
-    /// dropped) against a real device-list capture (needs-live).
+    /// 1. a camera `category` — `sp` (the grounded camera category,
+    ///    `re/tuya_cloud_auth.md` §5b) or `ipc` (the common Tuya IPC-family
+    ///    shorthand, kept as a lenient extra match); OR
+    /// 2. a present `skills.p2pType` ([`skills_p2p_type`](DeviceBean::skills_p2p_type)).
+    ///
+    /// The second signal is CAPTURE-VERIFIED (TASK-0065, emulator_captures/cap1):
+    /// the `m.life.my.group.device.list` v2.2 record carries **NO top-level
+    /// `category`** — the category lives in the SEPARATE `device.ref.info.list`
+    /// keyed by `productId`. The only camera-specific field ON the device record
+    /// itself is `skills.p2pType` (=4 for the SCD921), so its presence identifies
+    /// the camera on the real wire. A device with neither signal is NOT a camera.
     #[must_use]
     pub fn is_camera(&self) -> bool {
-        matches!(self.category.as_deref(), Some(c) if c == Self::CATEGORY_CAMERA || c == "ipc")
+        if matches!(self.category.as_deref(), Some(c) if c == Self::CATEGORY_CAMERA || c == "ipc") {
+            return true;
+        }
+        self.skills_p2p_type().is_some()
+    }
+
+    /// The camera transport selector read from `skills.p2pType` — the wire location
+    /// of `p2pType` on the `m.life.my.group.device.list` v2.2 record
+    /// (CAPTURE-VERIFIED, cap1; 4=THING/WebRTC, 2=PPCS). `None` for a non-camera
+    /// device (no such skill). Decode with [`P2pTransport::from_p2p_type`].
+    #[must_use]
+    pub fn skills_p2p_type(&self) -> Option<i32> {
+        self.skills
+            .get("p2pType")
+            .and_then(Value::as_i64)
+            .map(|t| t as i32)
+    }
+
+    /// The [`P2pTransport`] decoded from `skills.p2pType`, if present (the v2.2
+    /// device-record transport selector). `None` when the record carries no
+    /// `skills.p2pType` (e.g. a non-camera device).
+    #[must_use]
+    pub fn transport_from_skills(&self) -> Option<P2pTransport> {
+        self.skills_p2p_type().map(P2pTransport::from_p2p_type)
     }
 
     /// Online if either the cloud or LAN online flag is set true.
@@ -604,12 +632,50 @@ mod tests {
     }
 
     // NEGATIVE: a non-camera categoryCode is not mistaken for a camera (prove the
-    // alias does not over-match).
+    // alias does not over-match) — and, with no skills.p2pType, the second camera
+    // signal does not fire either.
     #[test]
     fn category_code_alias_non_camera_is_not_camera() {
         let body = br#"{"deviceList":[{"devId":"d1","categoryCode":"cz"}]}"#;
         let list = parse_device_list(body).unwrap();
         assert!(list.find_camera_device().is_none());
+    }
+
+    // ── cap1 ground truth: the m.life.my.group.device.list v2.2 record carries NO
+    // top-level `category` — the only camera-specific field ON the record is
+    // `skills.p2pType`. is_camera() must fire on that signal, and skills_p2p_type()
+    // must surface the transport selector. SYNTHETIC devId/localKey (no real secret).
+    #[test]
+    fn skills_p2p_type_marks_camera_without_category() {
+        let body = br#"{"deviceList":[{
+            "devId":"SYNTH_DEVID_0001",
+            "name":"Philips Avent Baby Monitor",
+            "productId":"SYNTH_PRODUCT_0001",
+            "uuid":"SYNTH_UUID_0001",
+            "localKey":"SYNTH_LOCALKEY16",
+            "skills":{"p2pType":4}
+        }]}"#;
+        let list = parse_device_list(body).unwrap();
+        let cam = list
+            .find_camera_device()
+            .expect("a record with skills.p2pType must be found as a camera (no category)");
+        assert!(
+            cam.category.is_none(),
+            "the cap1 v2.2 record has no category"
+        );
+        assert!(cam.is_camera());
+        assert_eq!(cam.skills_p2p_type(), Some(4));
+        assert_eq!(cam.transport_from_skills(), Some(P2pTransport::ThingWebRtc));
+    }
+
+    // NEGATIVE: skills WITHOUT a p2pType does not mark a camera (the signal is
+    // p2pType-specific, not "any skills present").
+    #[test]
+    fn skills_without_p2p_type_is_not_camera() {
+        let body = br#"{"deviceList":[{"devId":"d1","skills":{"foo":1}}]}"#;
+        let list = parse_device_list(body).unwrap();
+        assert!(list.find_camera_device().is_none());
+        assert_eq!(list.device_list[0].skills_p2p_type(), None);
     }
 
     // ── list_devices service: TOKEN-PENDING discipline ─────────────────────

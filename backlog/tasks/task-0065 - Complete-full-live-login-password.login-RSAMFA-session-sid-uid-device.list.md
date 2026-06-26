@@ -3,11 +3,11 @@ id: TASK-0065
 title: >-
   Complete full live login: password.login (RSA+MFA) -> session sid/uid ->
   device.list
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-06-26 10:31'
-updated_date: '2026-06-26 12:10'
+updated_date: '2026-06-26 13:53'
 labels:
   - auth
   - login
@@ -26,7 +26,7 @@ token.get now succeeds (returns the RSA pubkey + ticket). Complete the login flo
 <!-- AC:BEGIN -->
 - [ ] #1 password.login succeeds and yields a session (sid/uid + home-DC domain)
 - [x] #2 MFA/captcha steps handled per cap1 sequence (token.get refresh + mfa.code.get)
-- [ ] #3 device.list returns the account home + baby-monitor device record (post-AES-decrypt)
+- [x] #3 device.list returns the account home + baby-monitor device record (post-AES-decrypt)
 - [x] #4 Each request validated against emulator_captures/cap1/flows.json; secrets stay in secrets/
 <!-- AC:END -->
 
@@ -92,4 +92,29 @@ Review-fix pass (BLOCKER-1 + MEDIUM-2/3 + LOW-4), pre-commit, NOT committed:
 Validation (all green): just e2e EXIT 0; cargo test -p babymonitor-cli --features live = 41 passed/0 failed; cargo clippy -p babymonitor-cli --features live --all-targets -- -D warnings = clean; cargo test -p babymonitor-core session = 17 passed incl new perms test. No live network calls.
 
 PRE-EXISTING (out of scope of this fix, NOT introduced by my diff): just secret-scan FAILS with 215 findings, 210 from tracked emulator_captures/cap1/flows.full.txt (a mitmproxy dump whose hex bytes match the email regex). Zero findings originate from my .rs edits. Filed as a separate backlog task.
+
+LIVE LOGIN SUCCESS (2026-06-26): token.get ACCEPTED (signer validated) -> password.login(empty) -> MFA_NEED_SEND_CODE -> mfa.code.get (emailed) -> password.login(MFA code) -> LOGIN SUCCESS. Full session captured (sid/uid/ecode/domain). AC#1 (session) + AC#2 (MFA flow) DONE live. Two bugs fixed live: (a) password must be RSA(MD5hex(password)) not RSA(raw) -> was USER_PASSWD_WRONG; (b) chKey length (committed earlier). Post-login ET3 request-encrypt + response-decrypt with session ecode VALIDATED (device.list error response decrypted cleanly). AC#3 device.list REMAINING: our action thing.m.my.group.device.list returns USER_GROUP_ID_IS_BLANK; real flow per cap1 = m.life.home.space.list -> m.life.app.smart.local.device.list/smartlife.m.device.ref.info.list (pass homeId). Crypto all works; just wire the 2-step home->device action sequence.
+
+AC#3 device-list wiring (code; live run owner-gated) — babymonitor/babymonitor-cli/src/live.rs + babymonitor-core/src/device.rs. NOT committed, NOT Done.
+
+Replaced the single-call thing.m.my.group.device.list v1.0 (which returned USER_GROUP_ID_IS_BLANK live) with the cap1-verified TWO-STEP post-login discovery:
+1. m.life.home.space.list v1.0 — NO postData (signed envelope WITH session sid, like graphic.verification.code.get; reuses the no-postData path, now extended to fold sid into the sign). Response result = ARRAY of homes; parse_home_gids() collects each home gid (JSON number).
+2. m.life.my.group.device.list v2.2 — postData {"gid":<number>} (compact, no spaces, gid as JSON number — byte-shape matches the decrypted cap1 sub-api params), session sid in the signed envelope, session ecode for postData encrypt + response decrypt. Response result = ARRAY of device records.
+Neither action has a thing/smartlife prefix (rewrite passes them through). The genuine app wraps step 2 in smartlife.m.api.batch.invoke (top-level gid; the my.group.device.list sub-api params decrypt to exactly {"gid":<n>}); we issue it DIRECTLY as the minimal READ-ONLY path.
+
+GROUND-TRUTH DISCREPANCY (flagged): the raw m.life.my.group.device.list v2.2 record has NO top-level category field — category (sp/wf_sp) lives in the SEPARATE smartlife.m.device.ref.info.list keyed by productId. The only camera-specific field ON the device record is skills.p2pType (=4 for the SCD921). So inspect_device_list detects the camera by category in {sp,ipc} OR presence of skills.p2pType, and extracts p2pType from skills.p2pType first, falling back to a top-level p2pType. Verified by decrypting cap1 with re/scripts/decrypt_device_flow.py + the session ecode (crypto round-trip already validated). Core DeviceBean.is_camera() broadened to the same two signals + new skills_p2p_type()/transport_from_skills() accessors.
+
+Wired into BOTH consumers via a shared discover_devices(): post-login fetch_and_capture_device_list (in-process sid/ecode) AND run_injected_device_list (SessionStore sid/ecode). Each decrypted response captured to gitignored secrets/ (tuya_home_list.json + tuya_device_list.json, per-home indexed when >1 home). SHAPE-only logs; no devId/localKey/uuid/gid ever printed.
+
+OFFLINE VALIDATION (no live calls): just e2e EXIT 0 (cli 6, core 114, device_fixtures 10, py 10+18+12+5 OK). cargo test -p babymonitor-cli --features live = 46 passed (new: home.space.list sid+no-postData envelope, device_list_post_data {gid:number} byte shape, parse_home_gids array extraction, inspect_device_list v2.2 array+skills.p2pType camera + negative). cargo clippy --features live --all-targets -D warnings clean. fmt OK. secret-scan: 215 pre-existing cap1-dump findings only (unchanged baseline; 0 reference my .rs edits). Real cap1 gid/homeId anonymized to synthetic values in all committed tests/comments.
+
+REMAINING for AC#3: owner runs auth live-login --features live end-to-end to confirm home.space.list returns the home gid and my.group.device.list returns the SCD921 (skills.p2pType=4).
+
+AC#3 DONE LIVE: devices list --live (saved session) -> home.space.list (1 home) -> m.life.my.group.device.list{gid} -> camera_found=true, p2pType=4 (WebRTC). Device = Philips Avent Baby Monitor, productId kzm54lhabeeucq5a, devId recovered (22 chars). Follow-ups filed: unify/sharpen camera detection (new task).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Full live login + device discovery working end-to-end. chKey + password(MD5-then-RSA) + MFA-flow fixes solved ILLEGAL_CLIENT_ID through to a session; two-step home.space.list -> m.life.my.group.device.list{gid} discovers the SCD921 (p2pType=4=WebRTC). Validated against emulator_captures/cap1; e2e + 46 live tests green.
+<!-- SECTION:FINAL_SUMMARY:END -->

@@ -198,17 +198,31 @@ const GRAPHIC_VERIFICATION_CODE_GET_VERSION: &str = "1.0";
 const MFA_CODE_GET_ACTION: &str = "thing.m.user.username.mfa.code.get";
 const MFA_CODE_GET_VERSION: &str = "1.0";
 
-/// device-list (home-detail) action + version. CONFIDENCE: `likely` — the exact
-/// `a=` value is R8-obfuscated to `thing.m.n` in `com/thingclips/sdk/home/*`
-/// (`re/tuya_cloud_auth.md` §5a/§6: "the home-detail action name is R8-obfuscated
-/// … the exact `a=` value here is needs-live-capture"). We use the documented
-/// Tuya mobile device-list action as the single best-known candidate; a real
-/// capture (TASK-0022) confirms or corrects it. This is the ONE single-source,
-/// `likely` value on the injected-sid read path — every other envelope ingredient
-/// is `confirmed`. Defined once here so both the post-login and the injected-sid
-/// builders sign byte-identically.
-const DEVICE_LIST_ACTION: &str = "thing.m.my.group.device.list";
-const DEVICE_LIST_VERSION: &str = "1.0";
+/// Device discovery is a TWO-STEP, POST-LOGIN sequence. CAPTURE-VERIFIED
+/// (TASK-0065, emulator_captures/cap1; decrypted with the session `ecode` via
+/// `re/scripts/decrypt_device_flow.py`):
+///
+/// 1. `m.life.home.space.list` v1.0 — list the account's homes/groups. Like
+///    `graphic.verification.code.get` it carries **NO `postData`** (no postData form
+///    field, not in the sign) — only the signed envelope WITH the session `sid`. The
+///    decrypted response `result` is an ARRAY of homes; each home object carries a
+///    numeric `gid` (an account/home group id) we feed into step 2.
+/// 2. `m.life.my.group.device.list` v2.2 — per-`gid` device list. Its `postData` is
+///    `{"gid":<gid as JSON NUMBER>}` (compact, no spaces — the decrypted cap1 sub-api
+///    `params` are this exact shape), ET=3 encrypted under the session `ecode`; the
+///    envelope carries the session `sid`.
+///    The decrypted response `result` is an ARRAY of device records.
+///
+/// Neither `a=` has a `thing`/`smartlife` prefix, so both pass [`rewrite_action`]
+/// unchanged. The genuine app wraps step 2 inside `smartlife.m.api.batch.invoke`
+/// (the batch top-level carries `gid`, and the `m.life.my.group.device.list` sub-api
+/// `params` decrypts to exactly `{"gid":<gid>}`); we issue it DIRECTLY — the
+/// sub-api spec is byte-identical and a direct call is the minimal READ-ONLY path.
+/// Defined once here so the post-login and injected-sid builders sign identically.
+const HOME_SPACE_LIST_ACTION: &str = "m.life.home.space.list";
+const HOME_SPACE_LIST_VERSION: &str = "1.0";
+const DEVICE_LIST_ACTION: &str = "m.life.my.group.device.list";
+const DEVICE_LIST_VERSION: &str = "2.2";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Loaded secrets (from secrets/, never echoed)
@@ -656,27 +670,28 @@ fn build_signed_envelope_with(
 }
 
 /// Build a signed atop envelope for an action that sends **NO `postData`** on the
-/// wire (the graphic-captcha pre-check, `re/`-cap1 step 3). The genuine app emits
-/// only the envelope form params + `sign` — there is no `postData` form field and
-/// therefore no `postData` digest in the canonical sign string ([`canonical_string`]
-/// simply omits an absent whitelist key). PURE; no network.
+/// wire (the graphic-captcha pre-check, cap1 step 3; and the post-login
+/// `home.space.list`, cap1 device-discovery step 1). The genuine app emits only the
+/// envelope form params + `sign` — there is no `postData` form field and therefore
+/// no `postData` digest in the canonical sign string ([`canonical_string`] simply
+/// omits an absent whitelist key).
+///
+/// `extra` folds any additional SIGNED whitelist params (e.g. the post-login `sid`
+/// for `home.space.list`) into the envelope BEFORE signing, so a non-empty value
+/// enters the canonical string and the signature covers it. Pre-login callers (the
+/// captcha pre-check) pass an empty map. PURE; no network.
 fn build_signed_envelope_no_post_data(
     cfg: &LiveConfig,
     action: &str,
     version: &str,
+    extra: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, LiveError> {
     let wire_action = rewrite_action(action);
     let now_s = chrono::Utc::now().timestamp();
     let request_id = new_request_id();
 
-    let mut envelope = assemble_envelope_params(
-        cfg,
-        &wire_action,
-        version,
-        &request_id,
-        now_s,
-        &BTreeMap::new(),
-    );
+    let mut envelope =
+        assemble_envelope_params(cfg, &wire_action, version, &request_id, now_s, extra);
 
     // NO postData → sign over the envelope params as-is (no postData digest).
     let sign = sign_envelope(cfg, &envelope)?;
@@ -1460,6 +1475,7 @@ fn do_graphic_verification_code_get(
         cfg,
         GRAPHIC_VERIFICATION_CODE_GET_ACTION,
         GRAPHIC_VERIFICATION_CODE_GET_VERSION,
+        &BTreeMap::new(),
     )?;
     // No postData form field, no ecode (setSessionRequire(false)).
     let _resp = send_atop(client, host, cfg, &envelope, None, None)?;
@@ -1762,23 +1778,15 @@ pub fn run_injected_device_list(
         .build()
         .map_err(|e| LiveError::Network(format!("build http client: {e}")))?;
 
-    // Build the device.list request carrying the INJECTED sid (signed into the
-    // canonical string), send it ONCE. No password.login is performed.
-    eprintln!("live: sending ONE device.list with the INJECTED sid (no password.login)...");
-    let (envelope, body) = build_device_list_request(&cfg, &session.sid, session.ecode.as_deref())?;
-    let resp = send_atop(
-        &client,
-        &host,
-        &cfg,
-        &envelope,
-        Some(&body),
-        session.ecode.as_deref(),
-    )?;
-    capture_to_secrets(&cfg, "tuya_device_list.json", &resp.raw)?;
-    if !resp.success {
-        eprintln!("live: device.list returned a server error (captured raw to secrets/).");
-    }
-    let (camera_found, p2p_type) = inspect_device_list(&resp.raw);
+    // Drive the cap1 two-step discovery (home.space.list → per-gid
+    // my.group.device.list) carrying the INJECTED sid (signed into the canonical
+    // string) and the session ecode. No password.login is performed.
+    eprintln!(
+        "live: running two-step discovery (home.space.list → my.group.device.list) \
+         with the INJECTED sid (no password.login)..."
+    );
+    let (camera_found, p2p_type) =
+        discover_devices(&client, &host, &cfg, &session.sid, session.ecode.as_deref())?;
     Ok(InjectedOutcome::Fetched {
         camera_found,
         p2p_type,
@@ -2084,44 +2092,135 @@ fn probe_host(host: &str) -> Result<(), LiveError> {
     }
 }
 
-/// Build the SIGNED `device.list` atop request carrying the injected/post-login
-/// `sid`. PURE — no network, no I/O. This is the SINGLE SOURCE OF TRUTH for the
-/// device-list request shape, used by BOTH the post-login fetch
-/// ([`fetch_and_capture_device_list`]) and the injected-sid read path
-/// ([`run_injected_device_list`]), so the two produce a byte-identical envelope.
+/// Build the SIGNED `home.space.list` request (cap1 device-discovery step 1). It
+/// carries the post-login `sid` in the signed envelope and **NO `postData`** (cap1
+/// CONFIRMED: `home.space.list` has no postData form field, exactly like the
+/// captcha pre-check). The decrypted response `result` is an ARRAY of homes whose
+/// numeric `gid` feeds step 2. PURE — no network. The `sid` (whitelist param
+/// `bdpdqbp`) enters the canonical string so the signature covers it; an empty
+/// `sid` is dropped by the signer.
+fn build_home_space_list_request(
+    cfg: &LiveConfig,
+    sid: &str,
+) -> Result<BTreeMap<String, String>, LiveError> {
+    let extra = sid_extra(sid);
+    build_signed_envelope_no_post_data(cfg, HOME_SPACE_LIST_ACTION, HOME_SPACE_LIST_VERSION, &extra)
+}
+
+/// Build the SIGNED `m.life.my.group.device.list` v2.2 request (cap1 step 2) for
+/// one `gid`. PURE — no network. This is the SINGLE SOURCE OF TRUTH for the
+/// device-list request shape, used by BOTH the post-login fetch and the injected-sid
+/// read path, so the two produce a byte-identical envelope.
 ///
-/// The `sid` is folded into the envelope BEFORE signing (it is in the sign
-/// whitelist `bdpdqbp`, `re/tuya_sign.md` §1 line ~:82: `… sid, chKey …`), so a
-/// non-empty `sid` enters the canonical string `str2` and the signature covers it
-/// — exactly where the SDK puts it (`ApiParams.getSession` → wire `sid`,
-/// `re/tuya_cloud_auth.md` §1 line ~:84). An empty `sid` is dropped (the signer
-/// filters empty whitelist values), which is the pre-login shape.
+/// `postData` is `{"gid":<gid as JSON NUMBER>}` — compact, no spaces; the `gid` is a
+/// JSON number, NOT a string (the decrypted cap1 sub-api `params` are this exact
+/// byte shape) — ET=3 encrypted under the session `ecode`. The `sid` (whitelist
+/// param `bdpdqbp`,
+/// `re/tuya_sign.md` §1) is folded into the envelope BEFORE signing so it enters the
+/// canonical string `str2`; an empty `sid` is dropped (the pre-login shape).
 fn build_device_list_request(
     cfg: &LiveConfig,
     sid: &str,
+    gid: i64,
     ecode: Option<&str>,
 ) -> Result<(BTreeMap<String, String>, String), LiveError> {
-    let post_data = "{}";
-    let extra = if sid.is_empty() {
-        BTreeMap::new()
-    } else {
-        BTreeMap::from([("sid".to_string(), sid.to_string())])
-    };
+    let post_data = device_list_post_data(gid);
+    let extra = sid_extra(sid);
     build_signed_envelope_with(
         cfg,
         DEVICE_LIST_ACTION,
         DEVICE_LIST_VERSION,
-        post_data,
+        &post_data,
         &extra,
         ecode,
     )
 }
 
-/// READ-ONLY device-list fetch + capture. Returns (camera_found, p2p_type).
+/// The exact `m.life.my.group.device.list` v2.2 `postData`: `{"gid":<number>}`.
+/// `serde_json` renders this compactly (no spaces) and emits the `gid` as a JSON
+/// number — byte-identical in shape to the decrypted cap1 sub-api `params`.
+fn device_list_post_data(gid: i64) -> String {
+    serde_json::json!({ "gid": gid }).to_string()
+}
+
+/// Fold a non-empty `sid` into the SIGNED whitelist extras; an empty `sid` yields
+/// an empty map (the signer drops empty whitelist values → pre-login shape).
+fn sid_extra(sid: &str) -> BTreeMap<String, String> {
+    if sid.is_empty() {
+        BTreeMap::new()
+    } else {
+        BTreeMap::from([("sid".to_string(), sid.to_string())])
+    }
+}
+
+/// READ-ONLY device discovery: the cap1 two-step `home.space.list` →
+/// per-`gid` `m.life.my.group.device.list` sequence. Returns (camera_found,
+/// p2p_type) merged across every home. SHAPE-only — no secret/PII value is logged.
 ///
-/// Builds the request via [`build_device_list_request`] (the shared builder) with
-/// the post-login `sid` taken from the in-process login `User`. On any failure we
-/// surface it but do NOT retry-spam.
+/// Shared by BOTH consumers (the post-login fetch and the injected-sid read path)
+/// so they drive the identical sequence. Each decrypted response is captured to
+/// gitignored `secrets/` (home list + per-home device lists). A server error on
+/// either step is surfaced (no retry-spam) and the captured raw is kept for offline
+/// inspection. `sid`/`ecode` come from the in-process login `User` (post-login) or
+/// the injected [`SessionStore`] session (read path); both ride every call.
+fn discover_devices(
+    client: &reqwest::blocking::Client,
+    host: &str,
+    cfg: &LiveConfig,
+    sid: &str,
+    ecode: Option<&str>,
+) -> Result<(bool, Option<i32>), LiveError> {
+    // ── Step 1: home.space.list (no postData; sid signed; response decrypted with
+    // the session ecode) → collect each home's numeric gid. ───────────────────
+    let envelope = build_home_space_list_request(cfg, sid)?;
+    let resp = send_atop(client, host, cfg, &envelope, None, ecode)?;
+    capture_to_secrets(cfg, "tuya_home_list.json", &resp.raw)?;
+    if !resp.success {
+        eprintln!("live: home.space.list returned a server error (captured raw to secrets/).");
+    }
+    let gids = parse_home_gids(&resp.raw);
+    eprintln!(
+        "live: home.space.list returned {} home/group id(s).",
+        gids.len()
+    );
+
+    // ── Step 2: for EACH gid → m.life.my.group.device.list v2.2 {"gid":<n>}; merge
+    // the SHAPE facts (camera_found OR'd, first non-None p2pType wins). ────────
+    let multi = gids.len() > 1;
+    let mut camera_found = false;
+    let mut p2p_type: Option<i32> = None;
+    for (i, gid) in gids.iter().enumerate() {
+        let (env, body) = build_device_list_request(cfg, sid, *gid, ecode)?;
+        let resp = send_atop(client, host, cfg, &env, Some(&body), ecode)?;
+        // Per-home capture name avoids clobbering when the account has >1 home;
+        // a single-home account keeps the canonical `tuya_device_list.json` name.
+        let cap_name = if multi {
+            format!("tuya_device_list_{i}.json")
+        } else {
+            "tuya_device_list.json".to_string()
+        };
+        capture_to_secrets(cfg, &cap_name, &resp.raw)?;
+        if !resp.success {
+            eprintln!(
+                "live: my.group.device.list (home #{i}) returned a server error \
+                 (captured raw to secrets/)."
+            );
+            continue;
+        }
+        let (found, p2p) = inspect_device_list(&resp.raw);
+        if found {
+            camera_found = true;
+            if p2p_type.is_none() {
+                p2p_type = p2p;
+            }
+        }
+    }
+    Ok((camera_found, p2p_type))
+}
+
+/// READ-ONLY post-login device discovery + capture. Returns (camera_found,
+/// p2p_type). Extracts the `sid`/`ecode` from the in-process login `User` and runs
+/// the shared [`discover_devices`] two-step sequence.
 fn fetch_and_capture_device_list(
     client: &reqwest::blocking::Client,
     host: &str,
@@ -2130,62 +2229,98 @@ fn fetch_and_capture_device_list(
 ) -> Result<(bool, Option<i32>), LiveError> {
     let sid = user.get("sid").and_then(|v| v.as_str()).unwrap_or("");
     let ecode = user.get("ecode").and_then(|v| v.as_str());
-    let (envelope, body) = build_device_list_request(cfg, sid, ecode)?;
-
-    let resp = send_atop(client, host, cfg, &envelope, Some(&body), ecode)?;
-    capture_to_secrets(cfg, "tuya_device_list.json", &resp.raw)?;
-    if !resp.success {
-        // Surface (no retry) but still report the captured shape if any.
-        eprintln!("live: device-list fetch returned a server error (captured raw to secrets/).");
-    }
-    Ok(inspect_device_list(&resp.raw))
+    discover_devices(client, host, cfg, sid, ecode)
 }
 
-/// Inspect a captured device-list response for the SCD921 camera + p2pType.
-/// Returns (camera_found, p2p_type) — SHAPE only, no values echoed.
+/// Collect the numeric `gid` of every home in a `home.space.list` response.
+/// CAPTURE-VERIFIED (cap1): the decrypted `result` is an ARRAY of home objects,
+/// each with a numeric `gid` (an account/home group id). SHAPE-only — no name/PII
+/// is read.
+/// A non-array `result` (e.g. an error envelope) yields an empty list.
+fn parse_home_gids(raw: &serde_json::Value) -> Vec<i64> {
+    raw.get("result")
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|home| home.get("gid").and_then(serde_json::Value::as_i64))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Inspect a captured `m.life.my.group.device.list` v2.2 response for the camera +
+/// its `p2pType`. Returns (camera_found, p2p_type) — SHAPE only, no values echoed.
 ///
-/// The atop envelope wraps the payload under `result`; the device-list container
-/// (`HomeBean`) lives there. We try the core parser on the `result` sub-object
-/// first (the typed path), then fall back to a direct scan that also surfaces any
-/// `p2pType`. The whole-envelope is never fed to the core parser (it would parse
-/// to an empty list and silently mask the camera).
+/// CAPTURE-VERIFIED shape (cap1): the atop envelope wraps the payload under
+/// `result`, which for v2.2 is a bare ARRAY of device records (NOT a HomeBean
+/// `{deviceList:[…]}` object — older/home-detail shapes nest under `deviceList`, so
+/// we accept both). The camera-distinguishing signals (see [`device_is_camera`]):
+/// - `category` in {`sp`,`ipc`} — the Tuya camera category (the task spec; present
+///   on the `device.ref.info.list`-augmented / home-detail shape); OR
+/// - `skills.p2pType` present — the signal actually ON the raw v2.2 record. In cap1
+///   the `m.life.my.group.device.list` record carries **NO top-level `category`**
+///   (the category lives in the SEPARATE `device.ref.info.list` keyed by
+///   `productId`); the only camera-specific field on the record itself is
+///   `skills.p2pType` (=4 for the SCD921). `p2pType` is camera-specific, so its
+///   presence identifies the camera on the real wire.
+///
+/// `p2p_type` is taken from `skills.p2pType` first (the real wire location), then
+/// falls back to a top-level `p2pType` (the synthetic/older shape). Records are
+/// scanned as raw JSON (SHAPE only — `devId`/`localKey`/`uuid` are never touched).
 fn inspect_device_list(raw: &serde_json::Value) -> (bool, Option<i32>) {
     let result = raw.get("result").unwrap_or(raw);
 
-    // Typed path: the core parser over the `result` object (HomeBean-shaped).
-    if let Ok(body) = serde_json::to_vec(result) {
-        if let Ok(list) = babymonitor_core::device::parse_device_list(&body) {
-            if list.find_camera_device().is_some() {
-                let p2p = scan_p2p_type(result);
-                return (true, p2p);
-            }
-        }
-    }
+    // Normalize both shapes to a device iterator: a bare array (v2.2), or a
+    // `{deviceList:[…]}` object (older home-detail). Anything else → no devices.
+    let devices: Vec<&serde_json::Value> = if let Some(arr) = result.as_array() {
+        arr.iter().collect()
+    } else if let Some(arr) = result.get("deviceList").and_then(|d| d.as_array()) {
+        arr.iter().collect()
+    } else {
+        Vec::new()
+    };
 
-    // Fallback scan: any device with a camera category, plus any p2pType.
-    let mut found = false;
-    if let Some(arr) = result.get("deviceList").and_then(|d| d.as_array()) {
-        for d in arr {
-            let cat = d.get("category").and_then(|v| v.as_str()).unwrap_or("");
-            if cat == "sp" || cat == "ipc" {
-                found = true;
+    let mut camera_found = false;
+    let mut p2p_type: Option<i32> = None;
+    for d in devices {
+        if device_is_camera(d) {
+            camera_found = true;
+            if p2p_type.is_none() {
+                p2p_type = device_p2p_type(d);
             }
         }
     }
-    (found, scan_p2p_type(result))
+    (camera_found, p2p_type)
 }
 
-/// Find the first `p2pType` integer anywhere in a device-list payload (the
-/// transport selector — 4=WebRTC/2=PPCS). SHAPE only.
-fn scan_p2p_type(result: &serde_json::Value) -> Option<i32> {
-    if let Some(arr) = result.get("deviceList").and_then(|d| d.as_array()) {
-        for d in arr {
-            if let Some(t) = d.get("p2pType").and_then(serde_json::Value::as_i64) {
-                return Some(t as i32);
-            }
-        }
+/// Whether a raw device record is the camera, by either grounded signal: a camera
+/// `category` ({`sp`,`ipc`}) OR a present `skills.p2pType` (the cap1 v2.2 record has
+/// no `category` — see [`inspect_device_list`]). SHAPE only.
+fn device_is_camera(d: &serde_json::Value) -> bool {
+    let cat = d.get("category").and_then(|v| v.as_str());
+    if matches!(cat, Some("sp") | Some("ipc")) {
+        return true;
     }
-    None
+    skills_p2p_type(d).is_some()
+}
+
+/// The device's `p2pType` (transport selector — 4=WebRTC/2=PPCS): `skills.p2pType`
+/// first (the real v2.2 wire location), else a top-level `p2pType` (synthetic/older
+/// shape). SHAPE only.
+fn device_p2p_type(d: &serde_json::Value) -> Option<i32> {
+    skills_p2p_type(d).or_else(|| {
+        d.get("p2pType")
+            .and_then(serde_json::Value::as_i64)
+            .map(|t| t as i32)
+    })
+}
+
+/// Read `skills.p2pType` (the transport selector on the raw v2.2 record). SHAPE only.
+fn skills_p2p_type(d: &serde_json::Value) -> Option<i32> {
+    d.get("skills")
+        .and_then(|s| s.get("p2pType"))
+        .and_then(serde_json::Value::as_i64)
+        .map(|t| t as i32)
 }
 
 #[cfg(test)]
@@ -2832,6 +2967,7 @@ mod tests {
             &cfg,
             GRAPHIC_VERIFICATION_CODE_GET_ACTION,
             GRAPHIC_VERIFICATION_CODE_GET_VERSION,
+            &BTreeMap::new(),
         )
         .expect("no-postData envelope build");
         // The wire action has NO thing/smartlife prefix → unchanged by rewrite.
@@ -2927,14 +3063,125 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // inspect_device_list finds a camera by category and reports SHAPE only.
+    // inspect_device_list (older/home-detail shape): a `{deviceList:[…]}` object
+    // under `result`, camera by `category:"sp"`, p2pType from the top-level field.
     #[test]
     fn inspect_device_list_finds_camera_shape() {
         let raw = serde_json::json!({
             "result": { "deviceList": [ { "devId": "d", "category": "sp", "p2pType": 4 } ] }
         });
-        let (found, _p2p) = inspect_device_list(&raw);
+        let (found, p2p) = inspect_device_list(&raw);
         assert!(found, "an sp-category device must be reported as a camera");
+        assert_eq!(p2p, Some(4), "top-level p2pType fallback must be surfaced");
+    }
+
+    // inspect_device_list (cap1 m.life.my.group.device.list v2.2 shape): `result` is
+    // a bare ARRAY of device records; the SCD921 record carries NO top-level
+    // `category` — only `skills.p2pType` — and must STILL be found as the camera,
+    // with p2pType read from skills. SYNTHETIC devId/localKey/uuid (no real secret).
+    #[test]
+    fn inspect_device_list_finds_camera_v22_array_shape() {
+        let raw = serde_json::json!({
+            "result": [ {
+                "devId": "SYNTH_DEVID_0001",
+                "name": "Philips Avent Baby Monitor",
+                "productId": "SYNTH_PRODUCT_0001",
+                "uuid": "SYNTH_UUID_0001",
+                "localKey": "SYNTH_LOCALKEY16",
+                "skills": { "p2pType": 4 }
+            } ],
+            "success": true,
+            "status": "ok"
+        });
+        let (found, p2p) = inspect_device_list(&raw);
+        assert!(
+            found,
+            "a v2.2 record with skills.p2pType (no category) must be the camera"
+        );
+        assert_eq!(p2p, Some(4), "p2pType must be read from skills.p2pType");
+    }
+
+    // NEGATIVE: a v2.2 array with only a non-camera device (no skills.p2pType, no
+    // camera category) must report no camera and no p2pType.
+    #[test]
+    fn inspect_device_list_non_camera_array_is_empty_shape() {
+        let raw = serde_json::json!({
+            "result": [ { "devId": "d2", "skills": { "switch": 1 } } ],
+            "success": true
+        });
+        assert_eq!(inspect_device_list(&raw), (false, None));
+    }
+
+    // device_list_post_data byte shape: EXACTLY `{"gid":<number>}` (compact, no
+    // spaces, gid as a JSON NUMBER) — the same byte shape as the decrypted cap1
+    // sub-api params. SYNTHETIC gid (the real account gid is never committed).
+    #[test]
+    fn device_list_post_data_is_gid_number_compact() {
+        assert_eq!(device_list_post_data(100200300), r#"{"gid":100200300}"#);
+        // The gid is a JSON number, never a quoted string.
+        let v: serde_json::Value = serde_json::from_str(&device_list_post_data(7)).unwrap();
+        assert!(v["gid"].is_number());
+        assert_eq!(v["gid"].as_i64(), Some(7));
+    }
+
+    // parse_home_gids extracts each home's numeric gid from the home.space.list
+    // response ARRAY (cap1 shape: result = [{gid, groupId, id, name, admin}, …]).
+    // SYNTHETIC gid/id values (the real account ids are never committed).
+    #[test]
+    fn parse_home_gids_extracts_numeric_gids_from_array() {
+        let raw = serde_json::json!({
+            "result": [
+                { "gid": 100200300, "groupId": 100200300, "id": 100200301, "name": "H1", "admin": true },
+                { "gid": 999, "id": 2, "name": "H2", "admin": false }
+            ],
+            "success": true
+        });
+        assert_eq!(parse_home_gids(&raw), vec![100200300, 999]);
+        // A non-array result (e.g. an error envelope) → empty, never a panic.
+        let err = serde_json::json!({ "success": false, "errorCode": "X" });
+        assert!(parse_home_gids(&err).is_empty());
+    }
+
+    // home.space.list request: carries the session sid in BOTH the wire form params
+    // AND the canonical sign string (sid is whitelisted), and emits NO postData.
+    #[test]
+    fn home_space_list_request_carries_sid_and_no_post_data() {
+        let cfg = synthetic_cfg();
+        let fake_sid = "FAKE_INJECTED_SID_0001"; // SYNTHETIC.
+        let envelope =
+            build_home_space_list_request(&cfg, fake_sid).expect("home.space.list build");
+
+        // Correct action/version, no thing/smartlife rewrite (m.life.* unchanged).
+        assert_eq!(
+            envelope.get("a").map(String::as_str),
+            Some(HOME_SPACE_LIST_ACTION)
+        );
+        assert_eq!(
+            envelope.get("v").map(String::as_str),
+            Some(HOME_SPACE_LIST_VERSION)
+        );
+        // sid rides the wire form and the canonical sign string.
+        assert_eq!(envelope.get("sid").map(String::as_str), Some(fake_sid));
+        let canonical = babymonitor_core::sign::canonical_string(&{
+            let mut p = envelope.clone();
+            p.remove("sign");
+            p
+        });
+        assert!(
+            canonical.contains(&format!("sid={fake_sid}")),
+            "sid must be signed into home.space.list; got: {canonical}"
+        );
+        // NO postData form field (cap1: home.space.list has no postData).
+        let form = form_body(&envelope, None);
+        assert!(
+            !form.contains("postData="),
+            "home.space.list must not carry a postData form field: {form}"
+        );
+        assert!(
+            !canonical.contains("postData="),
+            "home.space.list sign must omit postData; got: {canonical}"
+        );
+        assert!(envelope.get("sign").is_some_and(|s| !s.is_empty()));
     }
 
     // ── TASK-0055: injected-session device.list request shape (OFFLINE) ─────────
@@ -2948,11 +3195,12 @@ mod tests {
         let cfg = synthetic_cfg();
         let fake_sid = "FAKE_INJECTED_SID_0001"; // SYNTHETIC — never a real sid.
 
-        let (envelope, body) =
-            build_device_list_request(&cfg, fake_sid, None).expect("device.list request build");
+        let (envelope, body) = build_device_list_request(&cfg, fake_sid, 100200300, None)
+            .expect("device.list request build");
 
         // (0) It is the device.list action, byte-faithful to the shared constant
-        // (rewritten thing*→smartlife* on the wire), with encrypted postData.
+        // (m.life.* has no thing/smartlife prefix → unchanged on the wire), with
+        // encrypted postData carrying the gid.
         assert_eq!(
             envelope.get("a").map(String::as_str),
             Some(rewrite_action(DEVICE_LIST_ACTION).as_str()),
@@ -2962,7 +3210,10 @@ mod tests {
             envelope.get("v").map(String::as_str),
             Some(DEVICE_LIST_VERSION)
         );
-        assert_ne!(body, "{}", "device.list postData is ET=3 encrypted");
+        assert_ne!(
+            body, r#"{"gid":100200300}"#,
+            "device.list postData {{gid}} must be ET=3 encrypted, not plaintext"
+        );
 
         // (1) The injected sid is in the wire form params with its exact value.
         assert_eq!(
@@ -2992,14 +3243,14 @@ mod tests {
     #[test]
     fn empty_sid_is_dropped_from_device_list_request() {
         let cfg = synthetic_cfg();
-        let (envelope, _body) = build_device_list_request(&cfg, "", None).expect("build");
+        let (envelope, body) = build_device_list_request(&cfg, "", 100200300, None).expect("build");
 
         assert!(
             !envelope.contains_key("sid"),
             "an empty sid must be dropped (pre-login shape), not sent empty"
         );
 
-        let canonical = canonical_for_params(&envelope, "");
+        let canonical = canonical_for_params(&envelope, &body);
         assert!(
             !canonical.contains("sid="),
             "empty sid must not enter the canonical sign string; got: {canonical}"
@@ -3014,8 +3265,8 @@ mod tests {
         use babymonitor_core::sign::canonical_string;
 
         let cfg = synthetic_cfg();
-        let (e1, _) = build_device_list_request(&cfg, "SID_AAAA", None).unwrap();
-        let (e2, _) = build_device_list_request(&cfg, "SID_BBBB", None).unwrap();
+        let (e1, _) = build_device_list_request(&cfg, "SID_AAAA", 100200300, None).unwrap();
+        let (e2, _) = build_device_list_request(&cfg, "SID_BBBB", 100200300, None).unwrap();
         let mut c1_params = e1.clone();
         let mut c2_params = e2.clone();
         c1_params.remove("sign");

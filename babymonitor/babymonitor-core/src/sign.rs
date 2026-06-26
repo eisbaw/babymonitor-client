@@ -48,7 +48,7 @@
 //! the message is G alone.
 //!
 //! `chKey` ([`ch_key`]) = `lowercase_hex(HMAC-SHA256(key = appKey,
-//! msg = packageName ++ 0x5f ++ certColonUpper))[8..24]` — same colon-upper cert
+//! msg = packageName ++ 0x5f ++ certColonUpper))[8..16]` — same colon-upper cert
 //! input as G; output shape unchanged.
 //!
 //! # Honest confidence
@@ -860,7 +860,7 @@ pub const APP_PACKAGE_NAME: &str = "com.philips.ph.babymonitorplus";
 ///
 /// ```text
 /// chKey = lowercase_hex( HMAC-SHA256( key   = appId_bytes,
-///                                     msg   = packageName + "_" + certColonUpper ) )[8..24]
+///                                     msg   = packageName + "_" + certColonUpper ) )[8..16]
 /// ```
 ///
 /// where:
@@ -877,8 +877,11 @@ pub const APP_PACKAGE_NAME: &str = "com.philips.ph.babymonitorplus";
 /// digestSize=0x20, blockSize=0x40}` and the key-setup `FUN_00117780` does the
 /// canonical HMAC ipad(`0x36`)/opad(`0x5c`) pad-XOR. Ghidra shows the native
 /// function hex-encodes the 32-byte digest, then returns a Java string copied
-/// from byte offset 8, capped at 16 chars. The `_` join byte (`0x5f`) is written
-/// at `getChKey@0x116108`. All STATIC — no runtime/device/cloud input.
+/// from byte offset 8. The static Ghidra length reading (`0x10`/16 chars) was
+/// WRONG — capture ground truth shows **8 chars** (`hex[8..16]`); the cap constant
+/// was misread (likely `0x8` vs `0x10`). The capture overrides the static reading.
+/// The `_` join byte (`0x5f`) is written at `getChKey@0x116108`. All STATIC — no
+/// runtime/device/cloud input.
 ///
 /// # Static-derivable
 /// Every input is a static, offline-recoverable value (appKey from `secrets/`,
@@ -894,16 +897,24 @@ pub const APP_PACKAGE_NAME: &str = "com.philips.ph.babymonitorplus";
 ///   INTERNALLY, so the wrong lowercase-64-hex cert string is unconstructable at
 ///   this boundary (architect Finding 2).
 ///
-/// The returned `chKey` is a per-app value derived from the appKey + cert hash —
-/// **secret-by-policy** (CLAUDE.md): it must only ever go to `secrets/`, never a
-/// tracked file.
+/// The returned `chKey` is an **app-static, non-reversible fingerprint**: the same
+/// value for every install of this APK, derived one-way via HMAC from the appKey +
+/// cert hash. It does NOT reveal the appKey/appSecret/cert. It is therefore safe to
+/// cite in tracked RE notes (unlike `appSecret`/the raw cert hash, which stay in
+/// `secrets/`). The literal value also already appears in the committed
+/// `emulator_captures/` wire dumps.
 #[must_use]
 pub fn ch_key(app_key: &str, package_name: &str, cert_digest: &[u8; 32]) -> String {
     let cert_colon_upper = cert_sha256_colon_upper(cert_digest);
     let message = format!("{package_name}{KEY_PART_SEP}{cert_colon_upper}");
     let mac = hmac_sha256(app_key.as_bytes(), message.as_bytes());
     let hex = hex::encode(mac);
-    hex[8..24].to_string()
+    // CAPTURE-VERIFIED (2026-06-26): the wire chKey is hex[8..16] = 8 chars, NOT
+    // hex[8..24]/16. The genuine app's chKey in emulator_captures/cap1 token.get
+    // (`071d81fa`) is reproduced EXACTLY by HMAC-SHA256(appKey, pkg+"_"+certColonUpper)
+    // hex[8..16]. The earlier [8..24] static guess was a wrong-length value in a
+    // standalone client-binding param — the prime suspect for ILLEGAL_CLIENT_ID.
+    hex[8..16].to_string()
 }
 
 /// Native `SecureNativeApi.getEncryptoKey(requestId, ecode)` for ET=3 post bodies.
@@ -1542,7 +1553,7 @@ mod tests {
     }
 
     // chKey composition: with SYNTHETIC inputs, the recovered pipeline
-    // (HMAC-SHA256(key=appId, msg=packageName_"_"_certHex) → hex[8..24]) must
+    // (HMAC-SHA256(key=appId, msg=packageName_"_"_certHex) → hex[8..16]) must
     // equal an INDEPENDENT recomputation. This pins the key/message ordering and
     // native substring behavior recovered from getChKey@0x16000 (appId is the
     // HMAC KEY; packageName_cert is the MESSAGE).
@@ -1557,13 +1568,17 @@ mod tests {
         let cert = cert_sha256_colon_upper(&digest);
         let got = ch_key(app_key, pkg, &digest);
 
-        // INDEPENDENT: HMAC-SHA256(key=appId, msg=pkg + "_" + cert), hex[8..24].
+        // INDEPENDENT: HMAC-SHA256(key=appId, msg=pkg + "_" + cert), hex[8..16].
         let full = hex::encode(hmac_sha256(
             app_key.as_bytes(),
             format!("{pkg}_{cert}").as_bytes(),
         ));
-        assert_eq!(got, full[8..24]);
-        assert_eq!(got.len(), 16, "native getChKey returns hex_hmac[8..24]");
+        assert_eq!(got, full[8..16]);
+        assert_eq!(
+            got.len(),
+            8,
+            "wire getChKey returns hex_hmac[8..16] (capture-verified)"
+        );
         assert!(got
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));

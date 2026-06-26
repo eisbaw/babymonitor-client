@@ -7,7 +7,7 @@ status: To Do
 assignee:
   - '@architect'
 created_date: '2026-06-25 11:40'
-updated_date: '2026-06-26 02:04'
+updated_date: '2026-06-26 10:31'
 labels:
   - phase3
   - wave3
@@ -58,4 +58,6 @@ STATIC SURFACE EXHAUSTED (qa GO + static lead-hunt conclusive): corrected reques
 Reconciled at ship (2026-06-25): CONCLUDED, goal NOT achievable under static-only. The live token.get is blocked by a PROVEN sign-insensitive server-side identity gate (TASK-0050) before the gateway evaluates the sign, so the bmp_token candidate can NEVER be validated/refuted via this path. password.login never reached; 0 lockout calls. Not a success — recorded honestly in re/live_login.md. No further static action possible; supersede via a captured session (TASK-0022) if ever revisited.
 
 OUTCOME (2026-06-26): authorized one-time live probes fired with the CORRECTED signer (HMAC-SHA256/G 64-hex) + byte-faithful request. token.get returns ILLEGAL_CLIENT_ID; corrupt-sign differential identical -> sign-insensitive server-side identity gate. Device-list/signaling capture is BLOCKED by this gate (login never proceeds past token.get). The bmp_token candidate can be neither confirmed nor refuted because the server never reaches sign-verification. See re/live_login.md 2026-06-26. Not statically resolvable.
+
+BREAKTHROUGH 2026-06-26: token.get now SUCCEEDS (returns RSA pubkey + ticket {t,sign,result}) after the chKey length fix (TASK-0062). The bmp_token candidate is VALIDATED: re/scripts/validate_sign_against_capture.py grid-searched 1800 recipe combos against the genuine captured 64-hex sign and found exactly ONE match = our exact recipe, proving our signer is byte-perfect. The earlier server-side-gate conclusion is SUPERSEDED. Remaining for this task: capture device-list/signaling requires completing password.login (MFA) -> see new task.
 <!-- SECTION:NOTES:END -->

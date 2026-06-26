@@ -18,7 +18,40 @@ OUTCOME, never a value.
 
 ---
 
-## 2026-06-26 DEFINITIVE — corrected-signer live A/B proves a server-side identity gate
+## 2026-06-26 SOLVED — ILLEGAL_CLIENT_ID was a wrong `chKey` LENGTH (client bug) (confidence: confirmed)
+
+Evidence (≥2 independent): `emulator_captures/cap1/flows.json` (genuine wire chKey + sign);
+`re/scripts/validate_sign_against_capture.py` (1800-combo gold-vector match); `sign.rs::ch_key`
+(the fixed derivation) + the live success probe.
+
+`token.get` to `a1.tuyaeu.com` now returns the **success envelope** `{t,sign,result}` (RSA pubkey +
+login ticket). ICI is fixed. The "server-side identity gate" verdict below is **superseded** — it was
+a client bug all along, unmasked by the emulator capture (`../android_emulator_re` →
+`emulator_captures/cap1`).
+
+**Root cause:** `chKey` was the wrong length. Real (capture-verified): `chKey =
+hex(HMAC-SHA256(appKey, packageName+'_'+certColonUpper))[8..16]` = **8 chars** (e.g. `071d81fa`). Our
+static guess sliced `[8..24]` = 16 chars. The atop gateway validates this standalone client-binding
+param and rejected the 16-char value with `ILLEGAL_CLIENT_ID` *before* sign-verification. Fix:
+`sign.rs::ch_key` `hex[8..24]` → `hex[8..16]`.
+
+**Why the earlier A/B mislead us:** the corrupt-sign differential held the WRONG 16-char chKey
+constant in both arms, so the gateway rejected on the malformed chKey before reaching the sign →
+identical ICI in both arms. It looked "sign-insensitive" but was chKey-insensitive-to-the-sign.
+
+**How it was cracked (gold vector):** `re/scripts/validate_sign_against_capture.py` grid-searched 1800
+combinations against the genuine captured 64-hex `sign`; exactly ONE matched, and it was our exact
+recipe (`hmac(G,str2)`, `G=pkg_cert_mk_sec`, cert `colon_upper`, matrixKey0 `raw32`,
+postData `swap(md5hex)`). That PROVED our signer is byte-perfect and validated the `bmp_token`
+candidate; the same genuine params exposed the 8-vs-16 `chKey` divergence. `just e2e` + live tests
+green after the fix.
+
+**Next:** `password.login` (RSA-encrypt the password under the token.get pubkey + MFA) to reach
+session → device.list → stream signaling.
+
+---
+
+## 2026-06-26 DEFINITIVE — corrected-signer live A/B proves a server-side identity gate (SUPERSEDED above)
 
 After 4 native-decompile rounds we found and fixed the real root-cause bug: our Rust
 client had ported the WRONG native function for the request sign (`computeDigest`,

@@ -456,7 +456,8 @@ fn load_config(secrets_dir: &Path, apk_path: &Path) -> Result<LiveConfig, LiveEr
     // it and keep NO on-disk copy: the former secrets/chkey.txt cache was redundant
     // state and a second source of truth (architect Finding 4), and its write
     // silently swallowed errors. `ch_key` formats the raw cert digest to the
-    // colon-upper 95-hex form internally. The value is secret-by-policy, never logged.
+    // colon-upper 95-hex form internally. chKey is an app-static, one-way fingerprint
+    // (same for every install; reveals no secret) — capture-verified 8 chars, hex[8..16].
     let ch_key_value = ch_key(
         &material.app_key,
         APP_PACKAGE_NAME,

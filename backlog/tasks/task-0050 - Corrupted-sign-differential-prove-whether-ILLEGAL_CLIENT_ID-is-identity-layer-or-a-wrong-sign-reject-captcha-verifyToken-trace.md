@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-06-25 15:10'
-updated_date: '2026-06-26 02:04'
+updated_date: '2026-06-26 10:31'
 labels:
   - phase3
   - wave3
@@ -61,6 +61,8 @@ GATES: just e2e + just secret-scan + just check-evidence green; cargo clippy --f
 
 <!-- SECTION:NOTES:BEGIN -->
 CLEAN RE-RUN (2026-06-26): the original differential was wrong-vs-wrong (malformed 32-hex sign). Re-fired with the corrected valid 64-hex HMAC-SHA256(G,str2) signer: valid-sign and corrupted-valid-sign both return identical ILLEGAL_CLIENT_ID. Sign-insensitivity now PROVEN cleanly. ICI is an identity/provisioning gate upstream of sign-verify, not a sign-class reject.
+
+SUPERSEDED: the sign-insensitive reading was an artifact of the wrong 16-char chKey held constant in both arms (server rejected on malformed chKey before sign-verify). ICI was chKey-length, not sign. See TASK-0062.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

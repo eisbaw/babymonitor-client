@@ -4,7 +4,7 @@ title: 'Correct RE docs to match the HMAC-SHA256(G,str2) signer ground truth'
 status: To Do
 assignee: []
 created_date: '2026-06-26 00:56'
-updated_date: '2026-06-26 01:21'
+updated_date: '2026-06-26 10:48'
 labels:
   - auth
   - docs
@@ -30,4 +30,6 @@ TASK-0060/0061 corrected the signer in code + re/master_secret_g.md, but several
 
 <!-- SECTION:NOTES:BEGIN -->
 Also stale after Fix-4: re/chkey_static.md:194-195 and task-0044 still describe a removed operator-pin chKey override (secrets/chkey.txt) — chKey is now always derived. Correct these doc refs.
+
+Also: re/chkey_static.md documents chKey as hex[8..24]/16-char throughout (lines ~24,37,77-81,190) — now WRONG. Capture-verified chKey is hex[8..16]/8 chars. Mark superseded + correct to [8..16].
 <!-- SECTION:NOTES:END -->

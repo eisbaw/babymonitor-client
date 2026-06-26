@@ -164,7 +164,10 @@ impl SessionStore {
         }
         let json = serde_json::to_vec_pretty(session)
             .map_err(|e| Error::SessionStore(format!("serialize session: {e}")))?;
-        std::fs::write(&self.path, json)
+        // sid/uid/ecode are SECRETS — persist the file with owner-only (0600)
+        // permissions on Unix so they are never group/world-readable at the default
+        // umask. A plain `std::fs::write` would leave it at e.g. 0644.
+        write_private(&self.path, &json)
             .map_err(|e| Error::SessionStore(format!("write {}: {e}", self.path.display())))
     }
 
@@ -181,6 +184,46 @@ impl SessionStore {
                 self.path.display()
             ))),
         }
+    }
+}
+
+/// Write `bytes` to `path` (truncating) with owner-only (`0600`) permissions on
+/// Unix so the secret `sid`/`uid`/`ecode` are never group/world-readable.
+///
+/// On Unix the file is created with mode `0600` via `OpenOptions` (the mode is
+/// applied atomically at create time, so a fresh file is never briefly readable at
+/// the process umask) and the mode is re-asserted afterwards so an EXISTING file —
+/// created before this hardening or by another tool — is also tightened (the
+/// `OpenOptions` mode only takes effect when the file is newly created). On
+/// non-Unix targets it falls back to a plain truncating write.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.flush()?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.flush()?;
+        Ok(())
     }
 }
 
@@ -271,6 +314,37 @@ mod tests {
         std::fs::create_dir_all(store.path().parent().unwrap()).unwrap();
         std::fs::write(store.path(), b"{ this is not valid json").unwrap();
         assert!(matches!(store.load(), Err(Error::SessionStore(_))));
+    }
+
+    // The persisted session holds SECRET sid/uid/ecode → its file MUST be 0600
+    // (owner-only), never group/world-readable at the default umask.
+    #[cfg(unix)]
+    #[test]
+    fn saved_session_file_is_owner_only_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (store, _g) = temp_store();
+        store.save(&synth_session(Utc::now(), 60)).unwrap();
+        let mode = std::fs::metadata(store.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "session file must be 0600; got {mode:o}"
+        );
+
+        // Re-saving over an existing (possibly wider-perm) file must keep it 0600.
+        store.save(&synth_session(Utc::now(), 30)).unwrap();
+        let mode2 = std::fs::metadata(store.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode2 & 0o777,
+            0o600,
+            "re-save must stay 0600; got {mode2:o}"
+        );
     }
 
     #[test]

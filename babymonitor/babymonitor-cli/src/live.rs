@@ -8,17 +8,28 @@
 //! device-list — strictly READ-ONLY.
 //!
 //! # Hard guardrails (mirrored from the task; violating any is failure)
-//! - **READ-ONLY:** only `token.get`, `password.login`, device-list fetch. NEVER
-//!   a write/control/unbind/pairing API.
-//! - **password.login AT MOST ONCE:** if it fails we STOP and report — no retry,
-//!   no fold/region sweep against the account.
-//! - **2FA:** on the emailed-code challenge we STOP, capture the challenge state
-//!   to `secrets/tuya_2fa_state.json`, and return [`LiveOutcome::Needs2fa`]. We
-//!   NEVER guess a code.
-//! - **Secrets:** creds are read from `secrets/` and every captured value
-//!   (session/uid/device-list/2FA state) is written ONLY under `secrets/`
-//!   (gitignored). No secret value is ever logged, printed, or returned in a
-//!   human-facing message.
+//! - **READ-ONLY:** only `token.get`, `password.login`, the MFA handshake
+//!   (`graphic.verification.code.get` + `mfa.code.get`), and the device-list fetch.
+//!   NEVER a write/control/unbind/pairing API.
+//! - **No blind retry / no sweep:** a hard credential or sign failure STOPS
+//!   immediately — no fold/region sweep against the account. Each invocation sends
+//!   EXACTLY ONE `password.login`; the MFA-code SUBMISSION is the SAME single call,
+//!   carrying the operator's code (on the second run) — never a re-guess of a
+//!   rejected credential. `mfa.code.get` fires at most once per invocation, ONLY
+//!   when the server returns `MFA_NEED_SEND_CODE`.
+//! - **MFA (NEVER guess a code) — finite TWO-RUN model (TASK-0065 BLOCKER-1):** we
+//!   read the operator's code from `twofa_code_file` FIRST, then do
+//!   `token.get` → `password.login(mfaCode = code.unwrap_or(""))`. On
+//!   `MFA_NEED_SEND_CODE` we email the code EXACTLY ONCE (captcha pre-check → FRESH
+//!   `token.get` → `mfa.code.get`) and STOP with [`LiveOutcome::Needs2fa`] + an
+//!   instruction (never hang, never fabricate a code). A re-run that already carries
+//!   the code goes straight to `password.login(code)` and does NOT re-send
+//!   `mfa.code.get`, so a pasted code is never invalidated. The live run is the owner's.
+//! - **Secrets:** creds are read from `secrets/` and captured values
+//!   (session/uid/device-list/MFA state) are written under `secrets/` (gitignored);
+//!   the structured session is persisted to the gitignored XDG [`SessionStore`]
+//!   (sid/uid/ecode redacted in its `Debug`). No secret value is ever logged,
+//!   printed, or returned in a human-facing message.
 //!
 //! # What "validated" means (the gold differential)
 //! The lockout-sensitive step is `password.login`. `token.get` is a pre-login
@@ -34,7 +45,7 @@ use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes128Gcm, Nonce};
-use babymonitor_core::session::SessionStore;
+use babymonitor_core::session::{Session, SessionStore};
 use babymonitor_core::sign::{
     app_cert_sha256_digest_from_apk, assemble_master_key_g, ch_key, et3_encrypto_key,
     generate_phone_util_device_id, post_data_digest_hex, Signer, SigningKeyMaterial,
@@ -165,9 +176,27 @@ const TOKEN_GET_ACTION: &str = "thing.m.user.username.token.get";
 const TOKEN_GET_VERSION: &str = "2.0";
 
 /// password.login action + version (`re/tuya_cloud_auth.md` §2 step 2, email
-/// path). Version is a build constant; `4.0` is the documented mobile value.
+/// path). CAPTURE-VERIFIED (TASK-0065, emulator_captures/cap1): the genuine app
+/// sends **v3.0**, NOT the earlier `4.0` guess. The wire `a` is the
+/// `thing.*`→`smartlife.*`-rewritten `smartlife.m.user.email.password.login`.
 const PASSWORD_LOGIN_ACTION: &str = "thing.m.user.email.password.login";
-const PASSWORD_LOGIN_VERSION: &str = "4.0";
+const PASSWORD_LOGIN_VERSION: &str = "3.0";
+
+/// graphic-captcha pre-check, sent once after the first `password.login` returns
+/// `MFA_NEED_SEND_CODE` and BEFORE the MFA code is requested (TASK-0065,
+/// emulator_captures/cap1). This action has NO `postData` on the wire — it carries
+/// only the signed envelope form params. Its wire `a` has NO `thing`/`smartlife`
+/// prefix, so it passes through [`rewrite_action`] unchanged.
+const GRAPHIC_VERIFICATION_CODE_GET_ACTION: &str =
+    "m.life.app.property.graphic.verification.code.get";
+const GRAPHIC_VERIFICATION_CODE_GET_VERSION: &str = "1.0";
+
+/// mfa-code email trigger (TASK-0065, emulator_captures/cap1). Wire `a` rewrites
+/// `thing.*`→`smartlife.*` to `smartlife.m.user.username.mfa.code.get`. postData
+/// carries `countryCode`, `ifencrypt`, `options` (mfaCode `"null"`), `passwd`
+/// (RSA under a FRESH token.get pubkey), `token` (that fresh ticket), `username`.
+const MFA_CODE_GET_ACTION: &str = "thing.m.user.username.mfa.code.get";
+const MFA_CODE_GET_VERSION: &str = "1.0";
 
 /// device-list (home-detail) action + version. CONFIDENCE: `likely` — the exact
 /// `a=` value is R8-obfuscated to `thing.m.n` in `com/thingclips/sdk/home/*`
@@ -190,6 +219,14 @@ const DEVICE_LIST_VERSION: &str = "1.0";
 struct LoginCreds {
     email: String,
     password: String,
+    /// Path to the file the account owner writes the emailed MFA code into. The
+    /// interactive MFA step reads the 6-digit code from here (the live run is the
+    /// owner's: the CLI emails the code, the owner pastes it into this file and
+    /// re-runs). Relative paths resolve from the process CWD (the repo root). NOT
+    /// a secret itself (it is a path), but the code it points at is — so the file
+    /// lives under `secrets/` (gitignored) and its contents are never logged.
+    #[serde(default)]
+    twofa_code_file: Option<String>,
 }
 
 /// App key material read from `secrets/tuya_appkey.json`. The cert hash is NOT in
@@ -595,12 +632,91 @@ fn build_signed_envelope_with(
     let now_s = chrono::Utc::now().timestamp();
     let request_id = new_request_id();
 
+    let envelope = assemble_envelope_params(cfg, &wire_action, version, &request_id, now_s, extra);
+
+    // Java default path: signWhitEncryptedBody=true and et=3, so `postData` is
+    // AES-GCM encrypted with a random 12-byte nonce, base64(nonce||ciphertext||tag),
+    // then that encrypted string is what enters both the form body and the sign
+    // digest. See ThingApiParams.getPostBody/getEncryptPostDataString.
+    let wire_post_data = encrypt_et3_post_data(cfg, &request_id, post_data, ecode)?;
+
+    // Build the SIGN input map: a copy of the params with `postData` inserted as
+    // the digest of the encrypted wire value (Tuya digests postData before sorting).
+    let mut sign_params = envelope.clone();
+    let pd_digest = post_data_digest_hex(wire_post_data.as_bytes())
+        .map_err(|e| LiveError::Crypto(format!("{e}")))?;
+    sign_params.insert("postData".into(), pd_digest);
+
+    let sign = sign_envelope(cfg, &sign_params)?;
+
+    // The final POST form body carries encrypted `postData` plus all params below.
+    let mut envelope = envelope;
+    envelope.insert("sign".into(), sign);
+    Ok((envelope, wire_post_data))
+}
+
+/// Build a signed atop envelope for an action that sends **NO `postData`** on the
+/// wire (the graphic-captcha pre-check, `re/`-cap1 step 3). The genuine app emits
+/// only the envelope form params + `sign` — there is no `postData` form field and
+/// therefore no `postData` digest in the canonical sign string ([`canonical_string`]
+/// simply omits an absent whitelist key). PURE; no network.
+fn build_signed_envelope_no_post_data(
+    cfg: &LiveConfig,
+    action: &str,
+    version: &str,
+) -> Result<BTreeMap<String, String>, LiveError> {
+    let wire_action = rewrite_action(action);
+    let now_s = chrono::Utc::now().timestamp();
+    let request_id = new_request_id();
+
+    let mut envelope = assemble_envelope_params(
+        cfg,
+        &wire_action,
+        version,
+        &request_id,
+        now_s,
+        &BTreeMap::new(),
+    );
+
+    // NO postData → sign over the envelope params as-is (no postData digest).
+    let sign = sign_envelope(cfg, &envelope)?;
+    envelope.insert("sign".into(), sign);
+    Ok(envelope)
+}
+
+/// Compute the request `sign` (`HMAC-SHA256(G, str2)` → 64-hex) over a fully-built
+/// sign-param map. Centralised so the with-/without-postData builders sign through
+/// the identical signer construction.
+fn sign_envelope(
+    cfg: &LiveConfig,
+    sign_params: &BTreeMap<String, String>,
+) -> Result<String, LiveError> {
+    let signer = Signer::new(
+        cfg.material.clone(),
+        StaticBmpToken::new(cfg.bmp_token.clone()),
+    );
+    signer
+        .sign(sign_params)
+        .map_err(|e| LiveError::Crypto(format!("sign failed: {e}")))
+}
+
+/// Assemble the common atop envelope form params (everything EXCEPT `postData` and
+/// `sign`) for one action. Shared by the with-/without-postData builders so the SDK
+/// envelope shape is identical regardless of whether the action carries a body.
+fn assemble_envelope_params(
+    cfg: &LiveConfig,
+    wire_action: &str,
+    version: &str,
+    request_id: &str,
+    now_s: i64,
+    extra: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
     // Params that ride in the POST form body (sid empty pre-login → dropped).
     let mut envelope: BTreeMap<String, String> = BTreeMap::new();
-    envelope.insert("a".into(), wire_action.clone());
+    envelope.insert("a".into(), wire_action.to_string());
     envelope.insert("v".into(), version.into());
     envelope.insert("time".into(), now_s.to_string());
-    envelope.insert("requestId".into(), request_id.clone());
+    envelope.insert("requestId".into(), request_id.to_string());
     envelope.insert("et".into(), ET_VERSION.into());
     envelope.insert("lang".into(), LANG.into());
     envelope.insert("os".into(), OS_ANDROID.into());
@@ -651,30 +767,7 @@ fn build_signed_envelope_with(
         envelope.insert(k.clone(), v.clone());
     }
 
-    // Java default path: signWhitEncryptedBody=true and et=3, so `postData` is
-    // AES-GCM encrypted with a random 12-byte nonce, base64(nonce||ciphertext||tag),
-    // then that encrypted string is what enters both the form body and the sign
-    // digest. See ThingApiParams.getPostBody/getEncryptPostDataString.
-    let wire_post_data = encrypt_et3_post_data(cfg, &request_id, post_data, ecode)?;
-
-    // Build the SIGN input map: a copy of the params with `postData` inserted as
-    // the digest of the encrypted wire value (Tuya digests postData before sorting).
-    let mut sign_params = envelope.clone();
-    let pd_digest = post_data_digest_hex(wire_post_data.as_bytes())
-        .map_err(|e| LiveError::Crypto(format!("{e}")))?;
-    sign_params.insert("postData".into(), pd_digest);
-
-    let signer = Signer::new(
-        cfg.material.clone(),
-        StaticBmpToken::new(cfg.bmp_token.clone()),
-    );
-    let sign = signer
-        .sign(&sign_params)
-        .map_err(|e| LiveError::Crypto(format!("sign failed: {e}")))?;
-
-    // The final POST form body carries encrypted `postData` plus all params below.
-    envelope.insert("sign".into(), sign);
-    Ok((envelope, wire_post_data))
+    envelope
 }
 
 /// Assemble the native master key **G** for this config — the HMAC key for both
@@ -723,6 +816,52 @@ fn encrypt_et3_post_data_with_nonce(
     out.extend_from_slice(nonce);
     out.extend_from_slice(&ciphertext_and_tag);
     Ok(base64::engine::general_purpose::STANDARD.encode(out))
+}
+
+/// Decrypt an ET=3 atop **response** `result` blob to its inner JSON envelope.
+///
+/// CAPTURE-VERIFIED (TASK-0065, emulator_captures/cap1): a server-accepted atop
+/// response is `{ "result": "<base64(nonce||ct||tag)>", "sign", "t" }` with NO
+/// top-level `success`/`errorCode` — the WHOLE business envelope (`{result, success,
+/// errorCode, errorMsg, status, t}`) is ET=3-encrypted under the SAME per-request
+/// key as the request `postData`: `et3_encrypto_key(requestId, G [, ecode])` (the
+/// scheme is symmetric — `re/scripts/decrypt_capture_login.py` decrypts every
+/// captured response with this exact key). Login calls set `setSessionRequire(false)`
+/// so `ecode` is `None`; session-required reads (device.list) pass the session ecode.
+///
+/// Returns the decrypted inner envelope as a [`serde_json::Value`]. No plaintext
+/// (which may carry sid/uid/PII) is ever logged.
+fn decrypt_et3_result(
+    cfg: &LiveConfig,
+    request_id: &str,
+    result_b64: &str,
+    ecode: Option<&str>,
+) -> Result<serde_json::Value, LiveError> {
+    let g = master_key_g(cfg)?;
+    let key = et3_encrypto_key(request_id, &g, ecode);
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(result_b64)
+        .map_err(|e| LiveError::Protocol(format!("response result is not base64: {e}")))?;
+    if raw.len() < 12 + 16 {
+        return Err(LiveError::Protocol(
+            "response result too short for nonce(12)+tag(16)".into(),
+        ));
+    }
+    let (nonce, ct_and_tag) = raw.split_at(12);
+    let cipher = Aes128Gcm::new_from_slice(&key)
+        .map_err(|e| LiveError::Crypto(format!("AES-GCM key init: {e:?}")))?;
+    let mut buf = ct_and_tag.to_vec();
+    cipher
+        .decrypt_in_place(Nonce::from_slice(nonce), b"", &mut buf)
+        .map_err(|_| {
+            // A GCM tag mismatch usually means the per-request key (G/ecode) is
+            // wrong — surface it without leaking any plaintext/secret.
+            LiveError::Protocol(
+                "response result GCM auth failed (wrong et3 key / corrupt blob)".into(),
+            )
+        })?;
+    serde_json::from_slice(&buf)
+        .map_err(|e| LiveError::Protocol(format!("decrypted response is not JSON: {e}")))
 }
 
 /// Build the wire `ttid` value the app actually sends. RESOLVED statically
@@ -825,7 +964,8 @@ fn send_atop(
     host: &str,
     cfg: &LiveConfig,
     params: &BTreeMap<String, String>,
-    wire_post_data: &str,
+    wire_post_data: Option<&str>,
+    ecode: Option<&str>,
 ) -> Result<AtopResponse, LiveError> {
     let url = format!("https://{host}{ATOP_PATH}");
 
@@ -864,7 +1004,10 @@ fn send_atop(
     // This is the single source of truth for debugging a routing/sign rejection
     // without ever echoing a value. Overwritten each call (last-call wins).
     {
-        let mut form_param_keys = vec!["postData".to_string()];
+        let mut form_param_keys = Vec::new();
+        if wire_post_data.is_some() {
+            form_param_keys.push("postData".to_string());
+        }
         form_param_keys.extend(params.keys().cloned());
         let dbg = serde_json::json!({
             "host": host,
@@ -879,24 +1022,44 @@ fn send_atop(
         }
     }
 
-    let raw: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+    let outer: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
         // Do NOT echo the body (could contain account data); report status only.
         LiveError::Protocol(format!("non-JSON atop response (HTTP {status}): {e}"))
     })?;
 
-    let success = raw
+    // ET=3 response envelope: a server-ACCEPTED response is
+    // `{ "result": "<base64 enc>", "sign", "t" }` with NO top-level
+    // `success`/`errorCode` — the whole business envelope is encrypted under the
+    // per-request et3 key (CAPTURE-VERIFIED, TASK-0065; see `decrypt_et3_result`).
+    // A gateway-level rejection (e.g. ILLEGAL_CLIENT_ID, before the client's key is
+    // known) may instead come back as a PLAINTEXT envelope carrying top-level
+    // `success`/`errorCode`. Branch on the shape: decrypt only the encrypted form.
+    let envelope = if outer.get("success").is_some() || outer.get("errorCode").is_some() {
+        // Plaintext business envelope — use as-is (no decryption needed/possible).
+        outer.clone()
+    } else if let Some(enc) = outer.get("result").and_then(|v| v.as_str()) {
+        let request_id = params.get("requestId").ok_or_else(|| {
+            LiveError::Protocol("cannot decrypt response: request has no requestId".into())
+        })?;
+        decrypt_et3_result(cfg, request_id, enc, ecode)?
+    } else {
+        // No encrypted result and no plaintext markers — surface the outer as-is.
+        outer.clone()
+    };
+
+    let success = envelope
         .get("success")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let error_code = raw
+    let error_code = envelope
         .get("errorCode")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let error_msg = raw
+    let error_msg = envelope
         .get("errorMsg")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let result = raw
+    let result = envelope
         .get("result")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
@@ -906,13 +1069,20 @@ fn send_atop(
         error_code,
         error_msg,
         result,
-        raw,
+        // `raw` carries the DECRYPTED business envelope (never the encrypted blob)
+        // so downstream capture/inspection sees the real payload. It may hold
+        // sid/uid/PII → it is only ever written to gitignored secrets/, never logged.
+        raw: envelope,
     })
 }
 
-fn form_body(params: &BTreeMap<String, String>, wire_post_data: &str) -> String {
+fn form_body(params: &BTreeMap<String, String>, wire_post_data: Option<&str>) -> String {
     let mut pairs = Vec::with_capacity(params.len() + 1);
-    pairs.push(format!("postData={}", urlencode(wire_post_data)));
+    // The graphic-captcha pre-check sends NO postData form field at all
+    // (CAPTURE-VERIFIED); every other login action carries the encrypted postData.
+    if let Some(pd) = wire_post_data {
+        pairs.push(format!("postData={}", urlencode(pd)));
+    }
     for (k, v) in params {
         pairs.push(format!("{}={}", urlencode(k), urlencode(v)));
     }
@@ -1019,6 +1189,73 @@ fn classify_error(resp: &AtopResponse) -> LiveError {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// postData builders (PURE — testable offline against the cap1 spec)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build the `options` postData field EXACTLY as the genuine app emits it
+/// (CAPTURE-VERIFIED, emulator_captures/cap1): `{"group": 1,"mfaCode": "<code>"}`
+/// — a space after each `:` colon, NO space after the `,` comma, no spaces at the
+/// braces. `serde_json` would drop the colon spaces, so the bytes are formatted by
+/// hand to stay byte-faithful to the capture. The MFA code rides as a JSON string:
+/// `""` on the first login, the literal `"null"` on `mfa.code.get`, and the 6-digit
+/// code on the final login. MFA codes are numeric (or the fixed `""`/`null`), so no
+/// JSON escaping of `code` is required.
+fn build_login_options(mfa_code: &str) -> String {
+    format!("{{\"group\": 1,\"mfaCode\": \"{mfa_code}\"}}")
+}
+
+/// token.get postData (`re/`-cap1 step 1): `{countryCode, isUid:false, username}`.
+fn token_get_post_data(country_code: &str, username: &str) -> String {
+    serde_json::json!({
+        "countryCode": country_code,
+        "username": username,
+        "isUid": false,
+    })
+    .to_string()
+}
+
+/// password.login postData (cap1 steps 2/8): `{countryCode, email, ifencrypt:1,
+/// options, passwd:RSA-hex, token}`. `options` carries the MFA code (empty on the
+/// first attempt, the real code on the final attempt).
+fn password_login_post_data(
+    country_code: &str,
+    email: &str,
+    passwd_hex: &str,
+    token: &str,
+    mfa_code: &str,
+) -> String {
+    serde_json::json!({
+        "countryCode": country_code,
+        "email": email,
+        "passwd": passwd_hex,
+        "token": token,
+        "ifencrypt": 1,
+        "options": build_login_options(mfa_code),
+    })
+    .to_string()
+}
+
+/// mfa.code.get postData (cap1 step 5): `{countryCode, ifencrypt:1, options
+/// (mfaCode "null"), passwd:RSA-hex, token, username}`. Like password.login but
+/// keyed on `username` (not `email`) and with the literal `"null"` MFA code.
+fn mfa_code_get_post_data(
+    country_code: &str,
+    username: &str,
+    passwd_hex: &str,
+    token: &str,
+) -> String {
+    serde_json::json!({
+        "countryCode": country_code,
+        "username": username,
+        "passwd": passwd_hex,
+        "token": token,
+        "ifencrypt": 1,
+        "options": build_login_options("null"),
+    })
+    .to_string()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Step 1: token.get  (the SIGN ORACLE)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1037,16 +1274,11 @@ fn do_token_get(
     cfg: &LiveConfig,
 ) -> Result<TokenBean, LiveError> {
     // postData: countryCode + username(email) + isUid=false (§2 step 1).
-    let post_data = serde_json::json!({
-        "countryCode": COUNTRY_CODE_DK,
-        "username": cfg.creds.email,
-        "isUid": false,
-    })
-    .to_string();
+    let post_data = token_get_post_data(COUNTRY_CODE_DK, &cfg.creds.email);
 
     let (envelope, body) =
         build_signed_envelope(cfg, TOKEN_GET_ACTION, TOKEN_GET_VERSION, &post_data)?;
-    let resp = send_atop(client, host, cfg, &envelope, &body)?;
+    let resp = send_atop(client, host, cfg, &envelope, Some(&body), None)?;
 
     if !resp.success {
         return Err(classify_error(&resp));
@@ -1131,35 +1363,39 @@ fn parse_biguint(s: &str) -> Option<BigUint> {
     }
 }
 
-/// The classification of a password.login response.
+/// The classification of a `password.login` response (CAPTURE-VERIFIED flow).
 enum LoginResult {
-    /// 2FA email-code challenge: STOP. Carries the raw result so the challenge
-    /// state (session/ticket needed to submit the code) can be captured.
-    Needs2fa(serde_json::Value),
+    /// First attempt (`mfaCode:""`): the server demands the email code be sent.
+    /// errorCode `MFA_NEED_SEND_CODE`. The caller must run the captcha pre-check +
+    /// `mfa.code.get` to trigger the email, then resubmit with the real code.
+    NeedSendCode,
     /// Login succeeded: carries the `User` (sid/uid/domain) result object.
     Success(serde_json::Value),
 }
 
-/// Send THE ONE `password.login`. Per the guardrail this is attempted exactly
-/// once; any failure STOPS (the caller does not retry).
+/// Send one `password.login` with the supplied `mfa_code` (empty on the first
+/// attempt, the emailed 6-digit code on the final attempt). The `token` MUST be a
+/// FRESH `token.get` result — the `passwd` is RSA-encrypted under THAT pubkey and
+/// the postData carries THAT ticket. A `MFA_NEED_SEND_CODE` reply is the documented
+/// "send the code" signal, NOT a credential failure; any OTHER non-success reply
+/// (wrong password/sign/etc.) is surfaced as a typed error (the caller does not
+/// blind-retry).
 fn do_password_login(
     client: &reqwest::blocking::Client,
     host: &str,
     cfg: &LiveConfig,
     token: &TokenBean,
+    mfa_code: &str,
 ) -> Result<LoginResult, LiveError> {
     let enc_password = rsa_encrypt_password(token, &cfg.creds.password)?;
 
-    // postData: countryCode, email, passwd(RSA-enc hex), token(ticket),
-    // ifencrypt=1 (§2 step 2, email path).
-    let post_data = serde_json::json!({
-        "countryCode": COUNTRY_CODE_DK,
-        "email": cfg.creds.email,
-        "passwd": enc_password,
-        "token": token.token,
-        "ifencrypt": 1,
-    })
-    .to_string();
+    let post_data = password_login_post_data(
+        COUNTRY_CODE_DK,
+        &cfg.creds.email,
+        &enc_password,
+        &token.token,
+        mfa_code,
+    );
 
     let (envelope, body) = build_signed_envelope(
         cfg,
@@ -1167,63 +1403,142 @@ fn do_password_login(
         PASSWORD_LOGIN_VERSION,
         &post_data,
     )?;
-    let resp = send_atop(client, host, cfg, &envelope, &body)?;
+    let resp = send_atop(client, host, cfg, &envelope, Some(&body), None)?;
 
     if !resp.success {
-        // Detect a 2FA challenge: Tuya signals MFA/2-step via a specific error
-        // code/flag carrying a challenge ticket rather than a hard failure.
-        if is_2fa_challenge(&resp) {
-            return Ok(LoginResult::Needs2fa(resp.raw.clone()));
+        // The first login (empty code) is EXPECTED to fail with MFA_NEED_SEND_CODE
+        // — that is the trigger to request the emailed code, not an error.
+        if is_need_send_code(&resp) {
+            return Ok(LoginResult::NeedSendCode);
         }
         return Err(classify_error(&resp));
-    }
-
-    // Some deployments return success=true but with an MFA/next-step marker in
-    // the result rather than a full User; treat that as a 2FA challenge too.
-    if result_indicates_2fa(&resp.result) {
-        return Ok(LoginResult::Needs2fa(resp.raw.clone()));
     }
 
     Ok(LoginResult::Success(resp.result.clone()))
 }
 
-/// Whether a non-success response is a 2FA/MFA challenge (not a hard error).
-fn is_2fa_challenge(resp: &AtopResponse) -> bool {
+/// Whether a non-success `password.login` reply is the `MFA_NEED_SEND_CODE` signal
+/// (CAPTURE-VERIFIED errorCode, emulator_captures/cap1) — i.e. "trigger the emailed
+/// code", not a hard failure.
+///
+/// Matched EXACTLY (case-insensitively for robustness against a spelling that only
+/// differs in case). We deliberately do NOT match speculative variants
+/// (`NEED_MFA`, `USER_NEED_MFA`, a generic `*NEED_SEND_CODE*`): those were never
+/// observed on the wire, and a loose substring match risks misrouting a genuine
+/// FINAL-login error into the code-resend path (re-emailing a code instead of
+/// surfacing the real failure). `MFA_NEED_SEND_CODE` is the only verified code; if a
+/// future capture proves another, add it here EXPLICITLY (no fuzzy matching).
+fn is_need_send_code(resp: &AtopResponse) -> bool {
     let code = resp
         .error_code
         .clone()
         .unwrap_or_default()
-        .to_ascii_lowercase();
-    let msg = resp
-        .error_msg
-        .clone()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    code.contains("mfa")
-        || code.contains("2step")
-        || code.contains("two_step")
-        || code.contains("verify")
-        || msg.contains("verification code")
-        || msg.contains("two-step")
-        || msg.contains("2-step")
-        || msg.contains("mfa")
-        // Tuya's known code for "needs email/SMS verification" on login.
-        || code == "user_need_mfa"
-        || code == "need_mfa"
+        .to_ascii_uppercase();
+    code == "MFA_NEED_SEND_CODE"
 }
 
-/// Whether a success result body itself indicates a pending 2FA step.
-fn result_indicates_2fa(result: &serde_json::Value) -> bool {
-    // A challenge carries a ticket/session but no sid/uid yet.
-    let has_session = result.get("sid").and_then(|v| v.as_str()).is_some();
-    let mfa_marker = result.get("mfaToken").is_some()
-        || result
-            .get("needMfa")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        || result.get("flowId").is_some()
-        || result.get("nextStep").is_some();
-    mfa_marker && !has_session
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 3: graphic-captcha pre-check (NO postData)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Send the graphic-captcha pre-check (cap1 step 3). It carries NO `postData` —
+/// only the signed envelope form params. Returns the parsed response; the genuine
+/// reply is `{state:0}` (success). We do not gate the flow on its `state` value (it
+/// is an informational pre-check); a transport/parse failure still propagates.
+fn do_graphic_verification_code_get(
+    client: &reqwest::blocking::Client,
+    host: &str,
+    cfg: &LiveConfig,
+) -> Result<(), LiveError> {
+    let envelope = build_signed_envelope_no_post_data(
+        cfg,
+        GRAPHIC_VERIFICATION_CODE_GET_ACTION,
+        GRAPHIC_VERIFICATION_CODE_GET_VERSION,
+    )?;
+    // No postData form field, no ecode (setSessionRequire(false)).
+    let _resp = send_atop(client, host, cfg, &envelope, None, None)?;
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 5: mfa.code.get — trigger the emailed MFA code
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Send `mfa.code.get` (cap1 step 5) to make the server email the MFA code. Needs a
+/// FRESH `token.get` (the `passwd` is RSA-encrypted under THAT pubkey + uses THAT
+/// ticket). On success the server emails the code to the account owner.
+fn do_mfa_code_get(
+    client: &reqwest::blocking::Client,
+    host: &str,
+    cfg: &LiveConfig,
+    token: &TokenBean,
+) -> Result<serde_json::Value, LiveError> {
+    let enc_password = rsa_encrypt_password(token, &cfg.creds.password)?;
+    let post_data = mfa_code_get_post_data(
+        COUNTRY_CODE_DK,
+        &cfg.creds.email,
+        &enc_password,
+        &token.token,
+    );
+    let (envelope, body) =
+        build_signed_envelope(cfg, MFA_CODE_GET_ACTION, MFA_CODE_GET_VERSION, &post_data)?;
+    let resp = send_atop(client, host, cfg, &envelope, Some(&body), None)?;
+    if !resp.success {
+        return Err(classify_error(&resp));
+    }
+    Ok(resp.raw.clone())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MFA code input (read from the owner-written file; never fabricated)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolve the emailed MFA code from the owner-written file
+/// (`secrets/tuya_login.json` → `twofa_code_file`). Returns:
+/// - `Ok(Some(code))` when the file exists and holds a non-empty (trimmed) code;
+/// - `Ok(None)` when the file is missing/empty — the caller STOPS with a clear
+///   instruction (it does NOT hang and NEVER fabricates a code).
+///
+/// The code value is a secret-by-policy account credential: it is never logged.
+fn read_mfa_code(cfg: &LiveConfig) -> Result<Option<String>, LiveError> {
+    let Some(rel) = cfg
+        .creds
+        .twofa_code_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Err(LiveError::Config(
+            "secrets/tuya_login.json has no \"twofa_code_file\"; set it to a path \
+             (e.g. \"secrets/tuya_2fa.txt\") the owner writes the emailed code into."
+                .into(),
+        ));
+    };
+    let path = PathBuf::from(rel);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => {
+            let code = s.trim().to_string();
+            if code.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(code))
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(LiveError::Config(format!(
+            "read MFA code file {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// The path to the MFA-code file, for the operator-facing "put the code here"
+/// instruction. NOT a secret (a path); returns a placeholder if unset.
+fn mfa_code_file_hint(cfg: &LiveConfig) -> String {
+    cfg.creds
+        .twofa_code_file
+        .clone()
+        .unwrap_or_else(|| "secrets/tuya_2fa.txt".to_string())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1348,7 +1663,7 @@ pub fn run_token_get_probe(
             "candidate-sign"
         }
     );
-    let resp = send_atop(&client, host, &cfg, &envelope, &body)?;
+    let resp = send_atop(&client, host, &cfg, &envelope, Some(&body), None)?;
 
     if resp.success {
         // The sign oracle is reachable. STOP — do NOT chain into password.login.
@@ -1445,7 +1760,14 @@ pub fn run_injected_device_list(
     // canonical string), send it ONCE. No password.login is performed.
     eprintln!("live: sending ONE device.list with the INJECTED sid (no password.login)...");
     let (envelope, body) = build_device_list_request(&cfg, &session.sid, session.ecode.as_deref())?;
-    let resp = send_atop(&client, &host, &cfg, &envelope, &body)?;
+    let resp = send_atop(
+        &client,
+        &host,
+        &cfg,
+        &envelope,
+        Some(&body),
+        session.ecode.as_deref(),
+    )?;
     capture_to_secrets(&cfg, "tuya_device_list.json", &resp.raw)?;
     if !resp.success {
         eprintln!("live: device.list returned a server error (captured raw to secrets/).");
@@ -1463,14 +1785,29 @@ pub fn run_injected_device_list(
 
 /// Run the AUTHORIZED one-time live login. See the module docs for guardrails.
 ///
-/// Flow:
-/// 1. Load secrets + offline cert hash.
-/// 2. Probe the EU atop host reachability (DNS/TCP) — NOT a signed account call.
-/// 3. Send the ONE `token.get`. Sign-rejected → STOP (candidate/fold wrong).
-///    Accepted → signer VALIDATED.
-/// 4. RSA-encrypt the password + send THE ONE `password.login`. 2FA → capture
-///    state + return [`LiveOutcome::Needs2fa`]. Success → capture session + the
-///    device-list, confirm the SCD921 + p2pType. Any failure → STOP.
+/// Flow (CAPTURE-VERIFIED MFA, emulator_captures/cap1; TASK-0065 BLOCKER-1 — a
+/// finite, idempotent **TWO-RUN** model, NOT an in-process poll loop):
+/// 1. Load secrets + offline cert hash; probe host reachability (not a signed call).
+/// 2. Read the operator's MFA code from `twofa_code_file` — `Option` (absent on run
+///    1, present on run 2). Read FIRST so a config error fails before any network.
+/// 3. `token.get` → RSA pubkey + ticket. Sign-rejected → STOP (signer wrong).
+/// 4. The ONE `password.login(mfaCode = code.unwrap_or(""))`:
+///    - Success (no MFA, or the supplied code accepted) → finish.
+///    - `MFA_NEED_SEND_CODE` → email the code EXACTLY ONCE then STOP:
+///      `graphic.verification.code.get` (no postData) → FRESH `token.get` →
+///      `mfa.code.get` (`mfaCode:"null"`), then return [`LiveOutcome::Needs2fa`] with
+///      a stale-vs-first message and the `twofa_code_file` path. (`mfa.code.get` is
+///      reachable ONLY here — never on a re-run that already carries the code, so a
+///      pasted code is never invalidated by a fresh email.)
+///    - any other server error → STOP, surfacing the errorCode.
+/// 5. Finish = parse the session (`sid`/`uid`/`domain.mobileApiUrl`), persist via
+///    [`SessionStore`], capture to secrets/, fetch the device-list (SCD921 + p2pType).
+///
+/// Net: run 1 (no code) emails the code and STOPs; run 2 (code in file) does
+/// `token.get` → `password.login(code)` → success with NO new email. A stale code on
+/// run 2 re-emails once and STOPs (converges). Per invocation: EXACTLY ONE
+/// `password.login`, and `mfa.code.get` at most once — NO region/fold sweep, NO
+/// blind credential retry. A hard credential/sign failure STILL stops immediately.
 ///
 /// `secrets_dir` / `apk_path` are injected (testability + no hardcoded paths).
 /// Returns the terminal [`LiveOutcome`] or a typed [`LiveError`] (no secrets in
@@ -1508,13 +1845,24 @@ pub fn run_live_login(
         .build()
         .map_err(|e| LiveError::Network(format!("build http client: {e}")))?;
 
-    // ── Step 1: the ONE token.get (the sign oracle). ─────────────────────────
-    eprintln!("live: sending ONE token.get (sign oracle; HMAC-SHA256(G, str2))...");
+    // ── Step 1: read the operator-supplied MFA code FIRST (Option). ──────────
+    // The two-run model (TASK-0065 BLOCKER-1): run 1 has no code yet — we email it
+    // and STOP; run 2 has the pasted code and logs in WITHOUT re-emailing. Reading
+    // it before any network call also fails fast on a config error (no
+    // twofa_code_file). The value is secret-by-policy and never logged.
+    let code = read_mfa_code(&cfg)?;
+    eprintln!(
+        "live: operator MFA code present in file: {} (value withheld).",
+        code.is_some()
+    );
+
+    // ── Step 2: the token.get (the SIGN ORACLE). ─────────────────────────────
+    // A sign rejection here means the candidate signer (master key G, incl.
+    // bmp_token) is WRONG → STOP (no password.login, no retry/sweep).
+    eprintln!("live: sending token.get (sign oracle; HMAC-SHA256(G, str2))...");
     let token = match do_token_get(&client, host, &cfg) {
         Ok(t) => t,
         Err(e @ LiveError::SignRejected { .. }) => {
-            // The candidate signer (master key G, incl. bmp_token) is WRONG. STOP —
-            // do not proceed to password.login, do not retry/sweep.
             eprintln!("live: token.get SIGN REJECTED — candidate signer needs revisiting. STOP.");
             return Err(e);
         }
@@ -1525,34 +1873,184 @@ pub fn run_live_login(
     };
     eprintln!("live: token.get ACCEPTED — signer VALIDATED (master key G + bmp_token candidate).");
 
-    // We have the gold differential. Record it; values withheld.
-    // (We continue to the ONE password.login per the task.)
-
-    // ── Step 2: THE ONE password.login. ──────────────────────────────────────
-    eprintln!("live: sending THE ONE password.login (single attempt, no retry)...");
-    match do_password_login(&client, host, &cfg, &token)? {
-        LoginResult::Needs2fa(raw) => {
-            // Capture the challenge state needed to submit the code later.
-            // We persist the WHOLE raw response (it holds the ticket/session the
-            // resume task needs); it is written to secrets/ only.
-            capture_to_secrets(&cfg, "tuya_2fa_state.json", &raw)?;
-            eprintln!("live: reached 2FA email-code challenge. Challenge state captured to secrets/tuya_2fa_state.json. STOP.");
-            Ok(LiveOutcome::Needs2fa)
+    // ── Step 3: the ONE password.login — with the operator's code if present, ─
+    // else empty. mfa.code.get is NOT re-sent here; it fires ONLY when the server
+    // then demands it (Step 4). THIS is the BLOCKER-1 fix: a re-run with the pasted
+    // code goes straight token.get → password.login(code) and does NOT email a new
+    // (invalidating) code.
+    let mfa_code = code.as_deref().unwrap_or("");
+    eprintln!(
+        "live: sending password.login (mfaCode {})...",
+        if code.is_some() {
+            "= <operator code>"
+        } else {
+            "empty"
         }
-        LoginResult::Success(user) => {
-            // Capture session/uid (withheld) to secrets/.
-            capture_to_secrets(&cfg, "tuya_session.json", &user)?;
-            eprintln!("live: login SUCCESS. Session captured to secrets/tuya_session.json (values withheld).");
+    );
+    let login = do_password_login(&client, host, &cfg, &token, mfa_code)?;
 
-            // READ-ONLY: fetch the device list, capture it, confirm SCD921.
-            let (camera_found, p2p_type) =
-                fetch_and_capture_device_list(&client, host, &cfg, &user)?;
-            Ok(LiveOutcome::LoggedIn {
-                camera_found,
-                p2p_type,
-            })
+    match decide_post_login(login, code.is_some()) {
+        PostLoginAction::Finish(user) => {
+            // Login succeeded (no MFA needed, or the supplied code was accepted).
+            finish_login_success(&client, host, &cfg, &user)
+        }
+        PostLoginAction::ResendCodeThenStop { code_was_stale } => {
+            // ── Step 4: the server demands the email code be (re)sent. Email it ─
+            // EXACTLY ONCE, then STOP and ask the operator to (re-)run with the
+            // code. No unbounded poll/sleep — the two-run model converges.
+            send_mfa_code_then_stop(&client, host, &cfg, code_was_stale)
         }
     }
+}
+
+/// What the orchestrator does after the SINGLE `password.login` attempt, decided
+/// PURELY from the server reply + whether the operator had supplied a code. This is
+/// the BLOCKER-1 control-flow seam (TASK-0065): `mfa.code.get` is reachable ONLY via
+/// [`PostLoginAction::ResendCodeThenStop`], so a successful login — code present or
+/// not — NEVER re-emails (and thus never invalidates) a code. Unit-tested below.
+#[derive(Debug)]
+enum PostLoginAction {
+    /// `password.login` succeeded → finish (parse + persist session, device.list).
+    Finish(serde_json::Value),
+    /// Server returned `MFA_NEED_SEND_CODE` → email the code EXACTLY ONCE, then
+    /// STOP. `code_was_stale` selects the operator message: a previously-pasted code
+    /// was rejected (`true`) vs no code supplied yet (`false`).
+    ResendCodeThenStop { code_was_stale: bool },
+}
+
+/// Map a `password.login` reply + code-presence to the next [`PostLoginAction`].
+/// Pure (no I/O) so the BLOCKER-1 decision — "does this path re-email the code?" —
+/// is directly unit-testable without network.
+fn decide_post_login(login: LoginResult, code_present: bool) -> PostLoginAction {
+    match login {
+        LoginResult::Success(user) => PostLoginAction::Finish(user),
+        LoginResult::NeedSendCode => PostLoginAction::ResendCodeThenStop {
+            code_was_stale: code_present,
+        },
+    }
+}
+
+/// Email the MFA code EXACTLY ONCE (graphic-captcha pre-check → FRESH token.get →
+/// `mfa.code.get`), capture the challenge state to gitignored `secrets/`, then STOP
+/// with the operator instruction and return [`LiveOutcome::Needs2fa`]. Called ONLY
+/// when the server returned `MFA_NEED_SEND_CODE` (see [`decide_post_login`]), so the
+/// code is sent at most once per invocation. No secret value is logged.
+fn send_mfa_code_then_stop(
+    client: &reqwest::blocking::Client,
+    host: &str,
+    cfg: &LiveConfig,
+    code_was_stale: bool,
+) -> Result<LiveOutcome, LiveError> {
+    eprintln!("live: server requires MFA (MFA_NEED_SEND_CODE). Emailing the code ONCE...");
+
+    // (a) graphic-captcha pre-check (NO postData).
+    eprintln!("live: graphic.verification.code.get (captcha pre-check, no postData)...");
+    do_graphic_verification_code_get(client, host, cfg)?;
+
+    // (b) a FRESH token.get, then mfa.code.get (mfaCode:"null") → server emails it.
+    eprintln!("live: refreshing token.get for mfa.code.get...");
+    let token_mfa = do_token_get(client, host, cfg)?;
+    let mfa_raw = do_mfa_code_get(client, host, cfg, &token_mfa)?;
+    // The mfa.code.get reply ({countryCode,email}) is account-PII → gitignored only.
+    capture_to_secrets(cfg, "tuya_2fa_state.json", &mfa_raw)?;
+
+    // (c) STOP with the exact operator instruction (embeds the twofa_code_file path).
+    let hint = mfa_code_file_hint(cfg);
+    eprintln!("live: {}", mfa_resend_message(&hint, code_was_stale));
+    Ok(LiveOutcome::Needs2fa)
+}
+
+/// The exact operator-facing instruction printed after the code is (re)emailed.
+/// Pure + unit-tested; embeds the real `twofa_code_file` path so the operator knows
+/// where to paste the code. `code_was_stale` selects the wording: a rejected prior
+/// code (run 2 with a stale/invalid code) vs the first send (run 1, no code yet).
+fn mfa_resend_message(twofa_path: &str, code_was_stale: bool) -> String {
+    if code_was_stale {
+        format!(
+            "Your previous MFA code was stale/invalid; a NEW code was emailed. \
+             Replace it in '{twofa_path}' (a single line) and re-run `auth live-login`. STOP."
+        )
+    } else {
+        format!(
+            "MFA code emailed to your account. Put it in '{twofa_path}' (a single line) \
+             and re-run `auth live-login`. STOP."
+        )
+    }
+}
+
+/// Finish a successful login: parse + persist the session, capture to secrets/, and
+/// run the READ-ONLY device-list fetch. Shared by the no-MFA and post-MFA success
+/// branches so they behave identically. No secret value is logged.
+fn finish_login_success(
+    client: &reqwest::blocking::Client,
+    host: &str,
+    cfg: &LiveConfig,
+    user: &serde_json::Value,
+) -> Result<LiveOutcome, LiveError> {
+    // Capture the raw User (sid/uid/domain) to gitignored secrets/.
+    capture_to_secrets(cfg, "tuya_session.json", user)?;
+    // Persist a structured Session into the on-disk SessionStore (the consumer the
+    // rest of the client reads). Failure here is loud (we do not silently drop a
+    // hard-won session), but does not undo the successful login.
+    persist_session(user)?;
+    eprintln!(
+        "live: login SUCCESS. Session persisted to the SessionStore + captured to \
+         secrets/tuya_session.json (values withheld)."
+    );
+
+    // READ-ONLY: fetch the device list, capture it, confirm SCD921.
+    let (camera_found, p2p_type) = fetch_and_capture_device_list(client, host, cfg, user)?;
+    Ok(LiveOutcome::LoggedIn {
+        camera_found,
+        p2p_type,
+    })
+}
+
+/// Build a [`Session`] from the login `User` result and persist it via the default
+/// [`SessionStore`]. The home-datacenter base is `User.domain.mobileApiUrl`
+/// (the authoritative gateway for every subsequent call, `re/tuya_cloud_auth.md`
+/// §4). The mobile flow advertises no explicit TTL, so a conservative 12-hour
+/// expiry is set (the store enforces refresh-before-expiry; on session-invalid the
+/// client re-logins). sid/uid/ecode are SECRET — never logged (the Session Debug
+/// impl redacts them, and the store writes to the gitignored XDG data dir).
+fn persist_session(user: &serde_json::Value) -> Result<(), LiveError> {
+    let sid = user
+        .get("sid")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| LiveError::Protocol("login result missing sid".into()))?
+        .to_string();
+    let uid = user
+        .get("uid")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| LiveError::Protocol("login result missing uid".into()))?
+        .to_string();
+    let ecode = user
+        .get("ecode")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let mobile_api_base = user
+        .get("domain")
+        .and_then(|d| d.get("mobileApiUrl"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("https://{EU_ATOP_HOST}"));
+
+    let now = chrono::Utc::now();
+    let session = Session {
+        sid,
+        uid,
+        ecode,
+        mobile_api_base,
+        issued_at: now,
+        expires_at: now + chrono::Duration::hours(12),
+    };
+    let store = SessionStore::default_path()
+        .map_err(|e| LiveError::Config(format!("session store path: {e}")))?;
+    store
+        .save(&session)
+        .map_err(|e| LiveError::Config(format!("persist session: {e}")))
 }
 
 /// Non-account host reachability: open a TLS connection (HEAD-equivalent) to the
@@ -1628,7 +2126,7 @@ fn fetch_and_capture_device_list(
     let ecode = user.get("ecode").and_then(|v| v.as_str());
     let (envelope, body) = build_device_list_request(cfg, sid, ecode)?;
 
-    let resp = send_atop(client, host, cfg, &envelope, &body)?;
+    let resp = send_atop(client, host, cfg, &envelope, Some(&body), ecode)?;
     capture_to_secrets(cfg, "tuya_device_list.json", &resp.raw)?;
     if !resp.success {
         // Surface (no retry) but still report the captured shape if any.
@@ -1696,6 +2194,7 @@ mod tests {
             creds: LoginCreds {
                 email: "user@example.com".into(),
                 password: "pw".into(),
+                twofa_code_file: None,
             },
             material: SigningKeyMaterial {
                 app_key: "SYNTH_APPKEY_000000".into(),
@@ -1887,7 +2386,7 @@ mod tests {
             "nonce(12) + GCM tag(16) must be present"
         );
 
-        let form = form_body(&params, &body);
+        let form = form_body(&params, Some(&body));
         assert!(form.starts_with("postData="));
         assert!(
             form.contains("platform=Pixel+8+Pro"),
@@ -2143,16 +2642,18 @@ mod tests {
         assert!(matches!(classify_error(&other), LiveError::Server { .. }));
     }
 
+    // is_need_send_code recognises the CAPTURE-VERIFIED MFA_NEED_SEND_CODE signal
+    // (the first login's expected reply) but NOT a hard credential failure.
     #[test]
-    fn is_2fa_challenge_detects_mfa_markers() {
+    fn is_need_send_code_detects_mfa_need_send_code() {
         let r = AtopResponse {
             success: false,
-            error_code: Some("USER_NEED_MFA".into()),
-            error_msg: Some("verification code required".into()),
+            error_code: Some("MFA_NEED_SEND_CODE".into()),
+            error_msg: Some("Please update the App to the latest version.".into()),
             result: serde_json::Value::Null,
             raw: serde_json::Value::Null,
         };
-        assert!(is_2fa_challenge(&r));
+        assert!(is_need_send_code(&r));
 
         let not = AtopResponse {
             success: false,
@@ -2161,15 +2662,263 @@ mod tests {
             result: serde_json::Value::Null,
             raw: serde_json::Value::Null,
         };
-        assert!(!is_2fa_challenge(&not));
+        assert!(!is_need_send_code(&not));
+
+        // LOW-4: speculative/unverified variants are NOT matched — only the exact
+        // capture-verified code routes to the resend path, so a genuine final-login
+        // error is never misrouted into re-emailing a code.
+        for spec in ["NEED_MFA", "USER_NEED_MFA", "SOME_NEED_SEND_CODE_X"] {
+            let r = AtopResponse {
+                success: false,
+                error_code: Some(spec.into()),
+                error_msg: None,
+                result: serde_json::Value::Null,
+                raw: serde_json::Value::Null,
+            };
+            assert!(!is_need_send_code(&r), "{spec} must NOT match (unverified)");
+        }
+    }
+
+    // ── BLOCKER-1 (TASK-0065): the post-login decision seam. `mfa.code.get` is ──
+    // reachable ONLY via ResendCodeThenStop, so this proves the control flow:
+    // a SUCCESS never re-emails (regardless of code presence), and only a
+    // NEED_SEND_CODE reply routes to the (single) resend. The `code_was_stale`
+    // flag (= code present) selects the operator message on a re-run.
+    #[test]
+    fn decide_post_login_success_finishes_without_resend() {
+        let user = serde_json::json!({"sid": "SYNTH", "uid": "SYNTH"});
+        // Success with NO code (run-1 happy path: account has MFA disabled).
+        match decide_post_login(LoginResult::Success(user.clone()), false) {
+            PostLoginAction::Finish(u) => assert_eq!(u, user),
+            PostLoginAction::ResendCodeThenStop { .. } => {
+                panic!("a successful login must Finish, never re-email the code")
+            }
+        }
+        // Success WITH a code present (run-2 happy path: pasted code accepted).
+        match decide_post_login(LoginResult::Success(user.clone()), true) {
+            PostLoginAction::Finish(u) => assert_eq!(u, user),
+            PostLoginAction::ResendCodeThenStop { .. } => {
+                panic!("an accepted code must Finish, never re-email a fresh code")
+            }
+        }
     }
 
     #[test]
-    fn result_indicates_2fa_when_marker_and_no_sid() {
-        let chal = serde_json::json!({ "mfaToken": "x", "flowId": "y" });
-        assert!(result_indicates_2fa(&chal));
-        let logged_in = serde_json::json!({ "sid": "s", "uid": "u" });
-        assert!(!result_indicates_2fa(&logged_in));
+    fn decide_post_login_need_send_code_resends_once_with_stale_flag() {
+        // Run 1: server demands the code, none supplied → resend, NOT stale.
+        match decide_post_login(LoginResult::NeedSendCode, false) {
+            PostLoginAction::ResendCodeThenStop { code_was_stale } => assert!(!code_was_stale),
+            PostLoginAction::Finish(_) => panic!("NEED_SEND_CODE must route to resend"),
+        }
+        // Run 2: a (stale) code WAS supplied but still rejected → resend, stale=true.
+        match decide_post_login(LoginResult::NeedSendCode, true) {
+            PostLoginAction::ResendCodeThenStop { code_was_stale } => assert!(code_was_stale),
+            PostLoginAction::Finish(_) => panic!("NEED_SEND_CODE must route to resend"),
+        }
+    }
+
+    // The two operator-facing messages both embed the twofa_code_file path and
+    // differ in wording (first send vs stale-code re-send).
+    #[test]
+    fn mfa_resend_message_embeds_path_and_distinguishes_stale() {
+        let path = "secrets/tuya_2fa.txt";
+
+        let first = mfa_resend_message(path, false);
+        assert!(
+            first.contains(path),
+            "first-send message must name the file"
+        );
+        assert!(first.contains("emailed"));
+        assert!(
+            !first.to_ascii_lowercase().contains("stale"),
+            "first send is not a stale-code case"
+        );
+
+        let stale = mfa_resend_message(path, true);
+        assert!(stale.contains(path), "stale message must name the file");
+        assert!(
+            stale.to_ascii_lowercase().contains("stale"),
+            "stale message must say the prior code was stale/invalid"
+        );
+        assert!(stale.contains("NEW code"));
+    }
+
+    // ── TASK-0065: the `options` byte format MUST match emulator_captures/cap1 ───
+    // exactly (space after each colon, NO space after the comma). serde_json would
+    // drop the colon spaces, so build_login_options hand-formats the bytes.
+    #[test]
+    fn login_options_byte_format_matches_capture() {
+        // The first two are the EXACT decrypted `options` strings from cap1
+        // (decrypt_capture_login.py): first login (empty) and mfa.code.get ("null").
+        // The third uses a SYNTHETIC code "000000" (the real captured code is an
+        // account secret and must never enter a committed file, CLAUDE.md); the test
+        // only asserts the byte format, so the code VALUE is irrelevant.
+        assert_eq!(build_login_options(""), r#"{"group": 1,"mfaCode": ""}"#);
+        assert_eq!(
+            build_login_options("null"),
+            r#"{"group": 1,"mfaCode": "null"}"#
+        );
+        assert_eq!(
+            build_login_options("000000"),
+            r#"{"group": 1,"mfaCode": "000000"}"#
+        );
+    }
+
+    // password.login postData carries the CAPTURE-VERIFIED field set + the options
+    // string, and the embedded options keeps its exact colon-spaced bytes after
+    // serde_json escaping (the inner spaces survive as part of the string value).
+    #[test]
+    fn password_login_post_data_shape_and_embedded_options() {
+        let pd = password_login_post_data("45", "user@example.com", "DEADBEEF", "TICKET32", "");
+        let v: serde_json::Value = serde_json::from_str(&pd).expect("postData is JSON");
+        assert_eq!(v["countryCode"], "45");
+        assert_eq!(v["email"], "user@example.com");
+        assert_eq!(v["ifencrypt"], 1);
+        assert_eq!(v["passwd"], "DEADBEEF");
+        assert_eq!(v["token"], "TICKET32");
+        // options is a STRING whose value is the exact byte-faithful inner JSON.
+        assert_eq!(v["options"], r#"{"group": 1,"mfaCode": ""}"#);
+        // The escaped colon-space bytes survive in the serialized postData.
+        assert!(
+            pd.contains(r#""options":"{\"group\": 1,\"mfaCode\": \"\"}""#),
+            "options must embed with its exact escaped bytes; got: {pd}"
+        );
+        // Final attempt carries the code inside options.
+        let pd2 = password_login_post_data("45", "user@example.com", "AB", "TK", "000000");
+        let v2: serde_json::Value = serde_json::from_str(&pd2).unwrap();
+        assert_eq!(v2["options"], r#"{"group": 1,"mfaCode": "000000"}"#);
+    }
+
+    // mfa.code.get postData is keyed on `username` (NOT `email`) and carries the
+    // literal `"null"` MFA code, per cap1 step 5.
+    #[test]
+    fn mfa_code_get_post_data_shape() {
+        let pd = mfa_code_get_post_data("45", "user@example.com", "DEADBEEF", "TICKET32");
+        let v: serde_json::Value = serde_json::from_str(&pd).expect("postData is JSON");
+        assert_eq!(v["countryCode"], "45");
+        assert_eq!(v["username"], "user@example.com");
+        assert!(
+            v.get("email").is_none(),
+            "mfa.code.get uses username, not email"
+        );
+        assert_eq!(v["ifencrypt"], 1);
+        assert_eq!(v["passwd"], "DEADBEEF");
+        assert_eq!(v["token"], "TICKET32");
+        assert_eq!(v["options"], r#"{"group": 1,"mfaCode": "null"}"#);
+    }
+
+    // token.get postData shape (cap1 step 1): countryCode, username, isUid:false.
+    #[test]
+    fn token_get_post_data_shape() {
+        let pd = token_get_post_data("45", "user@example.com");
+        let v: serde_json::Value = serde_json::from_str(&pd).unwrap();
+        assert_eq!(v["countryCode"], "45");
+        assert_eq!(v["username"], "user@example.com");
+        assert_eq!(v["isUid"], false);
+    }
+
+    // The no-postData builder (graphic.verification.code.get) produces a fully
+    // signed envelope with NO postData form field, and form_body omits it.
+    #[test]
+    fn no_post_data_envelope_omits_post_data_and_signs() {
+        let cfg = synthetic_cfg();
+        let envelope = build_signed_envelope_no_post_data(
+            &cfg,
+            GRAPHIC_VERIFICATION_CODE_GET_ACTION,
+            GRAPHIC_VERIFICATION_CODE_GET_VERSION,
+        )
+        .expect("no-postData envelope build");
+        // The wire action has NO thing/smartlife prefix → unchanged by rewrite.
+        assert_eq!(
+            envelope.get("a").map(String::as_str),
+            Some(GRAPHIC_VERIFICATION_CODE_GET_ACTION)
+        );
+        assert!(
+            envelope.get("sign").is_some_and(|s| !s.is_empty()),
+            "no-postData request must still be signed"
+        );
+        // No postData form field is emitted.
+        let form = form_body(&envelope, None);
+        assert!(
+            !form.contains("postData="),
+            "no-postData request must not carry a postData form field: {form}"
+        );
+        // The canonical sign string must NOT contain a postData segment.
+        let canonical = babymonitor_core::sign::canonical_string(&{
+            let mut p = envelope.clone();
+            p.remove("sign");
+            p
+        });
+        assert!(
+            !canonical.contains("postData="),
+            "no-postData sign must omit postData; got: {canonical}"
+        );
+    }
+
+    // ET=3 RESPONSE decryption round-trip: a server-shaped `{result: <enc>, sign, t}`
+    // envelope decrypts back to its inner business envelope (success/errorCode/result).
+    // Uses the synthetic cfg's own et3 key as a stand-in for the server's (the scheme
+    // is symmetric — request and response share et3_encrypto_key(requestId, G)).
+    #[test]
+    fn et3_response_decrypts_to_inner_envelope() {
+        let cfg = synthetic_cfg();
+        let request_id = "trace-id-fixed";
+        // The "server" encrypts a business envelope with the SAME et3 scheme.
+        let inner = r#"{"result":{"token":"TK","publicKey":"PK","exponent":"65537"},"t":1,"success":true,"status":"ok"}"#;
+        let enc = encrypt_et3_post_data(&cfg, request_id, inner, None).unwrap();
+        let recovered = decrypt_et3_result(&cfg, request_id, &enc, None).expect("decrypts");
+        assert_eq!(recovered["success"], true);
+        assert_eq!(recovered["result"]["token"], "TK");
+        assert_eq!(recovered["result"]["publicKey"], "PK");
+
+        // An ENCRYPTED error envelope (MFA_NEED_SEND_CODE) also recovers.
+        let err = r#"{"t":2,"success":false,"errorCode":"MFA_NEED_SEND_CODE","status":"error"}"#;
+        let enc_err = encrypt_et3_post_data(&cfg, request_id, err, None).unwrap();
+        let rec_err = decrypt_et3_result(&cfg, request_id, &enc_err, None).unwrap();
+        assert_eq!(rec_err["success"], false);
+        assert_eq!(rec_err["errorCode"], "MFA_NEED_SEND_CODE");
+
+        // A wrong key (different requestId) must fail the GCM tag, not silently
+        // return garbage.
+        assert!(matches!(
+            decrypt_et3_result(&cfg, "other-request-id", &enc, None),
+            Err(LiveError::Protocol(_))
+        ));
+    }
+
+    // read_mfa_code: missing/empty file → Ok(None) (caller STOPs, no hang); a file
+    // with a trimmed non-empty code → Ok(Some(code)). No twofa_code_file → Config err.
+    #[test]
+    fn read_mfa_code_resolves_file_or_reports_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "bmp-mfa-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let code_path = dir.join("code.txt");
+
+        let mut cfg = synthetic_cfg();
+        // (a) twofa_code_file unset → Config error (loud, actionable).
+        cfg.creds.twofa_code_file = None;
+        assert!(matches!(read_mfa_code(&cfg), Err(LiveError::Config(_))));
+
+        // (b) file path set but missing → Ok(None) (STOP, no hang).
+        cfg.creds.twofa_code_file = Some(code_path.display().to_string());
+        assert!(matches!(read_mfa_code(&cfg), Ok(None)));
+
+        // (c) empty file → Ok(None).
+        std::fs::write(&code_path, "   \n").unwrap();
+        assert!(matches!(read_mfa_code(&cfg), Ok(None)));
+
+        // (d) non-empty (trimmed) → Ok(Some(code)).
+        std::fs::write(&code_path, " 000000 \n").unwrap();
+        assert_eq!(read_mfa_code(&cfg).unwrap().as_deref(), Some("000000"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // inspect_device_list finds a camera by category and reports SHAPE only.

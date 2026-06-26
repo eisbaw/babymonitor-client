@@ -601,7 +601,7 @@ fn live_device_list() -> Result<DeviceList, Error> {
     let material = SigningKeyMaterial {
         app_key: String::new(),
         app_secret: String::new(),
-        app_cert_sha256_hex: String::new(),
+        app_cert_sha256: [0u8; 32],
         ttid: String::new(),
     };
     device::list_devices(&material, &PendingBmpToken, "", "")

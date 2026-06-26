@@ -618,7 +618,7 @@ mod tests {
         SigningKeyMaterial {
             app_key: "SYNTH_APPKEY_000000".into(),
             app_secret: "SYNTH_APPSECRET_0000000000000000".into(),
-            app_cert_sha256_hex: "00".repeat(32),
+            app_cert_sha256: [0u8; 32],
             ttid: "SYNTH_TTID".into(),
         }
     }

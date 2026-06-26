@@ -1,44 +1,69 @@
 //! Tuya mobile-app ("atop") request signer.
 //!
-//! This module re-implements the Tuya **mobile-app SDK** request-signing
-//! algorithm recovered statically in `re/tuya_sign_static.md` (+ the canonical
-//! string in `re/tuya_sign.md` §1-3). It is the algorithm the native
-//! `JNICLibrary.doCommandNative(ctx, cmd=1, str2, …)` path computes; we reproduce
-//! it in safe Rust so the client never needs the device's native blob.
+//! Re-implements the Tuya **mobile-app SDK** request-signing algorithm the native
+//! `JNICLibrary.doCommandNative(ctx, cmd, str2, …)` computes, in safe Rust, so the
+//! client never needs the device's native blob.
 //!
-//! # What is recovered vs pending
+//! # Ground truth (Ghidra `libthing_security.so` + jadx; TASK-0060/0061)
 //!
-//! Recovered and unit-tested here (5 of 6 ingredients —
-//! `re/tuya_sign_static.md` §6):
-//! - the sorted-whitelist canonical string ([`canonical_string`]) — literal `||`
-//!   join, NOT `&`;
-//! - [`swap_sign_string`] — the 32-char permutation;
-//! - [`post_data_digest_hex`] — the live-path `swapSignString(md5_hex(body))`
-//!   fold for `postData`;
-//! - [`md5_hex_lower`] — the keyed-hash primitive is plain **MD5** (NOT
-//!   HMAC-SHA256: MD5 IV constants at `libthing_security.so@0x76c0`,
-//!   `re/tuya_sign_static.md` §3);
-//! - [`assemble_sign_key`] — the underscore-joined key parts; and
-//! - [`app_cert_sha256_hex`] — the app-cert SHA-256, computable **offline** from
-//!   the APK signing cert (`META-INF/*.RSA`).
+//! The wire request `sign` is **`doCommandNative` cmd=1 = HMAC-SHA256(key =
+//! master-key G, msg = str2)** rendered as **64 lowercase hex**
+//! (`re/master_secret_g.md`; native `doCommandNative.c:449-489`). An earlier port
+//! wrongly used `computeDigest` (MD5 → 32-hex), which is the inbound
+//! response-verify path, NOT the login signer. [`Signer::sign`] implements the
+//! correct HMAC path.
 //!
-//! Pending (the 6th ingredient, TOKEN-PENDING — `re/tuya_sign_static.md` §5 +
-//! `re/bmp_token_whitebox.md` §8): the `bmp_token` decoded from `assets/t_s.bmp`
-//! by an imath-bignum + matrix decode (sign path:
-//! `fcn.13b5c` → `read_keys_from_content@0x4974` → matrix `fcn.5eb0`), not yet
-//! ported. Tracked by **TASK-0032**. Until a [`BmpTokenProvider`] yields
-//! it, [`Signer::sign`] returns [`Error::BmpTokenPending`].
+//! `str2` is the sorted-whitelist canonical string ([`canonical_string`], literal
+//! `||` join, NOT `&`), with the `postData` param value replaced by its
+//! [`post_data_digest_hex`] fold (`swapSignString(md5_hex(encrypted_postData))`).
+//! NOTE: the `postData` digest is STILL MD5 — only the request `sign` is
+//! HMAC-SHA256. [`md5_hex_lower`]/[`swap_sign_string`] therefore remain.
 //!
-//! # Honest confidence (per `re/tuya_sign_static.md` §7-8)
+//! ## Master key G ([`assemble_master_key_g`]) — a RAW BYTE string
 //!
-//! The MD5 primitive, the `_` separator, and the offline cert-hash are
-//! `confirmed` (byte-level disassembly). The exact **order** of the underscore
-//! parts and whether the hash input also folds the canonical string (vs only the
-//! key) are `likely` — read from control-flow shape, not executed. A single
-//! differential vector (which needs the bmp_token, TASK-0032) pins them. This
-//! module exposes both [`assemble_sign_key`] (the `_`-join, `confirmed`) and the
-//! fold choice as an explicit [`SignBody`] so the disambiguation lands in ONE
-//! place when TASK-0032 unblocks the gold vector — it is NOT silently guessed.
+//! `doCommandNative` cmd=0 assembles G once at init
+//! (`doCommandNative.c:497-783`, `re/master_secret_g.md`):
+//!
+//! ```text
+//! G = packageName ++ 0x5f ++ certColonUpper ++ 0x5f ++ matrixKey0 ++ 0x5f ++ appSecret
+//! ```
+//!
+//! - `packageName` = [`APP_PACKAGE_NAME`] (UTF-8);
+//! - `certColonUpper` = the app-cert SHA-256 as **colon-grouped UPPERCASE hex, 95
+//!   chars** ([`cert_sha256_colon_upper`]) — NOT lowercase 64-hex. This is the
+//!   silent-failure trap this module exists to prevent;
+//! - `matrixKey0` = `hex_decode(bmp_token)` → **32 RAW bytes** (binary, NOT the
+//!   ASCII hex string), decoded from `assets/t_s.bmp` (TASK-0032). The raw-bytes
+//!   FORM is **confirmed (two-source)**: the native reads each key string as hex
+//!   TEXT via strlen (`doCommandNative.c:546`) then runs it through the
+//!   hex-DECODER `FUN_00113150` (`doCommandNative.c:572`), whose output is
+//!   `input_len/2` bytes (`00113150_FUN_00113150.c:32,46-76`) — so the 64-char hex
+//!   token folds into G as 32 raw bytes, exactly what [`hex::decode`] produces;
+//! - `appSecret` = raw UTF-8 appSecret;
+//! - `0x5f` = a single `_` byte separator (no length prefix).
+//!
+//! The ET=3 `postData` AES-128 key is the first **16 ASCII hex chars** of
+//! `HMAC-SHA256(key = requestId, msg = G [++ 0x5f ++ ecode])` ([`et3_encrypto_key`]);
+//! login (`token.get`) sets `setSessionRequire(false)`, so `ecode` is omitted and
+//! the message is G alone.
+//!
+//! `chKey` ([`ch_key`]) = `lowercase_hex(HMAC-SHA256(key = appKey,
+//! msg = packageName ++ 0x5f ++ certColonUpper))[8..24]` — same colon-upper cert
+//! input as G; output shape unchanged.
+//!
+//! # Honest confidence
+//!
+//! The primitive + encoding layers are offline-validated here against PUBLISHED
+//! vectors: HMAC-SHA256 vs RFC 4231 (cases 2 + 6), SHA-256 vs FIPS-180, MD5 vs
+//! RFC 1321, and [`cert_sha256_colon_upper`] against an exact hand-written gold
+//! string. The `matrixKey0`-as-raw-bytes FORM is also resolved — **confirmed
+//! (two-source)** by the G-assembly order plus the `FUN_00113150` hex-decoder
+//! (output = `input_len/2`); see [`assemble_master_key_g`]. The rest of the signer
+//! RECIPE (key=G, msg=str2, the 4-part byte order) is SINGLE-SOURCE native ground
+//! truth and CANNOT be validated offline end-to-end — there is NO HMAC KAT in the
+//! lib and the real `bmp_token` VALUE is un-ported (TASK-0032). Until a [`BmpTokenProvider`] supplies the
+//! token, [`Signer::sign`] returns [`Error::BmpTokenPending`]; it never fabricates
+//! a signature.
 
 use std::collections::BTreeMap;
 
@@ -63,6 +88,13 @@ use crate::Error;
 ///   * `t` → **`time`**: the timestamp param's WIRE name is `time`
 ///     (`KEY_TIMESTAMP="time"`, `re/tuya_cloud_auth.md` §1); the recovered
 ///     whitelist lists `time`, not `t`. Same silent-drop failure mode.
+///   * `h5` → **`isH5`** (TASK-0064): the H5 flag's WIRE key is `isH5`
+///     (`ThingApiParams.KEY_H5 = "isH5"`,
+///     `decompiled/.../ThingApiParams.java:60`; the whitelist `bdpdqbp` lists
+///     `KEY_H5`, `ThingApiSignManager.java:66`). The earlier `"h5"` spelling
+///     would silently drop an `isH5` param from the canonical string. `token.get`
+///     does not set it, so this was a LATENT mismatch — corrected for fidelity so
+///     any future H5 path signs the right key.
 ///
 /// These are load-bearing for a server-accepted sign; see the live path.
 pub const SIGN_WHITELIST: &[&str] = &[
@@ -74,7 +106,7 @@ pub const SIGN_WHITELIST: &[&str] = &[
     "deviceId",
     "appVersion",
     "ttid",
-    "h5",
+    "isH5",
     "h5Token",
     "os",
     "clientId",
@@ -208,6 +240,59 @@ pub fn post_data_digest_hex(body: &[u8]) -> Result<String, Error> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Sub-step 2b: PhoneUtil.getDeviceID-shaped per-install device id
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Synthesize a `PhoneUtil.getDeviceID`-SHAPED per-install device id: a **44-char
+/// LOWERCASE-HEX** string with the exact three-segment layout the app's
+/// `PhoneUtil.getRemoteDeviceID` builds.
+///
+/// Ground truth (jadx, TASK-0064): `PhoneUtil.getRemoteDeviceID`
+/// (`decompiled/.../PhoneUtil.java:770`) is
+/// ```text
+/// md5AsBase64(BRAND ++ MODEL).substring(4,16)
+///   ++ md5AsBase64(randomId3 ++ randomId4).substring(8,24)
+///   ++ md5AsBase64(randomId1 ++ randomId2).substring(16)
+/// ```
+/// and — despite the name — `MD5Util.md5AsBase64(byte[])` returns
+/// `HexUtil.bytesToHexString(md5(..))` (`MD5Util.java:577`), i.e. a **32-char
+/// lowercase-hex** MD5 digest (`HexUtil.bytesToHexString` uses
+/// `Integer.toHexString`, lowercase, `HexUtil.java:138`). So the layout is:
+///
+/// ```text
+/// deviceId = md5hex(brand ++ model)[4..16]   // 12 chars (device-model derived)
+///         ++ md5hex(rand_a)[8..24]           // 16 chars (per-install random)
+///         ++ md5hex(rand_b)[16..32]          // 16 chars (per-install random)
+/// ```
+/// = 12 + 16 + 16 = **44** lowercase-hex chars.
+///
+/// # HONESTY: this is a GENERATED STAND-IN, not a captured real device id.
+/// The real app likewise GENERATES this id once (random per install) and CACHES it
+/// in `SecuredPreferenceStore` (`PhoneUtil.getDeviceID:326-333`). The server does
+/// NOT validate the deviceId VALUE — it is merely SIGNED (`KEY_DEVICEID` is in the
+/// sign whitelist `bdpdqbp`), and the gateway recomputes the sign over the params
+/// it receives. So a **stable, correctly-shaped, generated, persisted** id is
+/// app-faithful — it is NOT a fabrication or a workaround. The CALLER must persist
+/// the returned value and reuse it (stable per install) exactly as the app caches
+/// `mDeviceId`.
+///
+/// `rand_a`/`rand_b` are caller-supplied CSPRNG seed bytes (the app feeds
+/// `getRandomId*()` UUID strings; raw random bytes are equivalent for the
+/// unvalidated value and keep this function pure + deterministic for tests).
+#[must_use]
+pub fn generate_phone_util_device_id(
+    brand: &str,
+    model: &str,
+    rand_a: &[u8],
+    rand_b: &[u8],
+) -> String {
+    let seg1 = md5_hex_lower(format!("{brand}{model}").as_bytes())[4..16].to_string();
+    let seg2 = md5_hex_lower(rand_a)[8..24].to_string();
+    let seg3 = md5_hex_lower(rand_b)[16..32].to_string();
+    format!("{seg1}{seg2}{seg3}")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Sub-step 3: canonical string (sorted whitelist, "||"-joined)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -239,66 +324,159 @@ pub fn canonical_string(params: &BTreeMap<String, String>) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Sub-step 4: sign-key assembly ("_"-join)
+// Sub-step 4: master key G assembly (4-part RAW byte string, "_" / 0x5f join)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Assemble the MD5 sign **key** from its three underscore-joined parts
-/// (`re/tuya_sign_static.md` §4 / §7):
-/// `cert_sha256_hex + "_" + bmp_token + "_" + appSecret`.
+/// Assemble the native **master key G** that `doCommandNative` cmd=0 builds once
+/// at init and cmd=1 uses as the HMAC-SHA256 key for the request `sign`
+/// (`re/master_secret_g.md`; native `doCommandNative.c:497-783`).
 ///
-/// The **order** of these parts is labelled `likely` in the spec (read from
-/// control flow, not executed); this function encodes that documented order in
-/// one place so a single gold vector (TASK-0032) can correct it if wrong, rather
-/// than the order being scattered across call sites.
-#[must_use]
-pub fn assemble_sign_key(cert_sha256_hex: &str, bmp_token: &str, app_secret: &str) -> String {
-    format!("{cert_sha256_hex}{KEY_PART_SEP}{bmp_token}{KEY_PART_SEP}{app_secret}")
+/// G is a **raw byte string** (NOT a `String` — `matrixKey0` is binary):
+///
+/// ```text
+/// G = packageName ++ 0x5f ++ certColonUpper ++ 0x5f ++ matrixKey0 ++ 0x5f ++ appSecret
+/// ```
+///
+/// where the parts are joined by a single `0x5f` (`_`) byte with no length prefix:
+/// - `package_name` — UTF-8, usually [`APP_PACKAGE_NAME`];
+/// - `cert_digest` — the app-cert SHA-256 **raw 32-byte digest**. It is formatted
+///   to the colon-grouped UPPERCASE 95-hex form ([`cert_sha256_colon_upper`])
+///   INTERNALLY, so a caller cannot accidentally pass the wrong (lowercase 64-hex)
+///   cert string at this boundary (architect Finding 2);
+/// - `matrixKey0` = `hex_decode(bmp_token_hex)` → the **32 RAW bytes** the
+///   `bmp_token` hex string decodes to (binary, not the ASCII hex);
+/// - `app_secret` — raw UTF-8 appSecret.
+///
+/// # Errors
+/// [`Error::InvalidSignInput`] if `bmp_token_hex` is not valid hex.
+pub fn assemble_master_key_g(
+    package_name: &str,
+    cert_digest: &[u8; 32],
+    bmp_token_hex: &str,
+    app_secret: &str,
+) -> Result<Vec<u8>, Error> {
+    // Format the raw cert digest to the colon-upper 95-hex form the native
+    // consumes, INTERNALLY — the lowercase-64-hex form is unconstructable at this
+    // boundary (architect Finding 2: a stringly-typed `&str` let a caller pass the
+    // wrong-but-plausible cert form and silently build a wrong G).
+    let cert_colon_upper = cert_sha256_colon_upper(cert_digest);
+    // matrixKey0 is the RAW bytes the bmp_token hex decodes to (NOT the ASCII hex
+    // string). CONFIRMED raw bytes — two-source: the native reads each key string
+    // as hex TEXT via strlen (`re/ghidra/doCommandNative.c:546`), then passes it
+    // through the hex-DECODER FUN_00113150 (`doCommandNative.c:572`), which resizes
+    // its output to input_len/2 and decodes pairs of [0-9a-fA-F] nibbles to bytes
+    // (`decompiled/ghidra_security/funcs/00113150_FUN_00113150.c:32,46-76`). So the
+    // 64-char hex token folds into G as 32 RAW bytes; feeding the ASCII hex here is
+    // a silent wrong-G failure mode.
+    let matrix_key0 = hex::decode(bmp_token_hex.trim()).map_err(|e| {
+        Error::InvalidSignInput(format!(
+            "bmp_token is not valid hex (matrixKey0 decode): {e}"
+        ))
+    })?;
+    const SEP: u8 = b'_'; // 0x5f
+    let mut g = Vec::with_capacity(
+        package_name.len()
+            + 1
+            + cert_colon_upper.len()
+            + 1
+            + matrix_key0.len()
+            + 1
+            + app_secret.len(),
+    );
+    g.extend_from_slice(package_name.as_bytes());
+    g.push(SEP);
+    g.extend_from_slice(cert_colon_upper.as_bytes());
+    g.push(SEP);
+    g.extend_from_slice(&matrix_key0);
+    g.push(SEP);
+    g.extend_from_slice(app_secret.as_bytes());
+    Ok(g)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sub-step 5: offline app-cert SHA-256
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Compute the app signing-certificate SHA-256, lowercase hex, **offline** from
-/// raw PKCS#7 (`*.RSA`) signature-block bytes (`re/tuya_sign_static.md` §4).
+/// Compute the **raw** app signing-certificate SHA-256 digest (32 bytes),
+/// **offline**, from raw PKCS#7 (`*.RSA`) signature-block bytes
+/// (`re/tuya_sign_static.md` §4).
 ///
 /// Tuya's native sign uses `MessageDigest.getInstance("SHA256").digest(certBytes)`
-/// over `getPackageInfo(GET_SIGNATURES).signatures[0]`, hex-encoded, as the first
-/// `_`-joined key part. The same hash is reproducible from the APK's own v1
-/// signing cert (`META-INF/BNDLTOOL.RSA`) with NO device.
+/// over `getPackageInfo(GET_SIGNATURES).signatures[0]`. The same hash is
+/// reproducible from the APK's own v1 signing cert (`META-INF/BNDLTOOL.RSA`) with
+/// NO device.
 ///
 /// `pkcs7_der` is the DER PKCS#7 SignedData block. We extract the embedded leaf
-/// X.509 certificate's DER bytes and SHA-256 them. To avoid pulling a full ASN.1
-/// crate into the scaffold, we locate the leaf cert by scanning for the X.509
-/// `Certificate` SEQUENCE that begins the `certificates [0]` context tag in the
-/// SignedData — see [`extract_leaf_cert_der`].
+/// X.509 certificate's DER bytes (see [`extract_leaf_cert_der`]) and SHA-256 them.
+/// The native master key G and `chKey` consume this digest formatted via
+/// [`cert_sha256_colon_upper`] (NOT the lowercase hex form); the raw digest is the
+/// single source both formatters start from.
 ///
 /// # Errors
 /// [`Error::CertHash`] if no embedded certificate can be located.
-pub fn app_cert_sha256_hex(pkcs7_der: &[u8]) -> Result<String, Error> {
+pub fn app_cert_sha256_digest(pkcs7_der: &[u8]) -> Result<[u8; 32], Error> {
     use sha2::{Digest, Sha256};
     let cert_der = extract_leaf_cert_der(pkcs7_der)?;
     let mut hasher = Sha256::new();
     hasher.update(cert_der);
-    Ok(hex::encode(hasher.finalize()))
+    Ok(hasher.finalize().into())
 }
 
 /// Read `META-INF/<name>.RSA` (or `.EC`/`.DSA`) from an APK/zip on disk and
-/// return the app-cert SHA-256 lowercase hex (`re/tuya_sign_static.md` §4).
+/// return the **raw** app-cert SHA-256 digest (32 bytes) (`re/tuya_sign_static.md`
+/// §4).
 ///
-/// This is the offline ingredient validation entry point: point it at
-/// `extracted/xapk/com.philips.ph.babymonitorplus.apk` and it yields the 64-hex
-/// digest with no device. The path is a caller-supplied secret location (per
-/// CLAUDE.md, the value is never committed).
+/// This is the offline ingredient entry point the live config uses: point it at
+/// `extracted/xapk/com.philips.ph.babymonitorplus.apk` and it yields the digest
+/// with no device. The path is a caller-supplied secret location (per CLAUDE.md,
+/// the value is never committed).
 ///
 /// # Errors
 /// [`Error::CertHash`] if the zip cannot be opened, no signature block is found,
 /// or the cert cannot be extracted.
-pub fn app_cert_sha256_hex_from_apk(apk_path: &std::path::Path) -> Result<String, Error> {
+pub fn app_cert_sha256_digest_from_apk(apk_path: &std::path::Path) -> Result<[u8; 32], Error> {
     let bytes = std::fs::read(apk_path)
         .map_err(|e| Error::CertHash(format!("read APK {}: {e}", apk_path.display())))?;
     let der = find_signature_block_in_zip(&bytes)?;
-    app_cert_sha256_hex(&der)
+    app_cert_sha256_digest(&der)
+}
+
+/// Format a 32-byte cert digest as **colon-grouped UPPERCASE hex, 95 chars**:
+/// `A1:B2:…:FF` (32 pairs separated by 31 colons → `32*2 + 31 = 95`).
+///
+/// This is the EXACT form the native master key G ([`assemble_master_key_g`]) and
+/// `chKey` ([`ch_key`]) consume as their cert part (`re/master_secret_g.md`). It is
+/// NOT the lowercase 64-hex form — feeding lowercase 64-hex silently produces a
+/// wrong-but-plausible G/chKey (the regression this whole change fixes). Use this,
+/// never [`app_cert_sha256_hex`], when building G or `chKey`.
+#[must_use]
+pub fn cert_sha256_colon_upper(digest: &[u8; 32]) -> String {
+    digest
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// Compute the app signing-certificate SHA-256, **lowercase hex** (64 chars),
+/// offline from raw PKCS#7 bytes. Kept for back-compat / diagnostics; the native
+/// sign uses [`cert_sha256_colon_upper`], NOT this form. Thin wrapper over
+/// [`app_cert_sha256_digest`].
+///
+/// # Errors
+/// [`Error::CertHash`] if no embedded certificate can be located.
+pub fn app_cert_sha256_hex(pkcs7_der: &[u8]) -> Result<String, Error> {
+    Ok(hex::encode(app_cert_sha256_digest(pkcs7_der)?))
+}
+
+/// Read the app-cert SHA-256 as lowercase hex from an APK/zip on disk. Back-compat
+/// wrapper; used only by the offline cert-cross-check tests. The live path uses
+/// [`app_cert_sha256_digest_from_apk`].
+///
+/// # Errors
+/// [`Error::CertHash`] if the zip/cert cannot be read or extracted.
+pub fn app_cert_sha256_hex_from_apk(apk_path: &std::path::Path) -> Result<String, Error> {
+    Ok(hex::encode(app_cert_sha256_digest_from_apk(apk_path)?))
 }
 
 /// Locate the first `META-INF/*.RSA|*.EC|*.DSA` entry in a ZIP byte buffer and
@@ -682,7 +860,7 @@ pub const APP_PACKAGE_NAME: &str = "com.philips.ph.babymonitorplus";
 ///
 /// ```text
 /// chKey = lowercase_hex( HMAC-SHA256( key   = appId_bytes,
-///                                     msg   = packageName + "_" + certSha256Hex ) )[8..24]
+///                                     msg   = packageName + "_" + certColonUpper ) )[8..24]
 /// ```
 ///
 /// where:
@@ -690,9 +868,9 @@ pub const APP_PACKAGE_NAME: &str = "com.philips.ph.babymonitorplus";
 ///   same value carried on the wire as `clientId`);
 /// - `packageName` = `getPackageName()` = [`APP_PACKAGE_NAME`] (static, from the
 ///   manifest); stored by native `FUN_00116528` into `.bss` `DAT_001390a0`;
-/// - `certSha256Hex` = the app signing-cert SHA-256 lowercase hex —
-///   offline-computable from the APK (`re/tuya_sign_static.md` §4,
-///   [`app_cert_sha256_hex_from_apk`]); stored into `.bss` `DAT_00139058`.
+/// - `certColonUpper` = the app signing-cert SHA-256 as colon-grouped UPPERCASE
+///   95-hex ([`cert_sha256_colon_upper`]) — the SAME cert form the native master
+///   key G uses, NOT lowercase 64-hex; stored into `.bss` `DAT_00139058`.
 ///
 /// The keyed digest is **HMAC-SHA256** (NOT plain MD5 like the request `sign`):
 /// the native algo-descriptor at `0x132fe0` is `{id=6, name="SHA256",
@@ -711,14 +889,18 @@ pub const APP_PACKAGE_NAME: &str = "com.philips.ph.babymonitorplus";
 /// # Arguments
 /// - `app_key` — the Tuya appKey string (its UTF-8 bytes are the HMAC key);
 /// - `package_name` — the app package name (usually [`APP_PACKAGE_NAME`]);
-/// - `cert_sha256_hex` — the app-cert SHA-256 lowercase hex (64 chars).
+/// - `cert_digest` — the app-cert SHA-256 **raw 32-byte digest**. It is formatted
+///   to the colon-grouped UPPERCASE 95-hex form ([`cert_sha256_colon_upper`])
+///   INTERNALLY, so the wrong lowercase-64-hex cert string is unconstructable at
+///   this boundary (architect Finding 2).
 ///
 /// The returned `chKey` is a per-app value derived from the appKey + cert hash —
 /// **secret-by-policy** (CLAUDE.md): it must only ever go to `secrets/`, never a
 /// tracked file.
 #[must_use]
-pub fn ch_key(app_key: &str, package_name: &str, cert_sha256_hex: &str) -> String {
-    let message = format!("{package_name}{KEY_PART_SEP}{cert_sha256_hex}");
+pub fn ch_key(app_key: &str, package_name: &str, cert_digest: &[u8; 32]) -> String {
+    let cert_colon_upper = cert_sha256_colon_upper(cert_digest);
+    let message = format!("{package_name}{KEY_PART_SEP}{cert_colon_upper}");
     let mac = hmac_sha256(app_key.as_bytes(), message.as_bytes());
     let hex = hex::encode(mac);
     hex[8..24].to_string()
@@ -729,22 +911,24 @@ pub fn ch_key(app_key: &str, package_name: &str, cert_sha256_hex: &str) -> Strin
 /// Ghidra export `re/ghidra/getEncryptoKey.c` shows the JNI function calls the same
 /// HMAC-SHA256 helper used by `getChKey`, with:
 /// - HMAC key = `requestId.getBytes()`;
-/// - HMAC message = native cached sign key (`cert "_" bmpToken "_" appSecret`);
-/// - when the second Java arg is non-empty, the message becomes
-///   `cachedKey "_" ecode`;
+/// - HMAC message = the native master key **G** bytes (`re/master_secret_g.md`);
+/// - when the second Java arg (`ecode`) is non-empty, the message becomes
+///   `G ++ 0x5f ++ ecode`;
 /// - return value = a Java byte[16] copied from the first 16 ASCII bytes of the
-///   lowercase hex HMAC digest.
+///   lowercase-hex HMAC digest.
 ///
-/// This function implements that JNI behavior for static clients. For pre-login
-/// login requests (`token.get`, `password.login`) the app sets
-/// `setSessionRequire(false)`, so pass `None` for `ecode`.
+/// This function implements that JNI behavior for static clients. `g` is the raw
+/// master-key bytes from [`assemble_master_key_g`]. For pre-login requests
+/// (`token.get`, `password.login`) the app sets `setSessionRequire(false)`, so
+/// pass `None` for `ecode` and the message is G alone.
 #[must_use]
-pub fn et3_encrypto_key(request_id: &str, cached_key: &str, ecode: Option<&str>) -> [u8; 16] {
-    let message = match ecode.filter(|s| !s.is_empty()) {
-        Some(ecode) => format!("{cached_key}{KEY_PART_SEP}{ecode}"),
-        None => cached_key.to_string(),
-    };
-    let mac = hmac_sha256(request_id.as_bytes(), message.as_bytes());
+pub fn et3_encrypto_key(request_id: &str, g: &[u8], ecode: Option<&str>) -> [u8; 16] {
+    let mut message = g.to_vec();
+    if let Some(ecode) = ecode.filter(|s| !s.is_empty()) {
+        message.push(b'_'); // 0x5f
+        message.extend_from_slice(ecode.as_bytes());
+    }
+    let mac = hmac_sha256(request_id.as_bytes(), &message);
     let mac_hex = hex::encode(mac);
     let mut out = [0u8; 16];
     out.copy_from_slice(&mac_hex.as_bytes()[..16]);
@@ -802,38 +986,44 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
 /// Non-secret-by-construction holder for the signer's static key material.
 ///
 /// All four fields are loaded by the CALLER from `secrets/tuya_appkey.json` (and
-/// the app-cert hash computed offline via [`app_cert_sha256_hex_from_apk`]) at
-/// runtime — **no value is hardcoded** in this crate. Tests construct this with
+/// the app-cert digest computed offline via [`app_cert_sha256_digest_from_apk`])
+/// at runtime — **no value is hardcoded** in this crate. Tests construct this with
 /// SYNTHETIC values only.
 ///
 /// Feed-forward (TASK-0013): the device-list/service layer should build on THIS
 /// shape — pass a borrowed `&SigningKeyMaterial` into request decoration rather
-/// than re-reading secrets. `app_key`/`ttid` are the envelope `clientId`/`ttid`
-/// params; `app_secret` and `app_cert_sha256_hex` are sign-key parts only.
+/// than re-reading secrets. `app_key` is the envelope `clientId` param; `ttid` is
+/// vestigial for login (the wire `ttid` is rewritten, see the field doc);
+/// `app_secret` and `app_cert_sha256` feed the master key G
+/// ([`assemble_master_key_g`]) and `chKey` (via [`cert_sha256_colon_upper`]).
 #[derive(Clone)]
 pub struct SigningKeyMaterial {
     /// Tuya appKey (20-char) — wire `clientId` param + cmd-0 native init.
     pub app_key: String,
-    /// Tuya appSecret (32-char) — the third `_`-joined sign-key part.
+    /// Tuya appSecret (32-char) — the 4th part of the master key G.
     pub app_secret: String,
-    /// App signing-cert SHA-256, lowercase hex (64 chars) — first sign-key part.
-    pub app_cert_sha256_hex: String,
-    /// Channel TTID — wire `ttid` param.
+    /// App signing-cert SHA-256 — the **raw 32-byte digest**. Formatted via
+    /// [`cert_sha256_colon_upper`] when it enters G / `chKey` (colon-upper 95-hex),
+    /// NEVER the lowercase 64-hex form.
+    pub app_cert_sha256: [u8; 32],
+    /// Channel TTID (the raw `philipsclnightowl`-style value from
+    /// `secrets/tuya_appkey.json`). **Vestigial for the login path:** the wire
+    /// `ttid` the app actually sends is the rewritten `sdk_<channel>@<appKey>`
+    /// (`= sdk_international@<appKey>`, built by `live::wire_ttid`), NOT this field
+    /// (TASK-0047). Kept for completeness/diagnostics; the signer does not consume
+    /// it.
     pub ttid: String,
 }
 
 impl std::fmt::Debug for SigningKeyMaterial {
-    /// Redacts secret values: never print appSecret / cert-hash / appKey bodies.
+    /// Redacts secret values: never print appSecret / cert-digest / appKey bodies.
     /// Prevents the key material leaking via `{:?}` into logs (CLAUDE.md: never
     /// leak secrets through any channel).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SigningKeyMaterial")
             .field("app_key", &Redacted(self.app_key.len()))
             .field("app_secret", &Redacted(self.app_secret.len()))
-            .field(
-                "app_cert_sha256_hex",
-                &Redacted(self.app_cert_sha256_hex.len()),
-            )
+            .field("app_cert_sha256", &Redacted(self.app_cert_sha256.len()))
             .field("ttid", &Redacted(self.ttid.len()))
             .finish()
     }
@@ -904,23 +1094,6 @@ impl BmpTokenProvider for StaticBmpToken {
     }
 }
 
-/// Which body the keyed MD5 hashes — the `likely`-confidence fold choice from
-/// `re/tuya_sign_static.md` §7 (`MD5(key)` vs `MD5(key || canonical_string)`).
-///
-/// We make this EXPLICIT rather than guessing: a caller (or the TASK-0032 gold
-/// vector) selects the variant, and the ambiguity is resolved in exactly one
-/// place. Defaults to [`SignBody::KeyAndCanonical`] because the native code
-/// computes MD5 twice (`re/tuya_sign_static.md` §7), consistent with folding the
-/// canonical string — but this is `likely`, not `confirmed`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SignBody {
-    /// `MD5(sign_key)` only.
-    KeyOnly,
-    /// `MD5(sign_key + canonical_string)`.
-    #[default]
-    KeyAndCanonical,
-}
-
 /// The composable signer: injected key material + an injected
 /// [`BmpTokenProvider`]. Build with [`Signer::new`], sign with [`Signer::sign`].
 ///
@@ -929,60 +1102,50 @@ pub enum SignBody {
 pub struct Signer<P: BmpTokenProvider> {
     material: SigningKeyMaterial,
     token_provider: P,
-    body: SignBody,
 }
 
 impl<P: BmpTokenProvider> Signer<P> {
     /// Construct a signer from injected key material and a token provider.
-    /// Uses the default [`SignBody`]; override with [`Signer::with_body`].
     pub fn new(material: SigningKeyMaterial, token_provider: P) -> Self {
         Self {
             material,
             token_provider,
-            body: SignBody::default(),
         }
-    }
-
-    /// Override the keyed-hash body choice (the `likely` fold ambiguity).
-    #[must_use]
-    pub fn with_body(mut self, body: SignBody) -> Self {
-        self.body = body;
-        self
     }
 
     /// Produce the wire `sign` value for the given envelope params.
     ///
-    /// Pipeline (`re/tuya_sign_static.md` §7): build the canonical string,
-    /// obtain the `bmp_token` (injected), assemble the `_`-joined key, then
-    /// `md5_hex_lower` of the chosen [`SignBody`].
+    /// Pipeline (`re/master_secret_g.md`; native `doCommandNative.c:449-489`):
+    /// `str2` = [`canonical_string`] of `params`; obtain the `bmp_token`
+    /// (injected); assemble the master key **G** ([`assemble_master_key_g`]); then
+    /// `sign = lowercase_hex(HMAC-SHA256(key = G, msg = str2))` (64 hex chars).
     ///
     /// The caller MUST pass `params` whose `postData` value is already the
-    /// [`post_data_digest`] (Tuya digests it before sorting); this method does
+    /// [`post_data_digest_hex`] (Tuya digests it before sorting); this method does
     /// not re-digest.
     ///
     /// # Errors
     /// - [`Error::BmpTokenPending`] if the injected provider has no token (the
     ///   honest TOKEN-PENDING state — TASK-0032). This is the CURRENT default
     ///   behaviour with [`PendingBmpToken`].
+    /// - [`Error::InvalidSignInput`] if the `bmp_token` is not valid hex.
     /// - any error the provider returns.
     ///
     /// # Honesty
     /// A full, byte-valid signature is NOT yet achievable offline: it requires
-    /// the `bmp_token` (TASK-0032). With [`PendingBmpToken`] this method always
-    /// returns [`Error::BmpTokenPending`] — it never returns a fabricated value.
+    /// the real `bmp_token` (TASK-0032). With [`PendingBmpToken`] this method
+    /// always returns [`Error::BmpTokenPending`] — it never returns a fabricated
+    /// value.
     pub fn sign(&self, params: &BTreeMap<String, String>) -> Result<String, Error> {
-        let canonical = canonical_string(params);
+        let str2 = canonical_string(params);
         let bmp_token = self.token_provider.bmp_token()?;
-        let key = assemble_sign_key(
-            &self.material.app_cert_sha256_hex,
+        let g = assemble_master_key_g(
+            APP_PACKAGE_NAME,
+            &self.material.app_cert_sha256,
             &bmp_token,
             &self.material.app_secret,
-        );
-        let digest_input = match self.body {
-            SignBody::KeyOnly => key,
-            SignBody::KeyAndCanonical => format!("{key}{canonical}"),
-        };
-        Ok(md5_hex_lower(digest_input.as_bytes()))
+        )?;
+        Ok(hex::encode(hmac_sha256(&g, str2.as_bytes())))
     }
 }
 
@@ -1197,21 +1360,155 @@ mod tests {
         assert_ne!(correct, wrong_query_form);
     }
 
-    // ── Sub-step 4: key assembly ───────────────────────────────────────────
+    // ── Sub-step 2b: PhoneUtil-shaped deviceId + whitelist isH5 ─────────────
+
+    // TASK-0064: the synthesized deviceId must be EXACTLY 44 lowercase-hex chars
+    // (the PhoneUtil.getRemoteDeviceID layout 12+16+16), deterministic given its
+    // inputs, with seg1 fixed by brand+model and the trailing 32 chars driven by
+    // the random entropy.
     #[test]
-    fn assemble_sign_key_underscore_joins_in_order() {
-        // SYNTHETIC parts only.
-        let key = assemble_sign_key("CERTHASH", "BMPTOKEN", "APPSECRET");
-        assert_eq!(key, "CERTHASH_BMPTOKEN_APPSECRET");
-        assert_eq!(key.matches('_').count(), 2);
+    fn phone_util_device_id_is_44_lowercase_hex_and_segment_shaped() {
+        let a = [0x11u8; 32];
+        let b = [0x22u8; 32];
+        let id = generate_phone_util_device_id("google", "Pixel 8 Pro", &a, &b);
+        assert_eq!(id.len(), 44, "deviceId is 12+16+16 = 44 chars");
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "deviceId is lowercase hex: {id}"
+        );
+        // Deterministic given the same inputs.
+        assert_eq!(
+            id,
+            generate_phone_util_device_id("google", "Pixel 8 Pro", &a, &b)
+        );
+        // seg1 (first 12 chars) = md5hex(brand+model)[4..16] — independent of the
+        // random segments; the trailing 32 chars change with different entropy.
+        let id2 =
+            generate_phone_util_device_id("google", "Pixel 8 Pro", &[0x99u8; 32], &[0x88u8; 32]);
+        assert_eq!(&id[..12], &id2[..12], "seg1 depends only on brand+model");
+        assert_ne!(&id[12..], &id2[12..], "random segments differ with entropy");
+        // seg1 is exactly the documented md5hex(brand+model)[4..16].
+        let expect_seg1 = &md5_hex_lower(b"googlePixel 8 Pro")[4..16];
+        assert_eq!(&id[..12], expect_seg1);
     }
 
+    // TASK-0064: the H5 flag's whitelist key is `isH5` (KEY_H5), NOT `h5`. Prove
+    // an `isH5` param now enters the canonical string and a bare `h5` does not.
     #[test]
-    fn assemble_sign_key_order_is_load_bearing() {
-        // Prove the assertion bites: a different order yields a different key.
-        let correct = assemble_sign_key("A", "B", "C");
-        let swapped = assemble_sign_key("C", "B", "A");
-        assert_ne!(correct, swapped);
+    fn whitelist_uses_is_h5_key_not_h5() {
+        assert!(SIGN_WHITELIST.contains(&"isH5"));
+        assert!(!SIGN_WHITELIST.contains(&"h5"));
+        let mut p = BTreeMap::new();
+        p.insert("isH5".into(), "true".into());
+        p.insert("h5".into(), "ignored".into()); // not whitelisted -> dropped
+        let s = canonical_string(&p);
+        assert!(
+            s.contains("isH5=true"),
+            "isH5 must enter the canonical string: {s}"
+        );
+        assert!(!s.contains("h5=ignored"), "bare h5 must be dropped: {s}");
+    }
+
+    // ── Sub-step 4: master key G assembly ──────────────────────────────────
+
+    // The 4-part RAW byte layout with single 0x5f separators. A synthetic 64-hex
+    // bmp_token decodes to 32 raw bytes (matrixKey0). We assert the EXACT byte
+    // string an INDEPENDENT manual concatenation produces.
+    #[test]
+    fn assemble_master_key_g_concatenates_four_raw_parts() {
+        let pkg = "com.example.app";
+        let digest = [0xABu8; 32];
+        let cert = cert_sha256_colon_upper(&digest); // colon-upper 95-hex
+        let bmp_hex = "cd".repeat(32); // 64-hex → 32 raw bytes
+        let app_secret = "SYNTH_APPSECRET";
+        // assemble_master_key_g takes the RAW digest and formats it internally.
+        let g = assemble_master_key_g(pkg, &digest, &bmp_hex, app_secret).unwrap();
+
+        // INDEPENDENT manual build of the same byte string.
+        let matrix0 = hex::decode(&bmp_hex).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(pkg.as_bytes());
+        expected.push(0x5f);
+        expected.extend_from_slice(cert.as_bytes());
+        expected.push(0x5f);
+        expected.extend_from_slice(&matrix0); // RAW 32 bytes, NOT the ascii hex
+        expected.push(0x5f);
+        expected.extend_from_slice(app_secret.as_bytes());
+        assert_eq!(g, expected);
+        // matrixKey0 is the RAW decode, so the ascii hex must NOT appear verbatim.
+        assert!(
+            !g.windows(bmp_hex.len()).any(|w| w == bmp_hex.as_bytes()),
+            "matrixKey0 must be the RAW bytes, not the ascii hex string"
+        );
+    }
+
+    // The exact byte-length of G for a synthetic 64-hex bmp_token: the regression
+    // guard on the 4-part layout (pkg + _ + 95-char cert + _ + 32 raw + _ + secret).
+    #[test]
+    fn master_key_g_has_exact_layout_length() {
+        let digest = [0u8; 32];
+        let cert = cert_sha256_colon_upper(&digest);
+        assert_eq!(cert.len(), 95);
+        let bmp_hex = "ab".repeat(32); // 32 raw bytes
+        let app_secret = "SYNTH_APPSECRET_0000000000000000";
+        let g = assemble_master_key_g(APP_PACKAGE_NAME, &digest, &bmp_hex, app_secret).unwrap();
+        assert_eq!(
+            g.len(),
+            APP_PACKAGE_NAME.len() + 1 + 95 + 1 + 32 + 1 + app_secret.len(),
+        );
+    }
+
+    // NEGATIVE: a non-hex bmp_token must error loudly (the matrixKey0 decode is
+    // the silent-wrong-G trap), not silently build a wrong G from ascii bytes.
+    #[test]
+    fn assemble_master_key_g_rejects_non_hex_token() {
+        assert!(matches!(
+            assemble_master_key_g("pkg", &[0u8; 32], "NOT_HEX_!!", "secret"),
+            Err(Error::InvalidSignInput(_))
+        ));
+    }
+
+    // cert_sha256_colon_upper: the EXACT 95-char colon-grouped UPPERCASE form. The
+    // expected string is hand-written (a true gold vector, not computed by the fn)
+    // — this is the regression test for the exact silent-failure bug (lowercase
+    // 64-hex vs colon-upper 95-hex).
+    #[test]
+    fn cert_sha256_colon_upper_exact_gold_vector() {
+        // digest = [0x00, 0x01, 0x02, …, 0x1f]
+        let mut digest = [0u8; 32];
+        for (i, b) in digest.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let got = cert_sha256_colon_upper(&digest);
+        let expected = "00:01:02:03:04:05:06:07:08:09:0A:0B:0C:0D:0E:0F:\
+                        10:11:12:13:14:15:16:17:18:19:1A:1B:1C:1D:1E:1F";
+        assert_eq!(got, expected);
+        assert_eq!(got.len(), 95, "32*2 + 31 colons = 95");
+        // UPPER only (no lowercase), colon at every 3rd position except the last.
+        assert!(!got.chars().any(|c| c.is_ascii_lowercase()));
+        for (i, b) in got.bytes().enumerate() {
+            if (i + 1) % 3 == 0 {
+                assert_eq!(b, b':', "colon expected at index {i}");
+            } else {
+                assert!(b.is_ascii_uppercase() || b.is_ascii_digit());
+            }
+        }
+    }
+
+    // FIPS-180 SHA-256 known-answer vectors for the primitive that underlies both
+    // the HMAC and the cert digest. INDEPENDENT of our decompilation.
+    #[test]
+    fn sha256_fips180_known_vectors() {
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            hex::encode(Sha256::digest(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     // ── Sub-step 6: chKey (HMAC-SHA256) ────────────────────────────────────
@@ -1253,8 +1550,12 @@ mod tests {
     fn ch_key_composes_hmac_over_packagename_cert() {
         let app_key = "SYNTH_APPKEY_000000";
         let pkg = "com.example.app";
-        let cert = "ab".repeat(32); // synthetic 64-hex
-        let got = ch_key(app_key, pkg, &cert);
+        let digest = [0xABu8; 32];
+        // `cert` is the colon-upper 95-hex form used by the INDEPENDENT recompute
+        // below; `ch_key` formats the raw digest to that form internally, so we
+        // pass the raw `digest` to it.
+        let cert = cert_sha256_colon_upper(&digest);
+        let got = ch_key(app_key, pkg, &digest);
 
         // INDEPENDENT: HMAC-SHA256(key=appId, msg=pkg + "_" + cert), hex[8..24].
         let full = hex::encode(hmac_sha256(
@@ -1273,24 +1574,23 @@ mod tests {
     // (a wrong key/msg swap would silently produce a wrong, plausible token).
     #[test]
     fn ch_key_key_message_order_is_load_bearing() {
-        let correct = ch_key("APPID", "PKG", &"cd".repeat(32));
+        let digest = [0xCDu8; 32];
+        let cert = cert_sha256_colon_upper(&digest);
+        let correct = ch_key("APPID", "PKG", &digest);
         // Wrong: treat the message as the key and vice-versa.
-        let swapped = hex::encode(hmac_sha256(
-            format!("PKG_{}", "cd".repeat(32)).as_bytes(),
-            b"APPID",
-        ));
+        let swapped = hex::encode(hmac_sha256(format!("PKG_{cert}").as_bytes(), b"APPID"));
         assert_ne!(correct, swapped);
     }
 
     #[test]
     fn et3_encrypto_key_matches_native_hmac_shape() {
         let request_id = "REQ-123";
-        let cached_key = "cert_bmp_secret";
+        let g = b"GGGG_master_secret_G_bytes"; // raw master-key bytes (synthetic)
 
         // Native getEncryptoKey returns Java byte[16] copied from the first 16
-        // ASCII bytes of lowercase hex(HMAC-SHA256(key=requestId, msg=cachedKey)).
-        let expected_hex = hex::encode(hmac_sha256(request_id.as_bytes(), cached_key.as_bytes()));
-        let got = et3_encrypto_key(request_id, cached_key, None);
+        // ASCII bytes of lowercase hex(HMAC-SHA256(key=requestId, msg=G)).
+        let expected_hex = hex::encode(hmac_sha256(request_id.as_bytes(), g));
+        let got = et3_encrypto_key(request_id, g, None);
         assert_eq!(&got, &expected_hex.as_bytes()[..16]);
         assert!(got.iter().all(u8::is_ascii_hexdigit));
     }
@@ -1298,15 +1598,18 @@ mod tests {
     #[test]
     fn et3_encrypto_key_appends_ecode_when_present() {
         let request_id = "REQ-123";
-        let cached_key = "cert_bmp_secret";
+        let g = b"GGGG_master_secret_G_bytes";
         let ecode = "ECODE";
 
-        let no_ecode = et3_encrypto_key(request_id, cached_key, None);
-        let with_ecode = et3_encrypto_key(request_id, cached_key, Some(ecode));
+        let no_ecode = et3_encrypto_key(request_id, g, None);
+        let with_ecode = et3_encrypto_key(request_id, g, Some(ecode));
         assert_ne!(no_ecode, with_ecode, "ecode changes the native message");
 
-        let msg = format!("{cached_key}_{ecode}");
-        let expected_hex = hex::encode(hmac_sha256(request_id.as_bytes(), msg.as_bytes()));
+        // msg = G ++ 0x5f ++ ecode (the bytes, not a string concat of hex).
+        let mut msg = g.to_vec();
+        msg.push(b'_');
+        msg.extend_from_slice(ecode.as_bytes());
+        let expected_hex = hex::encode(hmac_sha256(request_id.as_bytes(), &msg));
         assert_eq!(&with_ecode, &expected_hex.as_bytes()[..16]);
     }
 
@@ -1391,7 +1694,7 @@ mod tests {
         let material = SigningKeyMaterial {
             app_key: "SYNTH_APPKEY_000000".into(),
             app_secret: "SYNTH_APPSECRET_0000000000000000".into(),
-            app_cert_sha256_hex: "00".repeat(32),
+            app_cert_sha256: [0u8; 32],
             ttid: "SYNTH_TTID".into(),
         };
         let signer = Signer::new(material, PendingBmpToken);
@@ -1411,33 +1714,54 @@ mod tests {
         let material = SigningKeyMaterial {
             app_key: "SECRETKEY".into(),
             app_secret: "SECRETSECRET".into(),
-            app_cert_sha256_hex: "deadbeef".into(),
+            app_cert_sha256: [0u8; 32],
             ttid: "ttid".into(),
         };
         let dbg = format!("{material:?}");
         assert!(dbg.contains("redacted"));
         assert!(!dbg.contains("SECRETKEY"));
         assert!(!dbg.contains("SECRETSECRET"));
-        assert!(!dbg.contains("deadbeef"));
+    }
+
+    // The wire `sign` is 64 lowercase hex chars (HMAC-SHA256 → 32 bytes → 64 hex),
+    // NOT the old 32-char MD5 form. This is the headline shape AC of TASK-0060.
+    #[test]
+    fn sign_output_is_64_lowercase_hex() {
+        let material = SigningKeyMaterial {
+            app_key: "SYNTH_APPKEY_000000".into(),
+            app_secret: "SYNTH_APPSECRET_0000000000000000".into(),
+            app_cert_sha256: [0xABu8; 32],
+            ttid: "SYNTH_TTID".into(),
+        };
+        let signer = Signer::new(material, StaticBmpToken::new("cd".repeat(32)));
+        let mut params = BTreeMap::new();
+        params.insert("a".into(), "smartlife.m.user.username.token.get".into());
+        params.insert("time".into(), "1700000000".into());
+
+        let sign = signer.sign(&params).unwrap();
+        assert_eq!(sign.len(), 64, "HMAC-SHA256 sign is 64 hex chars, not 32");
+        assert!(sign
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     // PARTIAL DIFFERENTIAL over the recovered sub-steps: with a SYNTHETIC
-    // placeholder bmp_token, the assembled key + MD5 are fully determined and
-    // reproducible. We assert the composed pipeline equals an INDEPENDENT manual
-    // recomputation (md5 of the '_'-joined key + canonical) — proving the
-    // recovered steps compose correctly NOW, without the real token. This is the
-    // honest partial differential of TESTING.md Part-2 signal #2.
+    // bmp_token the assembled G + HMAC are fully determined and reproducible. We
+    // assert the composed pipeline equals an INDEPENDENT manual recomputation
+    // (HMAC-SHA256(G, str2)) — proving the recovered steps compose correctly NOW,
+    // without the real token. The RECIPE itself (key=G, msg=str2) is single-source
+    // ground truth and cannot be offline-validated end-to-end; this only proves the
+    // Rust composition is self-consistent over its sub-steps.
     #[test]
     fn partial_differential_recovered_substeps_compose() {
         let material = SigningKeyMaterial {
             app_key: "SYNTH_APPKEY_000000".into(),
             app_secret: "SYNTH_APPSECRET_0000000000000000".into(),
-            app_cert_sha256_hex: "ab".repeat(32), // synthetic 64-hex
+            app_cert_sha256: [0xABu8; 32],
             ttid: "SYNTH_TTID".into(),
         };
-        let placeholder_token = StaticBmpToken::new("PLACEHOLDER_BMP_TOKEN");
-        let signer =
-            Signer::new(material.clone(), placeholder_token).with_body(SignBody::KeyAndCanonical);
+        let bmp_hex = "cd".repeat(32); // synthetic 64-hex → 32 raw bytes
+        let signer = Signer::new(material.clone(), StaticBmpToken::new(bmp_hex.clone()));
 
         let mut params = BTreeMap::new();
         params.insert("a".into(), "smartlife.m.user.email.password.login".into());
@@ -1447,22 +1771,22 @@ mod tests {
         let got = signer.sign(&params).unwrap();
 
         // INDEPENDENT recomputation of the recovered pipeline:
-        let canonical = "a=smartlife.m.user.email.password.login||time=1700000000||v=1.0";
-        let key = format!(
-            "{}_{}_{}",
-            "ab".repeat(32),
-            "PLACEHOLDER_BMP_TOKEN",
-            "SYNTH_APPSECRET_0000000000000000"
-        );
-        let expected = md5_hex_lower(format!("{key}{canonical}").as_bytes());
+        let str2 = "a=smartlife.m.user.email.password.login||time=1700000000||v=1.0";
+        let g = assemble_master_key_g(
+            APP_PACKAGE_NAME,
+            &material.app_cert_sha256,
+            &bmp_hex,
+            &material.app_secret,
+        )
+        .unwrap();
+        let expected = hex::encode(hmac_sha256(&g, str2.as_bytes()));
         assert_eq!(got, expected);
-        assert_eq!(got.len(), 32);
+        assert_eq!(got.len(), 64);
 
-        // KeyOnly body must differ (proves the SignBody fold is load-bearing).
-        let signer_keyonly = Signer::new(material, StaticBmpToken::new("PLACEHOLDER_BMP_TOKEN"))
-            .with_body(SignBody::KeyOnly);
-        let got_keyonly = signer_keyonly.sign(&params).unwrap();
-        assert_ne!(got, got_keyonly);
+        // A different bmp_token (→ different G) must change the sign (the token is
+        // genuinely a keyed input, not cosmetic).
+        let signer2 = Signer::new(material, StaticBmpToken::new("ef".repeat(32)));
+        assert_ne!(got, signer2.sign(&params).unwrap());
     }
 
     // post_data_digest: surfaces the length-24-vs-32 ambiguity as a typed error

@@ -73,7 +73,7 @@ fn live_login_then_device_list_finds_scd921() {
         // the store and drives the read path from there.
         app_key: String::new(),
         app_secret: String::new(),
-        app_cert_sha256_hex: String::new(),
+        app_cert_sha256: [0u8; 32],
         ttid: String::new(),
     };
 

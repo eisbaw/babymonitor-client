@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-06-25 15:10'
-updated_date: '2026-06-25 15:20'
+updated_date: '2026-06-26 02:04'
 labels:
   - phase3
   - wave3
@@ -56,6 +56,12 @@ STAGE B (captcha/verifyToken static trace, NO network):
 
 GATES: just e2e + just secret-scan + just check-evidence green; cargo clippy --features live -D warnings; cargo test --features live --no-run. Commit per logical unit (branch task-0050-sign-differential).
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+CLEAN RE-RUN (2026-06-26): the original differential was wrong-vs-wrong (malformed 32-hex sign). Re-fired with the corrected valid 64-hex HMAC-SHA256(G,str2) signer: valid-sign and corrupted-valid-sign both return identical ILLEGAL_CLIENT_ID. Sign-insensitivity now PROVEN cleanly. ICI is an identity/provisioning gate upstream of sign-verify, not a sign-class reject.
+<!-- SECTION:NOTES:END -->
 
 ## Final Summary
 

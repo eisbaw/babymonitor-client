@@ -7,7 +7,7 @@ status: To Do
 assignee:
   - '@architect'
 created_date: '2026-06-25 11:40'
-updated_date: '2026-06-25 18:21'
+updated_date: '2026-06-26 02:04'
 labels:
   - phase3
   - wave3
@@ -56,4 +56,6 @@ SINGLE LIVE token.get RE-ATTEMPT (chKey-corrected request) — OUTCOME: still IL
 STATIC SURFACE EXHAUSTED (qa GO + static lead-hunt conclusive): corrected request matched host + clientId/time + chKey(confirmed) + ALL signed/whitelisted params + ALL 3 SDK headers (User-Agent/Connection/x-client-trace-id; no interceptor adds identity headers) + NO attestation gate exists anywhere in the decompile. ILLEGAL_CLIENT_ID is server-only, identity-layer, PRE-sign -> appKey/ttid PROVISIONING, not a missing static field. Likely: (a) our extracted appKey/ttid isn't the live value, or (b) appKey is server-bound to the official Philips app registration. STOPPING per guardrail -> owner decides. The ONLY remaining unblock is an on-device capture (broader than the authorized cloud login) -> TASK-0045. P2: live.rs scrub_url_secrets docstring stale-mentions without_url (not called).
 
 Reconciled at ship (2026-06-25): CONCLUDED, goal NOT achievable under static-only. The live token.get is blocked by a PROVEN sign-insensitive server-side identity gate (TASK-0050) before the gateway evaluates the sign, so the bmp_token candidate can NEVER be validated/refuted via this path. password.login never reached; 0 lockout calls. Not a success — recorded honestly in re/live_login.md. No further static action possible; supersede via a captured session (TASK-0022) if ever revisited.
+
+OUTCOME (2026-06-26): authorized one-time live probes fired with the CORRECTED signer (HMAC-SHA256/G 64-hex) + byte-faithful request. token.get returns ILLEGAL_CLIENT_ID; corrupt-sign differential identical -> sign-insensitive server-side identity gate. Device-list/signaling capture is BLOCKED by this gate (login never proceeds past token.get). The bmp_token candidate can be neither confirmed nor refuted because the server never reaches sign-verification. See re/live_login.md 2026-06-26. Not statically resolvable.
 <!-- SECTION:NOTES:END -->

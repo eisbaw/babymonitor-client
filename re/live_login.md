@@ -18,6 +18,40 @@ OUTCOME, never a value.
 
 ---
 
+## 2026-06-26 DEFINITIVE — corrected-signer live A/B proves a server-side identity gate
+
+After 4 native-decompile rounds we found and fixed the real root-cause bug: our Rust
+client had ported the WRONG native function for the request sign (`computeDigest`,
+MD5→32-hex, the response-digest path) instead of `doCommandNative` cmd1 =
+`HMAC-SHA256(master-key G, str2)→64-hex`. The signer was re-ported byte-exactly (G =
+`packageName_certColonUpper_matrixKey0_appSecret`, cert folded as colon-grouped
+UPPERCASE 95-char), the synthetic `deviceId` omission was corrected (the genuine app
+DOES send+sign a `PhoneUtil.getDeviceID`-shaped id via the `ApiParams` subclass), and a
+round-4 net-layer trace confirmed every wire field (clientId value, ttid, host, the 4
+headers, params) now matches the genuine app.
+
+Two AUTHORIZED `--probe-only` `token.get` calls to `a1.tuyaeu.com` (account owner's
+credentials; no `password.login`; codes only, no values):
+
+| Variant | Sign | Result |
+|---|---|---|
+| `candidate-sign` | valid 64-hex `HMAC-SHA256(G, str2)` | `ILLEGAL_CLIENT_ID` (Invalid client;No access) |
+| `corrupt-sign`   | same sign, ONE hex nibble flipped (shape preserved) | `ILLEGAL_CLIENT_ID` (identical) |
+
+**This is the clean differential the 2026-06-25 note demanded** (valid vs
+corrupted-VALID sign, not the discredited wrong-vs-wrong). Identical results prove the
+gateway **rejects on client identity BEFORE sign-verification** — `ILLEGAL_CLIENT_ID` is
+**sign-insensitive**. With a byte-faithful request, the correct provisioned `clientId`
+value, and a valid signature, the reject persists. Therefore ICI is a **server-side
+app-identity/provisioning binding** (package↔appKey↔cert attestation, or a
+Play-Integrity/SafetyNet-class signal) that a static standalone client cannot reproduce.
+It is NOT a client request-construction defect — the static + standalone-live surface is
+EXHAUSTED. Further progress requires on-device capture of the genuine app's `token.get`
+(TASK-0022; out of the static-only scope) or Tuya provisioning this appKey for standalone
+use. The signer/deviceId fixes remain correct and necessary regardless.
+
+---
+
 ## 2026-06-25 correction — TASK-0050/0051 exhaustion verdict superseded
 
 The "static cloud-login avenue is airtight-exhausted" conclusion below is now

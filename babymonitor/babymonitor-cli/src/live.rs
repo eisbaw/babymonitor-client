@@ -1317,17 +1317,23 @@ fn do_token_get(
 
 /// RSA-encrypt the password with the token.get pubkey (the `ifencrypt=1` path).
 ///
-/// Tuya's `TokenBean.publicKey`/`exponent` are decimal-string RSA modulus +
-/// exponent; we build an [`RsaPublicKey`] from them and PKCS#1 v1.5-encrypt the
-/// UTF-8 password, returning lowercase hex (the app sends the hex of the
-/// ciphertext). The password value never appears in any log.
+/// CAPTURE/JADX-VERIFIED: the app RSA-encrypts the **MD5 hex of the password**, NOT
+/// the raw password — `passwd = RSA_PKCS1v15(pubkey, MD5Util.md5AsBase64(password))`,
+/// and `md5AsBase64` returns the 32-char LOWERCASE HEX MD5 (despite its name; same
+/// helper as the deviceId segments). Source: `dqdbbqp.java:378-381` (`"RSA/NONE/PKCS1Padding"`)
+/// and `ThingDefaultPasswordApi.java:708-712` (`"RSA/ECB/PKCS1Padding"` — both PKCS#1 v1.5).
+/// Encrypting the RAW password yields `USER_PASSWD_WRONG` (the server compares against
+/// the MD5-hex it expects). `TokenBean.publicKey`/`exponent` are decimal-string RSA
+/// modulus + exponent. Returns lowercase hex of the ciphertext. Nothing is logged.
 fn rsa_encrypt_password(pubkey: &TokenBean, password: &str) -> Result<String, LiveError> {
     // The publicKey may be a decimal modulus string (Tuya's TokenBean form) or a
     // PEM/DER SPKI. Try decimal modulus+exponent first (the documented form).
     let key = build_rsa_key(&pubkey.public_key, &pubkey.exponent)?;
+    // MD5-hex the password first (md5AsBase64 -> 32-char lowercase hex), then RSA it.
+    let pw_md5_hex = babymonitor_core::sign::md5_hex_lower(password.as_bytes());
     let mut rng = OsRng;
     let ct = key
-        .encrypt(&mut rng, Pkcs1v15Encrypt, password.as_bytes())
+        .encrypt(&mut rng, Pkcs1v15Encrypt, pw_md5_hex.as_bytes())
         .map_err(|e| LiveError::Crypto(format!("rsa encrypt: {e}")))?;
     Ok(hex::encode(ct))
 }

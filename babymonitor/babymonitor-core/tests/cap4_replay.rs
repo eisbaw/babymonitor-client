@@ -34,7 +34,7 @@
 use std::path::{Path, PathBuf};
 
 use babymonitor_core::stream::media::h264::H264Depacketizer;
-use babymonitor_core::stream::media::{MediaEngine, MediaUnit};
+use babymonitor_core::stream::media::{audio, MediaEngine, MediaUnit};
 
 /// The camera's source IP in the cap4 capture.
 const CAM_IP: &str = "192.0.2.184";
@@ -152,6 +152,13 @@ fn is_stun(p: &[u8]) -> bool {
 /// `conv` (non-STUN). Foreign-session datagrams are included here and filtered by
 /// the engine's HMAC gate downstream.
 fn camera_conv_datagrams<'a>(records: &'a [&'a [u8]], conv: u32) -> Vec<&'a [u8]> {
+    camera_media_datagrams(records, &[conv])
+}
+
+/// Like [`camera_conv_datagrams`] but for a set of `convs`, preserving the single
+/// interleaved capture order — the way the live unified pump sees video + audio on
+/// one socket.
+fn camera_media_datagrams<'a>(records: &'a [&'a [u8]], convs: &[u32]) -> Vec<&'a [u8]> {
     let mut out = Vec::new();
     for &frame in records {
         let Some((src, pl)) = sll2_udp(frame) else {
@@ -161,7 +168,7 @@ fn camera_conv_datagrams<'a>(records: &'a [&'a [u8]], conv: u32) -> Vec<&'a [u8]
             continue;
         }
         let c = u32::from_le_bytes([pl[0], pl[1], pl[2], pl[3]]);
-        if c != conv || pl[4] != IKCP_CMD_PUSH {
+        if !convs.contains(&c) || pl[4] != IKCP_CMD_PUSH {
             continue;
         }
         out.push(pl);
@@ -305,4 +312,76 @@ fn cap4_audio_matches_ground_truth() {
         "no non-HMAC errors expected on the key0 session"
     );
     assert_bytes_eq(&out, &truth, "cap4 audio S16LE");
+}
+
+/// The UNIFIED pump path the live CLI uses: feed BOTH media convs (1 video,
+/// 2 audio) through ONE [`MediaEngine`] in interleaved capture order, then route
+/// each decoded [`MediaUnit`] by its `conv` — video → H.264 Annex-B, downstream
+/// audio → raw S16LE via [`audio::downstream_pcm_s16le`]. Both reconstructed
+/// streams must byte-match the independent ground truth. This is the end-to-end
+/// proof of the conv-based A/V routing + the downstream-audio (S16LE @ 16 kHz, NOT
+/// G.711) handling that the `babymonitor-cli stream` live pump performs.
+#[test]
+#[ignore = "local-only: needs the gitignored cap4 capture + keys under secrets/"]
+fn cap4_unified_pump_routes_av_to_truth() {
+    if !inputs_present() || !video_truth_path().exists() || !audio_truth_path().exists() {
+        return;
+    }
+    let key = load_key0();
+    let pcap = std::fs::read(pcap_path()).expect("read pcap");
+    let records = parse_pcap(&pcap);
+    // Both convs in ONE interleaved stream (as the live socket delivers them).
+    let datagrams = camera_media_datagrams(&records, &[VIDEO_CONV, AUDIO_CONV]);
+
+    let mut engine = MediaEngine::from_security_level(3, key).expect("engine");
+    let mut depay = H264Depacketizer::new();
+    let mut video = Vec::new();
+    let mut audio_pcm = Vec::new();
+    let (mut hmac_dropped, mut other_err) = (0usize, 0usize);
+    for &dg in &datagrams {
+        match engine.push_datagram(dg) {
+            Ok(units) => {
+                for u in &units {
+                    if u.is_video() {
+                        for nal in depay.push(&u.payload).expect("depacketize") {
+                            video.extend_from_slice(&nal);
+                        }
+                    } else if u.is_downstream_audio() {
+                        // The downstream "decode" is identity — S16LE samples.
+                        audio_pcm.extend_from_slice(audio::downstream_pcm_s16le(&u.payload));
+                    }
+                }
+            }
+            Err(e) => {
+                if e.to_string().contains("HMAC") {
+                    hmac_dropped += 1;
+                } else {
+                    other_err += 1;
+                }
+            }
+        }
+    }
+
+    let video_truth = std::fs::read(video_truth_path()).expect("read video truth");
+    let audio_truth = std::fs::read(audio_truth_path()).expect("read audio truth");
+    eprintln!(
+        "cap4 UNIFIED: datagrams={} hmac_dropped(foreign)={} other_err={} \
+         video_bytes={} (truth {}) audio_bytes={} (truth {}, {} ms @ {} Hz)",
+        datagrams.len(),
+        hmac_dropped,
+        other_err,
+        video.len(),
+        video_truth.len(),
+        audio_pcm.len(),
+        audio_truth.len(),
+        audio::duration_ms(audio_pcm.len()),
+        audio::DOWNSTREAM_SAMPLE_RATE_HZ,
+    );
+    assert_eq!(other_err, 0, "no non-HMAC errors on the key0 session");
+    assert_bytes_eq(&video, &video_truth, "cap4 unified video H.264");
+    assert_bytes_eq(
+        &audio_pcm,
+        &audio_truth,
+        "cap4 unified downstream audio S16LE",
+    );
 }

@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-06-26 20:20'
-updated_date: '2026-06-26 22:20'
+updated_date: '2026-06-27 19:46'
 labels:
   - stream
   - decoder
@@ -26,7 +26,7 @@ Consume the depacketized media from the transport+decrypt engine (TASK-0037) and
 - [x] #2 openh264 (or ffmpeg) decodes the Annex-B stream to raw frames; one keyframe renders
 - [x] #3 G.711 mu-law audio decoded (LUT); optional playback
 - [x] #4 babymonitor-cli stream subcommand drives login->discovery->signaling->media->display end-to-end
-- [ ] #5 Decode validated against cap4 decrypted frames (TASK-0068); secrets stay in secrets/
+- [x] #5 Decode validated against cap4 decrypted frames (TASK-0068); secrets stay in secrets/
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -49,6 +49,27 @@ VALIDATION (ACTUAL): just e2e EXIT 0 (core 213 pass/0 fail/3 ign, cli 13 pass, s
 HONEST GAPS: AC#5 NOT met — no emulator_captures/cap4 exists, so decode validated on SYNTHETIC H.264 only, not captured camera bytes. Live drive (login/broker/camera) cannot run in sandbox — gated honestly. Audio: G.711 decode done; muxing PCMU into the TS is a follow-up (video-only TS served today).
 
 IMPLEMENTED: G.711 mu-law LUT, AccessUnitAssembler (AU=RTP M-bit, keyframe=NAL5), babymonitor-cli stream subcommand, MPEG-TS-over-HTTP. just e2e + stream-validate GREEN: synthetic replay -> depacketize (33 NAL->35 RTP->33 NAL, 1 keyframe AU) -> MPEG-TS, ffprobe=h264 320x240 30 frames. Command: vlc/mpv/ffplay http://127.0.0.1:8554/stream.ts (also --replay-annexb / --output ts|stdout).
+
+Decode validated on REAL cap4: 1920x1080 H.264 Main, 25 keyframes/1231 frames, 0 ffmpeg errors; frames in secrets/cap4_frames/. The stream subcommand path is validated (offline) end-to-end against real ciphertext.
+
+AUDIO BUG (cap4 ground truth): the DOWNSTREAM (camera->app baby audio) is 16 kHz MONO S16LE RAW PCM (cap4 stage6_extract AUDIO_RATE=16000; replay concatenates payloads, byte-matches). The committed g711 module (PCMU/8000, PT0) is the TALK-BACK (app->camera) direction or an unverified cap3 assumption — it does NOT render the camera audio. Fix: handle downstream audio as raw 16k S16LE + mux into the TS.
+
+## Live stream assembled + AUDIO FIX (cap4 ground truth) + A/V mux — implementer cycle
+
+Built on the TASK-0075 ICE stage (uncommitted tree). Both required gates GREEN: just e2e -> exit 0; cargo clippy -p babymonitor-cli --features live --all-targets -D warnings -> clean. NOT committed.
+
+AUDIO FIX (the headline): the DOWNSTREAM camera audio (conv=2) is raw 16 kHz mono S16LE PCM, NOT G.711. The engine already produced byte-exact S16LE; the bug was in the CLI/mux + docs treating it as PCMU/8k.
+- core: new stream/media/audio.rs (downstream S16LE@16k, identity decode + rate/format constants + duration/sample helpers; clearly separated from g711 which is now relabeled TALK-BACK/upstream only).
+- core: MediaUnit gained conv (kcp::VIDEO_CONV=1 / AUDIO_CONV=2) so the unified pump routes video vs downstream-audio exactly as the ground-truth extractor (route by conv, not PT). is_video()/is_downstream_audio() helpers.
+- VALIDATED byte-exact vs REAL cap4 (tests/cap4_replay.rs, #[ignore]d): cap4_unified_pump_routes_av_to_truth feeds BOTH convs through ONE engine and reconstructs video=4,090,176 B (truth) AND downstream audio=1,532,800 B S16LE (truth, 47,900 ms @ 16 kHz) byte-for-byte.
+
+A/V MUX (TASK-0073): babymonitor-cli stream --replay-audio <s16le> muxes the downstream S16LE alongside H.264 into MPEG-TS (ffmpeg 2nd input -f s16le -ar 16000 -ac 1 -> AAC). stream-validate now asserts ffprobe sees BOTH an h264 video AND an audio track; wired into just e2e. Live pump feeds audio via a FIFO.
+
+WIRING (0069/0070/0037): new babymonitor-cli/src/stream_live.rs (gated --features live) is the ONE assembled driver: load session -> runtime bundle (secrets/stream_runtime.json, token-injectable) -> derive MQTT creds (mqtt_auth) -> broker TLS connect+302 negotiate (connect_and_negotiate) -> ICE host-direct + consent check -> MediaEngine pump -> H.264+S16LE -> MPEG-TS over HTTP. Live socket I/O is REACHED not faked; absent session/bundle -> honest StreamPending listing exactly what is missing (never a fabricated stream).
+
+DOCS: wrote re/live_stream_run.md (owner steps: secrets, MFA two-run, stream cmd, vlc URL, live-gated risks incl. the Frida hook on qpqbppd/SdkMqttCertificationInfo to verify MQTT CONNECT creds); fixed stale re/stream_playback.md (cap4 now exists+byte-validates; auth is 20B HMAC-SHA1 not SHA256; downstream audio S16LE not G.711; A/V mux).
+
+HONEST: AC#5 (cap4 decode validation) is now MET byte-exact. Live stages 4-6 (broker/camera sockets) are owner-run (no broker/camera in sandbox) - NOT executed here. secret-scan: my files add ZERO findings (synthetic localKey injected via placeholder + allow-marked const). check-evidence has residual findings on the operational run-docs (pre-existing-red gate; mis-parses shell # comments as headers; not in just e2e).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

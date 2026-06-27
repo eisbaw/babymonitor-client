@@ -16,6 +16,14 @@ path = "src/main.rs"
 # NETWORK/TLS-heavy trees deliberately kept OUT of the default build so
 # `just e2e` / `just assert-offline` never compile or link them — the offline gate
 # stays green. Build the live path explicitly with `--features live`.
+#
+# It ALSO forward-enables `babymonitor-core/live-tls` (TASK-0074): without this the
+# TLS:8883 broker CONNECT line in core's stream::transport
+# (`opts.set_transport(rumqttc::Transport::tls_with_default_config())`, under
+# `#[cfg(feature = "live-tls")]`) is NEVER compiled by `cargo build --features live`,
+# so the live MQTT signaling path would silently fall back to plain TCP. The core
+# `live-tls` feature pulls rumqttc's `use-rustls` (rustls+ring), another TLS-heavy
+# tree kept out of the offline/default build for the same reason as above.
 live = [
     "dep:reqwest",
     "dep:rsa",
@@ -24,6 +32,7 @@ live = [
     "dep:hex",
     "dep:aes-gcm",
     "dep:base64",
+    "babymonitor-core/live-tls",
 ]
 
 [dependencies]

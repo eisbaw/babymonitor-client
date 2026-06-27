@@ -1,12 +1,19 @@
 //! G.711 µ-law (PCMU, RTP **PT 0**) decode — a 256-entry lookup table → 16-bit
 //! signed PCM (`re/media_decode_spec.md` §4 Step D, §5).
 //!
-//! The cap3 media path negotiates `PT 0` for the return-audio channel; its
-//! payload is raw G.711 µ-law samples at **8 kHz, mono** (`pts = rtp_ts >> 3` ms,
-//! `imm_p2p_rtc_recv_frame.c:91-99`). µ-law has no sync word, so correctness is
-//! validated structurally (RTP `PT == 0`) plus the decoded amplitude envelope —
-//! `re/media_decode_spec.md` §4 marks PT/ts as **[C]** and the audio plausibility
-//! as **[I]**.
+//! # ⚠ This is the TALK-BACK (app→camera) direction ONLY
+//!
+//! G.711 µ-law @ 8 kHz is the **upstream** "speak to the baby" audio, NOT the
+//! camera's downstream audio. The **downstream** camera audio (camera→app, the
+//! one you listen to) is raw **16 kHz mono S16LE PCM** on `conv = 2` — see
+//! [`super::audio`], cap4-validated byte-exact. Do **not** run this µ-law decode
+//! on the downstream payload: it would halve the rate and mangle every sample
+//! (that conflation was the original "audio bug"). This module is retained for the
+//! talk-back path and as the documented PCMU codec.
+//!
+//! µ-law has no sync word, so correctness is validated structurally (RTP `PT == 0`)
+//! plus the decoded amplitude envelope — `re/media_decode_spec.md` §4 marks PT/ts
+//! as **[C]** and the talk-back audio plausibility as **[I]**.
 //!
 //! The decode is the standard ITU-T G.711 µ-law expansion (the Sun `g711.c`
 //! reference): bias `0x84`, 8-bit code → 14-bit magnitude → sign. It is a pure,

@@ -40,6 +40,17 @@ pub const IKCP_CMD_WINS: u8 = 0x54;
 /// can route it away from the media RTP parse.
 pub const CONTROL_CONV: u32 = 0x0100_00f3;
 
+/// The **video** media `conv` (`1`). On cap4 (and whenever native
+/// `active_handle == 0`) `conv == channel id`; channel `1` carries H.264
+/// (`tests/cap4_replay.rs`, `emulator_captures/cap4/stage6_extract.py`).
+pub const VIDEO_CONV: u32 = 0x0000_0001;
+
+/// The **downstream camera audio** media `conv` (`2`). Channel `2` carries raw
+/// 16 kHz mono S16LE PCM — NOT G.711 (cap4 ground truth; see
+/// [`super::audio`]). The G.711 µ-law channel ([`super::g711`]) is the *talk-back*
+/// (app→camera) direction only.
+pub const AUDIO_CONV: u32 = 0x0000_0002;
+
 /// Default receive **acceptance** window (segments). The native side derives the
 /// window from a byte budget (`rcvbytes/0x640`); a pure decoder is not
 /// flow-controlled, so we use a generous fixed window and document that segments

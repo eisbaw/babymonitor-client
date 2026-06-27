@@ -53,6 +53,13 @@ mod live;
 // the on-disk session and honestly reports its gate (TASK-0070).
 mod stream;
 
+// The assembled LIVE A/V driver (login -> discovery -> MQTT 302 signaling -> ICE
+// -> media -> MPEG-TS). Compiled ONLY under `--features live` (it reaches real
+// broker/camera sockets); the default build keeps the honest gated reporter
+// (TASK-0069/0070/0037).
+#[cfg(feature = "live")]
+mod stream_live;
+
 /// Path (relative to this crate) of the synthetic device-list fixture used as the
 /// default OFFLINE body. It is committed, obviously-synthetic test data — never a
 /// real capture.

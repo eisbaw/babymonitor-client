@@ -35,6 +35,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
+#[cfg(not(feature = "live"))]
 use babymonitor_core::session::SessionStore;
 use babymonitor_core::stream::media::h264::{AccessUnitAssembler, H264Depacketizer};
 use babymonitor_core::stream::media::rtp;
@@ -101,6 +102,19 @@ pub struct StreamArgs {
     #[arg(long)]
     pub replay_annexb: Option<PathBuf>,
 
+    /// OFFLINE replay: mux this raw **downstream camera audio** alongside the
+    /// `--replay-annexb` video. It is **16 kHz mono S16LE PCM** (NOT G.711 — see
+    /// `babymonitor_core::stream::media::audio`); ffmpeg reads it directly and
+    /// encodes it into the MPEG-TS as an AAC audio track. Requires
+    /// `--replay-annexb`; not supported with `--output stdout`.
+    #[arg(long)]
+    pub replay_audio: Option<PathBuf>,
+
+    /// Sample rate (Hz) of the `--replay-audio` S16LE stream. Defaults to the
+    /// cap4-pinned downstream rate (16 kHz).
+    #[arg(long, default_value_t = babymonitor_core::stream::media::audio::DOWNSTREAM_SAMPLE_RATE_HZ)]
+    pub audio_rate: u32,
+
     /// RTP packetization budget (payload bytes) for the replay packetizer. NALs
     /// larger than this are FU-A fragmented.
     #[arg(long, default_value_t = DEFAULT_MTU)]
@@ -127,9 +141,20 @@ pub fn run_stream(args: &StreamArgs, _json: bool) -> Result<(), Error> {
 // LIVE path — wired, honestly gated
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// LIVE dispatch under `--features live`: hand off to the assembled
+/// [`crate::stream_live`] driver (login → discovery → MQTT signaling → ICE →
+/// media → MPEG-TS), which reaches the real broker/camera sockets and is honestly
+/// gated when no session / runtime bundle is injected.
+#[cfg(feature = "live")]
+fn run_live(args: &StreamArgs) -> Result<(), Error> {
+    crate::stream_live::run_live_stream(args)
+}
+
 /// Wire the live pipeline as far as the offline environment allows, then stop at
 /// the first honest gate. All diagnostics go to stderr so `--output stdout` keeps
-/// stdout clean.
+/// stdout clean. (Default build — the `live` feature replaces this with the real
+/// socket-driving driver.)
+#[cfg(not(feature = "live"))]
 fn run_live(args: &StreamArgs) -> Result<(), Error> {
     let store = SessionStore::default_path()?;
     let have_session = store.load()?.is_some();
@@ -150,7 +175,7 @@ fn run_live(args: &StreamArgs) -> Result<(), Error> {
         "  stage 3  signaling:  MQTT 302 offer/answer over the TLS broker (CONNECT password is native-derived, re/mqtt_signaling.md)"
     );
     eprintln!(
-        "  stage 4  media:      MediaEngine — suite-3 AES-128-CBC + HMAC-SHA256 / KCP / RTP / H.264 -> Annex-B (re/media_decode_spec.md)"
+        "  stage 4  media:      MediaEngine — suite-3 AES-128-CBC + 20B HMAC-SHA1 / KCP / fixed-12B RTP / H.264 + S16LE audio (re/media_decode_spec.md, cap4-validated)"
     );
     eprintln!(
         "  stage 5  output:     ffmpeg -> MPEG-TS at http://127.0.0.1:{}/stream.ts",
@@ -185,7 +210,25 @@ fn run_replay(args: &StreamArgs, path: &PathBuf) -> Result<(), Error> {
         )));
     }
 
-    let mut sink = OutputSink::spawn(args.output, args.port, args.ts_out.as_ref())?;
+    // Optional downstream-audio track (16 kHz mono S16LE) muxed alongside video.
+    let audio = match &args.replay_audio {
+        Some(audio_path) => {
+            if args.output == OutputMode::Stdout {
+                return Err(Error::Transport(
+                    "--replay-audio cannot be combined with --output stdout (stdout carries raw \
+                     Annex-B video only); use --output ts/http for an A/V MPEG-TS"
+                        .to_string(),
+                ));
+            }
+            Some(AudioInput {
+                path: audio_path.clone(),
+                rate: args.audio_rate,
+            })
+        }
+        None => None,
+    };
+
+    let mut sink = OutputSink::spawn(args.output, args.port, args.ts_out.as_ref(), audio)?;
     announce(&sink, args);
 
     let mut depay = H264Depacketizer::new();
@@ -248,6 +291,18 @@ fn run_replay(args: &StreamArgs, path: &PathBuf) -> Result<(), Error> {
             "stream: warning — no IDR keyframe in the sample; the decoder may not render a picture."
         );
     }
+    if let Some(audio_path) = &args.replay_audio {
+        if let Ok(meta) = std::fs::metadata(audio_path) {
+            let bytes = meta.len() as usize;
+            eprintln!(
+                "stream: muxing downstream audio {} ({} bytes S16LE @ {} Hz mono, ~{} ms) as an AAC track.",
+                audio_path.display(),
+                bytes,
+                args.audio_rate,
+                babymonitor_core::stream::media::audio::duration_ms(bytes),
+            );
+        }
+    }
     sink.finish()
 }
 
@@ -276,95 +331,165 @@ fn announce(sink: &OutputSink, args: &StreamArgs) {
 // Output sink (ffmpeg muxer / stdout)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The downstream byte sink for the decoded Annex-B stream.
-enum OutputSink {
-    /// ffmpeg child reading Annex-B on stdin, muxing MPEG-TS to `target`.
+/// A downstream-audio S16LE input that ffmpeg reads directly (OFFLINE replay).
+/// 16 kHz mono S16LE PCM — the cap4 downstream format
+/// (`babymonitor_core::stream::media::audio`), NOT G.711.
+#[derive(Clone)]
+pub struct AudioInput {
+    /// Path to the raw S16LE PCM file ffmpeg reads as its second input.
+    pub path: PathBuf,
+    /// Sample rate (Hz).
+    pub rate: u32,
+}
+
+/// The downstream byte sink for the decoded Annex-B stream (+ optional audio).
+pub(crate) enum OutputSink {
+    /// ffmpeg child reading Annex-B on stdin (+ optional S16LE audio on a second
+    /// input), muxing MPEG-TS to `target`.
     Ffmpeg {
         child: Child,
         stdin: ChildStdin,
         target: String,
     },
-    /// Raw Annex-B to this process's stdout.
+    /// Raw Annex-B to this process's stdout (video-only; no audio mux).
     Stdout(io::Stdout),
 }
 
-impl OutputSink {
-    /// Spawn the sink for `mode`. For ffmpeg modes the Rust side feeds Annex-B on
-    /// the child's stdin (`-f h264 -i pipe:0 -c:v copy -f mpegts ...`).
-    fn spawn(mode: OutputMode, port: u16, ts_out: Option<&PathBuf>) -> Result<Self, Error> {
-        match mode {
-            OutputMode::Stdout => Ok(Self::Stdout(io::stdout())),
-            OutputMode::Http => {
-                let target = format!("http://127.0.0.1:{port}/stream.ts");
-                Self::spawn_ffmpeg(&["-listen", "1", &target], target.clone())
-            }
-            OutputMode::Ts => {
-                let path = ts_out.ok_or_else(|| {
-                    Error::Transport(
-                        "--output ts requires --ts-out <FILE> (the MPEG-TS output path)"
-                            .to_string(),
-                    )
-                })?;
-                let target = path.display().to_string();
-                Self::spawn_ffmpeg(&["-y", &target], target.clone())
-            }
-        }
-    }
-
-    /// Spawn ffmpeg with the shared raw-H.264-in / MPEG-TS-out args plus the
-    /// mode-specific output args.
-    fn spawn_ffmpeg(output_args: &[&str], target: String) -> Result<Self, Error> {
-        let mut cmd = Command::new("ffmpeg");
+/// Build the shared ffmpeg muxer `Command`: raw-H.264 on stdin (`pipe:0`), an
+/// optional second raw-S16LE audio input (`-f s16le -ar <rate> -ac 1 -i <src>`)
+/// encoded to AAC, MPEG-TS out, plus the mode-specific `output_args`.
+///
+/// `audio` is the `(path, rate)` of the audio input (a file for replay, a FIFO for
+/// the live path). Centralised so the replay and live spawners build an identical
+/// command.
+pub(crate) fn build_ffmpeg_cmd(
+    output_args: &[&str],
+    audio: Option<(&std::path::Path, u32)>,
+) -> Command {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        // Raw Annex-B carries no timing; assume this input framerate …
+        "-r",
+        FFMPEG_INPUT_FPS,
+        "-f",
+        "h264",
+        "-i",
+        "pipe:0",
+    ]);
+    // Second input: raw downstream S16LE PCM (16 kHz mono by default).
+    let rate_str;
+    if let Some((path, rate)) = audio {
+        rate_str = rate.to_string();
         cmd.args([
-            "-hide_banner",
-            "-loglevel",
-            "warning",
-            // Raw Annex-B carries no timing; assume this input framerate …
-            "-r",
-            FFMPEG_INPUT_FPS,
             "-f",
-            "h264",
+            babymonitor_core::stream::media::audio::FFMPEG_INPUT_FORMAT,
+            "-ar",
+            &rate_str,
+            "-ac",
+            "1",
             "-i",
-            "pipe:0",
-            "-c:v",
-            "copy",
-            // … and stamp each copied packet with a monotonic frame-index PTS so
-            // the MPEG-TS muxer has well-formed timestamps (no "unset timestamps"
-            // warning; players get a steady clock).
-            "-bsf:v",
-            "setts=ts=N",
-            "-f",
-            "mpegts",
         ])
+        .arg(path);
+    }
+    cmd.args([
+        "-c:v",
+        "copy",
+        // … and stamp each copied packet with a monotonic frame-index PTS so the
+        // MPEG-TS muxer has well-formed timestamps (no "unset timestamps" warning;
+        // players get a steady clock).
+        "-bsf:v",
+        "setts=ts=N",
+    ]);
+    if audio.is_some() {
+        // S16LE is not an MPEG-TS audio codec — encode to AAC (every player
+        // handles it). `-shortest` ends the mux when the shorter input ends so a
+        // finite replay terminates cleanly.
+        cmd.args(["-c:a", "aac", "-shortest"]);
+    }
+    cmd.args(["-f", "mpegts"])
         .args(output_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    cmd
+}
 
-        let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
+/// Spawn an ffmpeg `Command` as an [`OutputSink::Ffmpeg`], surfacing a clear
+/// "ffmpeg not found" message.
+pub(crate) fn spawn_ffmpeg_sink(mut cmd: Command, target: String) -> Result<OutputSink, Error> {
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            Error::Transport(
+                "ffmpeg not found in PATH — it is the downstream MPEG-TS muxer (add it to shell.nix / install ffmpeg)"
+                    .to_string(),
+            )
+        } else {
+            Error::Transport(format!("spawning ffmpeg muxer: {e}"))
+        }
+    })?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::Transport("ffmpeg stdin pipe was not captured".to_string()))?;
+    Ok(OutputSink::Ffmpeg {
+        child,
+        stdin,
+        target,
+    })
+}
+
+/// Resolve the `(output_args, target)` for an ffmpeg `OutputMode`.
+pub(crate) fn ffmpeg_output_target(
+    mode: OutputMode,
+    port: u16,
+    ts_out: Option<&PathBuf>,
+) -> Result<(Vec<String>, String), Error> {
+    match mode {
+        OutputMode::Http => {
+            let target = format!("http://127.0.0.1:{port}/stream.ts");
+            Ok((vec!["-listen".into(), "1".into(), target.clone()], target))
+        }
+        OutputMode::Ts => {
+            let path = ts_out.ok_or_else(|| {
                 Error::Transport(
-                    "ffmpeg not found in PATH — it is the downstream MPEG-TS muxer (add it to shell.nix / install ffmpeg)"
-                        .to_string(),
+                    "--output ts requires --ts-out <FILE> (the MPEG-TS output path)".to_string(),
                 )
-            } else {
-                Error::Transport(format!("spawning ffmpeg muxer: {e}"))
-            }
-        })?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::Transport("ffmpeg stdin pipe was not captured".to_string()))?;
-        Ok(Self::Ffmpeg {
-            child,
-            stdin,
-            target,
-        })
+            })?;
+            let target = path.display().to_string();
+            Ok((vec!["-y".into(), target.clone()], target))
+        }
+        OutputMode::Stdout => Err(Error::Transport(
+            "stdout mode is not an ffmpeg sink".to_string(),
+        )),
+    }
+}
+
+impl OutputSink {
+    /// Spawn the sink for `mode`, optionally muxing a downstream-audio file. For
+    /// ffmpeg modes the Rust side feeds Annex-B on the child's stdin
+    /// (`-f h264 -i pipe:0`); when `audio` is set ffmpeg reads the S16LE file as a
+    /// second input and encodes it to AAC.
+    pub(crate) fn spawn(
+        mode: OutputMode,
+        port: u16,
+        ts_out: Option<&PathBuf>,
+        audio: Option<AudioInput>,
+    ) -> Result<Self, Error> {
+        if mode == OutputMode::Stdout {
+            return Ok(Self::Stdout(io::stdout()));
+        }
+        let (output_args, target) = ffmpeg_output_target(mode, port, ts_out)?;
+        let args: Vec<&str> = output_args.iter().map(String::as_str).collect();
+        let cmd = build_ffmpeg_cmd(&args, audio.as_ref().map(|a| (a.path.as_path(), a.rate)));
+        spawn_ffmpeg_sink(cmd, target)
     }
 
     /// Write one Annex-B chunk (a start-code-prefixed NAL, or a whole access unit)
-    /// to the sink.
-    fn write_annexb(&mut self, buf: &[u8]) -> Result<(), Error> {
+    /// to the sink's video input.
+    pub(crate) fn write_annexb(&mut self, buf: &[u8]) -> Result<(), Error> {
         let res = match self {
             Self::Ffmpeg { stdin, .. } => stdin.write_all(buf),
             Self::Stdout(out) => out.write_all(buf),
@@ -376,7 +501,7 @@ impl OutputSink {
     }
 
     /// Close the input and wait for the muxer to finish.
-    fn finish(self) -> Result<(), Error> {
+    pub(crate) fn finish(self) -> Result<(), Error> {
         match self {
             Self::Stdout(mut out) => out
                 .flush()

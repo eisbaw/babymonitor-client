@@ -16,8 +16,15 @@
 //! - [`frame`] — the PATH-A imm wrapper + fixed-12B RTP-like header parse.
 //! - [`rtp`] — the stock RFC-3550 RTP header parse (PATH-B / CLI replay self-test).
 //! - [`h264`] — RFC-6184 STAP-A/FU-A → Annex-B depacketize + access-unit assembly.
-//! - [`g711`] — G.711 µ-law (PCMU, PT 0) → 16-bit PCM decode (256-entry LUT).
-//! - [`transport`] — ICE candidate parse/select + the UDP datagram seam.
+//! - [`audio`] — **downstream** camera audio (`conv = 2`): raw 16 kHz mono S16LE
+//!   PCM (cap4-pinned). This is the "listen to the baby" track the muxer wants.
+//! - [`g711`] — G.711 µ-law (PCMU, PT 0, 8 kHz) decode — the **talk-back**
+//!   (app→camera) direction ONLY, NOT the downstream camera audio.
+//! - [`stun`] — the STUN (RFC 5389) Binding codec: ICE connectivity-check
+//!   encode/decode (MESSAGE-INTEGRITY HMAC-SHA1 + FINGERPRINT CRC-32) and
+//!   Binding Success → XOR-MAPPED-ADDRESS (srflx). cap4-KAT'd.
+//! - [`transport`] — ICE candidate parse/select, the host-direct UDP transport
+//!   (cap4 primary path), srflx discovery, and the UDP datagram seam.
 //!
 //! # Honest status (cap4-validated end-to-end)
 //!
@@ -34,12 +41,14 @@
 //!   the spec had left as **[G]** (the imm wrapper + fixed-12B header, and the
 //!   20-byte HMAC-SHA1 trailer that corrected the spec's 32-byte HMAC-SHA256).
 
+pub mod audio;
 pub mod crypto;
 pub mod frame;
 pub mod g711;
 pub mod h264;
 pub mod kcp;
 pub mod rtp;
+pub mod stun;
 pub mod transport;
 
 use std::collections::HashMap;
@@ -96,10 +105,22 @@ impl CipherSuite {
 /// `(payload, pt, marker, seq, ts)` plus `ssrc`).
 #[derive(Clone, PartialEq, Eq)]
 pub struct MediaUnit {
-    /// The RTP payload (an H.264 RTP payload — feed to [`h264::H264Depacketizer`]
-    /// — or a G.711 µ-law frame for `payload_type == 0`).
+    /// The KCP `conv` (channel) this unit was demultiplexed from — the
+    /// AUTHORITATIVE video/audio selector. On the cap4 capture (and whenever the
+    /// native `active_handle == 0`) `conv == channel id`: **`1` = video**,
+    /// **`2` = downstream camera audio** (`tests/cap4_replay.rs`,
+    /// `emulator_captures/cap4/stage6_extract.py`). The unified [`MediaEngine::pump`]
+    /// loop routes on this so video → [`h264`] and audio → raw S16LE
+    /// ([`audio`](super::audio)) without re-inspecting the payload.
+    pub conv: u32,
+    /// The RTP payload. For the **video** conv this is an H.264 RTP payload (feed
+    /// to [`h264::H264Depacketizer`]). For the **downstream-audio** conv it is
+    /// **raw 16 kHz mono S16LE PCM** — NOT G.711 (`re/media_decode_spec.md`;
+    /// cap4 ground truth — see [`audio`](super::audio)). The G.711 µ-law path
+    /// ([`g711`]) is the *talk-back* (app→camera) direction only.
     pub payload: Vec<u8>,
-    /// RTP payload type (`PT`, 7-bit). `0` = PCMU.
+    /// RTP payload type (`PT`, 7-bit) from the fixed-12B header (cap4: `96` video,
+    /// `99` downstream audio). Diagnostic — route on [`conv`](Self::conv).
     pub payload_type: u8,
     /// RTP marker bit (for H.264, the last packet of an access unit).
     pub marker: bool,
@@ -112,8 +133,9 @@ pub struct MediaUnit {
 }
 
 impl MediaUnit {
-    fn from_rtp(pkt: &rtp::RtpPacket<'_>) -> Self {
+    fn from_rtp(conv: u32, pkt: &rtp::RtpPacket<'_>) -> Self {
         Self {
+            conv,
             payload: pkt.payload.to_vec(),
             payload_type: pkt.header.payload_type,
             marker: pkt.header.marker,
@@ -122,6 +144,19 @@ impl MediaUnit {
             ssrc: pkt.header.ssrc,
         }
     }
+
+    /// Whether this unit is on the cap4 **video** conv (`1`).
+    #[must_use]
+    pub fn is_video(&self) -> bool {
+        self.conv == kcp::VIDEO_CONV
+    }
+
+    /// Whether this unit is on the cap4 **downstream-audio** conv (`2`) — its
+    /// [`payload`](Self::payload) is raw 16 kHz mono S16LE PCM.
+    #[must_use]
+    pub fn is_downstream_audio(&self) -> bool {
+        self.conv == kcp::AUDIO_CONV
+    }
 }
 
 impl std::fmt::Debug for MediaUnit {
@@ -129,6 +164,7 @@ impl std::fmt::Debug for MediaUnit {
     /// user's own A/V on the live path).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MediaUnit")
+            .field("conv", &self.conv)
             .field("payload_len", &self.payload.len())
             .field("payload_type", &self.payload_type)
             .field("marker", &self.marker)
@@ -207,6 +243,32 @@ impl MediaEngine {
         self.suite
     }
 
+    /// Pull **one** datagram from a selected [`MediaTransport`](transport::MediaTransport)
+    /// and decode it into zero or more [`MediaUnit`]s — the seam that wires the
+    /// chosen UDP transport (host-direct via
+    /// [`transport::connect_host_direct`], or a srflx/relay socket) into this
+    /// engine (TASK-0037 / TASK-0075).
+    ///
+    /// Returns `Ok(None)` when the transport has no datagram ready (non-blocking);
+    /// `Ok(Some(units))` (possibly empty, e.g. a control-conv datagram) otherwise.
+    /// The caller owns the receive loop and the `buf` (size it to the path MTU).
+    ///
+    /// # Errors
+    /// - [`Error::Transport`] on a transport receive failure.
+    /// - any [`push_datagram`](Self::push_datagram) decode error (failed HMAC,
+    ///   malformed KCP/segment) — surfaced to the caller, which (like
+    ///   `cap4_replay`) may treat an HMAC failure as a foreign-session drop.
+    pub fn pump<T: transport::MediaTransport>(
+        &mut self,
+        transport: &mut T,
+        buf: &mut [u8],
+    ) -> Result<Option<Vec<MediaUnit>>, Error> {
+        match transport.recv_datagram(buf)? {
+            Some(n) => Ok(Some(self.push_datagram(&buf[..n])?)),
+            None => Ok(None),
+        }
+    }
+
     /// Process one received UDP datagram into zero or more decoded [`MediaUnit`]s.
     ///
     /// Runs the full §1 pipeline: (suite 3) HMAC verify+strip → `conv` demux →
@@ -231,7 +293,8 @@ impl MediaEngine {
     ///   bad PKCS#7 / GCM auth).
     /// - [`Error::Transport`] for the unimplemented ChaCha20 suite (2).
     pub fn push_datagram(&mut self, datagram: &[u8]) -> Result<Vec<MediaUnit>, Error> {
-        // 1. Datagram integrity (suite 3 only): verify + strip the 32-byte HMAC.
+        // 1. Datagram integrity (suite 3 only): verify + strip the 20-byte HMAC-SHA1
+        //    trailer (cap4-corrected; not the spec's original 32-byte HMAC-SHA256).
         let key = self.media_key.clone();
         let body: &[u8] = if self.suite.has_datagram_hmac() {
             crypto::verify_and_strip_hmac(datagram, &key)?
@@ -273,7 +336,7 @@ impl MediaEngine {
         let mut units = Vec::new();
         for msg in chan.drain_messages() {
             if let Some(pkt) = frame::parse_media_frame(&msg) {
-                units.push(MediaUnit::from_rtp(&pkt));
+                units.push(MediaUnit::from_rtp(conv, &pkt));
             }
         }
         Ok(units)
@@ -528,6 +591,85 @@ mod tests {
         assert!(err.to_string().contains("ChaCha20"));
     }
 
+    // ── pump(): the selected transport feeds the engine (TASK-0037 seam) ────
+    // A fake MediaTransport yields one prepared suite-3 datagram, then nothing;
+    // pump must decode the first into a MediaUnit and report None when drained.
+    #[test]
+    fn pump_decodes_from_a_selected_transport() {
+        use super::transport::MediaTransport;
+
+        struct OneShot(Option<Vec<u8>>);
+        impl MediaTransport for OneShot {
+            fn recv_datagram(&mut self, buf: &mut [u8]) -> Result<Option<usize>, Error> {
+                match self.0.take() {
+                    Some(dg) => {
+                        buf[..dg.len()].copy_from_slice(&dg);
+                        Ok(Some(dg.len()))
+                    }
+                    None => Ok(None),
+                }
+            }
+        }
+
+        let nal = [0x41u8, 0xDE, 0xAD];
+        let rtp_bytes = build_rtp(96, true, 7, 9000, 0xABCD_1234, &nal);
+        let msg = wrap_imm(0x03, &rtp_bytes, None);
+        let seg = cbc_seal_segment(&msg, KEY, &iv(0x5A));
+        let datagram = append_hmac(&kcp_push(CONV, 0, 0, &seg), KEY);
+
+        let mut engine = MediaEngine::from_security_level(3, KEY.to_vec()).unwrap();
+        let mut transport = OneShot(Some(datagram));
+        let mut buf = [0u8; 2048];
+
+        let units = engine.pump(&mut transport, &mut buf).unwrap().unwrap();
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].payload, nal);
+        // Transport drained → pump yields None (non-blocking).
+        assert!(engine.pump(&mut transport, &mut buf).unwrap().is_none());
+    }
+
+    // The engine tags each decoded unit with its source conv so the unified pump
+    // can route video (conv 1) → H.264 and audio (conv 2) → raw S16LE, exactly as
+    // the cap4 ground-truth extractor does (route by conv, not by re-sniffing).
+    #[test]
+    fn engine_tags_units_with_conv_for_av_routing() {
+        let key = KEY.to_vec();
+        let mut engine = MediaEngine::from_security_level(3, key).unwrap();
+
+        // Video conv (1): an H.264 single-NAL payload.
+        let vid = build_rtp(96, true, 1, 90_000, 1, &[0x41u8, 0xDE, 0xAD]);
+        let vid_dg = append_hmac(
+            &kcp_push(
+                kcp::VIDEO_CONV,
+                0,
+                0,
+                &cbc_seal_segment(&wrap_imm(0x03, &vid, None), KEY, &iv(0x11)),
+            ),
+            KEY,
+        );
+        // Audio conv (2): a raw S16LE payload (PT 99) — NOT G.711.
+        let pcm = [0x00u8, 0x80, 0x34, 0x12];
+        let aud = build_rtp(99, false, 2, 1000, 1, &pcm);
+        let aud_dg = append_hmac(
+            &kcp_push(
+                kcp::AUDIO_CONV,
+                0,
+                0,
+                &cbc_seal_segment(&wrap_imm(0x05, &aud, None), KEY, &iv(0x22)),
+            ),
+            KEY,
+        );
+
+        let v = &engine.push_datagram(&vid_dg).unwrap()[0];
+        assert!(v.is_video() && !v.is_downstream_audio());
+        assert_eq!(v.conv, kcp::VIDEO_CONV);
+
+        let a = &engine.push_datagram(&aud_dg).unwrap()[0];
+        assert!(a.is_downstream_audio() && !a.is_video());
+        // The downstream-audio payload is the raw S16LE samples, untouched.
+        assert_eq!(audio::downstream_pcm_s16le(&a.payload), &pcm);
+    }
+
     // Debug must not leak the media key or payload bytes.
     #[test]
     fn debug_redacts_key_and_payload() {
@@ -536,6 +678,7 @@ mod tests {
         assert!(dbg.contains("redacted"));
         assert!(!dbg.contains("0123456789abcdef")); // secret-scan:allow (synthetic test key)
         let u = MediaUnit {
+            conv: kcp::VIDEO_CONV,
             payload: vec![0xDE, 0xAD],
             payload_type: 96,
             marker: false,

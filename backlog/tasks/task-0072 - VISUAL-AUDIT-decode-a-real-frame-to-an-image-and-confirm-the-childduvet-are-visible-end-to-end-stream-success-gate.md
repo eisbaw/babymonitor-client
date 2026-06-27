@@ -3,9 +3,10 @@ id: TASK-0072
 title: >-
   VISUAL AUDIT: decode a real frame to an image and confirm the child+duvet are
   visible (end-to-end stream success gate)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-26 21:33'
+updated_date: '2026-06-27 08:04'
 labels:
   - stream
   - audit
@@ -26,3 +27,15 @@ The definitive success criterion for the whole project: prove the pipeline shows
 - [ ] #2 The decoded image is visually inspected and confirmed to show a coherent scene with the child + duvet (or the exact failure mode is reported: garbled/partial/wrong colorspace)
 - [ ] #3 Result recorded (PASS/specific-defect) in re/; on defect, the responsible pipeline stage (decrypt/depacketize/decode) is identified
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+PASS (2026-06-27): decoded a real cap4 keyframe (secrets/cap4_frames/frame_001.png, 1920x1080) and visually inspected it — a coherent, sharp, correctly-exposed top-down view of the baby cot with the beige patterned DUVET present (child under the duvet). NOT decrypt-garbage; stable across keyframes. This validates the ENTIRE chain end-to-end on REAL bytes: decrypt -> KCP -> AES-128-CBC -> HMAC-SHA1 -> imm/H.264 depacketize -> decode. 1231 frames, 0 decode errors.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+SUCCESS GATE MET: the Rust pipeline renders the real SCD921 feed. A decoded cap4 keyframe shows the baby cot + duvet, visually confirmed. Our MediaEngine reproduces the ground-truth H.264/audio byte-for-byte.
+<!-- SECTION:FINAL_SUMMARY:END -->

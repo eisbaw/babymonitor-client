@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-06-25 07:59'
-updated_date: '2026-06-26 22:20'
+updated_date: '2026-06-27 19:48'
 labels:
   - phase3
   - rust
@@ -107,4 +107,10 @@ GATE: just e2e GREEN (exit 0; 203 core lib tests + 6 cli + integration, clippy -
 SECRET-SCAN: my media/* files add ZERO findings (no email/key/token value-shapes; synthetic test keys 0123456789abcdef / fedcba9876543210 / IVIVIV... all carry the secret-scan:allow marker). NOTE: `just secret-scan` is currently RED on this worktree, but that is PRE-EXISTING and unrelated to this task — 5697 of 5702 hits are email/JWT-regex FALSE POSITIVES in the committed capture dumps emulator_captures/cap1+cap2/flows.full.txt (committed in 5603d96, before this work). Flagging for the owner; not fixed inline (out of scope / would be a tangent — candidate follow-up: gitignore or scrub the cap1/cap2 flow dumps, or add them to secret_scan EXCLUDE_GLOBS).
 
 IMPLEMENTED (stream/media/): AES-128-CBC inline-IV+PKCS7 + GCM (suite4) + datagram HMAC-SHA256 verify, hand-rolled ikcp RX with per-segment decrypt hook, 12B RTP parse, STAP-A/FU-A->Annex-B. ~63 unit tests + independent openssl AES KAT. Proven on SYNTHETIC vectors (self-consistent loop) — cap4 (TASK-0068) needed to validate REAL bytes + pin [G]: CBC-vs-GCM, conv ids, bare-vs-prefixed RTP. ICE = host-candidate only (STUN/TURN not impl -> follow-up).
+
+VALIDATED against REAL cap4 bytes (byte-for-byte vs independent Python truth): VIDEO conv=1, AUDIO conv=2, key0, suite3=AES-128-CBC. TWO fixes vs the prior spec: auth = 20-byte HMAC-SHA1 (not SHA256; FUN_0016a004:100 mbedtls_md_info_from_type(5)=SHA1), and video framing = imm-wrapper (28/36B) + FIXED 12B header (not variable RTP CC/X). H.264 decodes 1231 frames 0 errors. Cross-check in tests/cap4_replay.rs (#[ignore]d, reads secrets/ at runtime).
+
+## Media engine wired into the live pump; conv-tagged units for A/V routing
+
+MediaEngine::pump is now driven end-to-end by the assembled live driver (babymonitor-cli/src/stream_live.rs, --features live): UdpMediaTransport (host-direct, TASK-0075) -> pump -> per-unit conv routing -> H.264 depacketize (conv 1) + downstream S16LE audio (conv 2) -> ffmpeg MPEG-TS. Added MediaUnit.conv (VIDEO_CONV=1/AUDIO_CONV=2) + is_video()/is_downstream_audio() so the unified pump routes A/V exactly as the cap4 ground-truth extractor (by conv). Re-validated byte-exact vs REAL cap4 (video 4,090,176 B + audio 1,532,800 B S16LE) incl. a new unified-pump test. Suite 3 = AES-128-CBC + 20B HMAC-SHA1 (cap4). Gates GREEN. Not committed.
 <!-- SECTION:NOTES:END -->

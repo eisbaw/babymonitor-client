@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-06-26 17:38'
-updated_date: '2026-06-26 22:20'
+updated_date: '2026-06-27 19:47'
 labels:
   - stream
   - signaling
@@ -88,4 +88,8 @@ Refactored `LiveSessionDriver::run` to delegate offer framing/publish to the new
 **Honest limits / live-gated:** AC#1 (rumqttc TLS connect+AUTHENTICATE to the real broker) is OWNER-gated and left UNCHECKED — no live broker/camera in this sandbox, and live-tls cannot compile here (tokio-rustls not in local cargo cache), so the actual TLS:8883 CONNECT + auth handshake + real answer were NOT executed. Only the publish/subscribe/poll/answer LOGIC is offline-validated against a mock + cap3/synthetic vectors; the wire-level connect is the owner s live run (--features live-tls). No live network calls were made. secret-scan: my changed files add ZERO findings (synthetic keys only, secret-scan:allow annotated); the gate s 214 matches are all pre-existing capture-file false-positives (TASK-0066), none reference my files. Did NOT git commit.
 
 IMPLEMENTED: 302 codec byte-validated vs cap3 + 9 mock-transport tests (publish mqtt+lan, answer parse, wrong-localKey loud-fail, timeout). Live TLS:8883 connect gated + the live-tls path is NOT forwarded from the CLI feature (new follow-up task) and did not compile here (tokio-rustls absent).
+
+## Wired into the assembled live stream driver
+
+The 302 signaling client (connect_and_negotiate + MqttSignalingSession + BrokerConfig::from_credentials) is now wired into the ONE assembled driver babymonitor-cli/src/stream_live.rs (gated --features live): load session -> derive MQTT creds (mqtt_auth doCommandNative cmd2 password) -> RumqttcTransport TLS connect (live-tls 8883) -> publish 302 offer (imm SDP) -> poll for the camera answer -> extract remote ICE creds + media aes-key. Live socket I/O is REACHED not faked; no broker in sandbox -> honest StreamPending. AC#1 (live broker connect+auth) remains owner-gated/UNVERIFIED on the wire: re/live_stream_run.md documents the Frida hook on SdkMqttCertificationInfo/qpqbppd to dump the real clientId/username/password and diff vs derive_credentials. Gates GREEN (just e2e; --features live clippy). Not committed.
 <!-- SECTION:NOTES:END -->

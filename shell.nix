@@ -14,6 +14,9 @@ pkgs.mkShell {
     # Text processing
     ripgrep jq xmlstarlet
 
+    # Media muxer/probe for the `stream` subcommand + offline TS validation.
+    ffmpeg
+
     # Rust toolchain
     rustc cargo clippy rustfmt rust-analyzer pkg-config openssl.dev
 

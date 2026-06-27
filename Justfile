@@ -61,7 +61,36 @@ test-regions:
 
 # End-to-end gate (build+test+lint+fmt-check+stub-grep+offline). Green before any commit.
 [group('test')]
-e2e: build test lint fmt-check stub-grep assert-offline test-bmp-decode test-regions
+e2e: build test lint fmt-check stub-grep assert-offline test-bmp-decode test-regions stream-validate
+
+# Offline-validate the `stream` mux/serve path (TASK-0070): synthesize an Annex-B
+# H.264 sample, replay it through the real RTP depacketizer + ffmpeg muxer, and
+# assert with ffprobe that the produced MPEG-TS is a valid, decodable h264 stream.
+# No network/camera; uses ffmpeg/ffprobe from shell.nix.
+[group('test')]
+stream-validate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v ffmpeg  >/dev/null || { echo "stream-validate: ffmpeg not in PATH (shell.nix provides it)"; exit 1; }
+    command -v ffprobe >/dev/null || { echo "stream-validate: ffprobe not in PATH (shell.nix provides it)"; exit 1; }
+    WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+    # 1. Synthetic Annex-B H.264 (baseline, no B-frames, keyframe every 15 frames).
+    ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc=size=320x240:rate=15:duration=1 \
+        -c:v libx264 -profile:v baseline -pix_fmt yuv420p -g 15 -bf 0 -f h264 "$WORK/sample.264"
+    # 2. Build + run the replay -> MPEG-TS through the real depacketizer + muxer.
+    cargo build --quiet --manifest-path {{MANIFEST}} --bin babymonitor-cli
+    BIN=$(dirname {{MANIFEST}})/target/debug/babymonitor-cli
+    "$BIN" stream --replay-annexb "$WORK/sample.264" --output ts --ts-out "$WORK/out.ts"
+    # 3. ffprobe: the produced TS must carry an h264 video stream.
+    ffprobe -hide_banner -loglevel error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 \
+        "$WORK/out.ts" | grep -qx h264 || { echo "stream-validate: produced TS is not h264"; exit 1; }
+    # 4. The stream must actually decode (>=1 frame -> a keyframe renders).
+    N=$(ffprobe -hide_banner -loglevel error -count_frames -select_streams v:0 \
+        -show_entries stream=nb_read_frames -of csv=p=0 "$WORK/out.ts" | head -1)
+    [ "${N:-0}" -ge 1 ] || { echo "stream-validate: TS decoded 0 frames"; exit 1; }
+    ffmpeg -hide_banner -loglevel error -i "$WORK/out.ts" -f null - >/dev/null 2>&1 \
+        || { echo "stream-validate: ffmpeg failed to decode the TS"; exit 1; }
+    echo "stream-validate: OK (replay -> depacketize -> MPEG-TS; ffprobe=h264, $N frames decoded)"
 
 # Assert the test suite needs no network (--offline build + enumerate).
 [group('test')]

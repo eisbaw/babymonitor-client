@@ -29,9 +29,10 @@ flate2.workspace = true
 rumqttc.workspace = true
 aes.workspace = true
 # Media-plane (PATH A) decrypt engine (TASK-0037): AES-128-CBC per KCP segment
-# (suite 3), datagram HMAC-SHA256 integrity (suite 3), and AES-128-GCM (suite 4,
-# [G]). All resolve from the offline cargo cache so the `just assert-offline`
-# gate stays green (see workspace Cargo.toml notes).
+# (suite 3), datagram HMAC-SHA1 integrity (suite 3, cap4-pinned 20B trailer), and
+# AES-128-GCM (suite 4, [G]). All resolve from the offline cargo cache so the
+# `just assert-offline` gate stays green (see workspace Cargo.toml notes).
 cbc.workspace = true
 hmac.workspace = true
+sha1.workspace = true
 aes-gcm.workspace = true

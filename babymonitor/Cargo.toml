@@ -31,13 +31,19 @@ aes-gcm = "0.10"
 # index, so pulling it would break `just assert-offline`; `aes`+`cipher` are
 # already in the local cargo cache, keeping the offline gate green.
 aes = "0.8"
-# Media-plane (PATH A) crypto (TASK-0037). All three are already in the local
-# cargo cache, so adding them keeps `just assert-offline` green:
+# Media-plane (PATH A) crypto (TASK-0037). All are already in the local cargo
+# cache, so adding them keeps `just assert-offline` green:
 #   - `cbc`  (cbc-0.1.2)  → AES-128-CBC per-KCP-segment decrypt (suite 3, inline 16B IV).
-#   - `hmac` (hmac-0.12.1)→ datagram HMAC-SHA256 integrity tag (suite 3, key=16B SDP aes-key).
+#   - `hmac` (hmac-0.12.1)→ datagram HMAC integrity tag (suite 3, key=16B SDP aes-key).
+#   - `sha1` (sha1-0.10)  → the datagram HMAC digest. cap4 pins the trailer at
+#     20 bytes = HMAC-SHA1 (NOT the 32B SHA-256 the spec first assumed): the
+#     receiver builds the MAC via `mbedtls_md_info_from_type(5)` and in mbedtls
+#     3.x enum 5 = SHA-1, and `HMAC-SHA1(key, datagram[:-20])` reproduces the
+#     real trailing 20 bytes on the captured stream.
 # `aes-gcm` (already pinned by the cli crate) covers suite 4 (AES-128-GCM, [G]).
 cbc = "0.1"
 hmac = "0.12"
+sha1 = "0.10"
 # Inflate the (DEFLATE-compressed) APK signature block for the offline cert
 # hash. Pure-Rust miniz_oxide backend (no system zlib) keeps the e2e gate
 # self-contained and offline.

@@ -38,6 +38,9 @@ fixtures/
 babymonitor/babymonitor-core/tests/fixtures/*
 !babymonitor/babymonitor-core/tests/fixtures/device_list.json
 !babymonitor/babymonitor-core/tests/fixtures/camera_info.json
+# Synthetic (SYNTH_*) redacted cap3 signaling fixture for tests/signaling_cap3.rs
+# — no real capture value; secret-scan remains the backstop.
+!babymonitor/babymonitor-core/tests/fixtures/signaling_cap3_redacted.jsonl
 
 # Rust
 target/

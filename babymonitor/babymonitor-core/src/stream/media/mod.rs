@@ -1,37 +1,41 @@
 //! The cap3 **PATH A** media receive→decode engine: UDP datagram → (suite-3)
 //! HMAC verify+strip → KCP RX with per-segment AES decrypt → `frg` reassembly →
-//! RTP parse → [`MediaUnit`] (`re/media_decode_spec.md`, full spec).
+//! imm-wrapper + fixed-12B RTP parse → [`MediaUnit`] (`re/media_decode_spec.md`,
+//! full spec; framing cap4-pinned).
 //!
 //! ```text
-//! UDP ─▶ HMAC-SHA256 verify+strip (whole datagram, suite3) ─▶ ikcp_input
+//! UDP ─▶ HMAC-SHA1 verify+strip (whole datagram, suite3) ─▶ ikcp_input
 //!      ─▶ ikcp_parse_data ─▶ [per segment] strip 16B IV ─▶ AES-128-CBC ─▶ PKCS#7 unpad
-//!      ─▶ KCP frg reassembly (recv) ─▶ RTP(12B) parse ─▶ MediaUnit(payload,pt,marker,seq,ts)
+//!      ─▶ KCP frg reassembly (recv) ─▶ imm-wrapper + fixed-12B RTP parse
+//!      ─▶ MediaUnit(payload,pt,marker,seq,ts)
 //! ```
 //!
 //! The layered submodules each carry their own spec citations + unit tests:
-//! - [`crypto`] — datagram HMAC + per-segment AES-CBC/GCM (suite 3 / 4).
+//! - [`crypto`] — datagram HMAC-SHA1 + per-segment AES-CBC/GCM (suite 3 / 4).
 //! - [`kcp`] — hand-rolled ikcp RX with the per-segment decrypt hook.
-//! - [`rtp`] — the 12-byte RTP header parse.
+//! - [`frame`] — the PATH-A imm wrapper + fixed-12B RTP-like header parse.
+//! - [`rtp`] — the stock RFC-3550 RTP header parse (PATH-B / CLI replay self-test).
 //! - [`h264`] — RFC-6184 STAP-A/FU-A → Annex-B depacketize + access-unit assembly.
 //! - [`g711`] — G.711 µ-law (PCMU, PT 0) → 16-bit PCM decode (256-entry LUT).
 //! - [`transport`] — ICE candidate parse/select + the UDP datagram seam.
 //!
-//! # Honest status (offline-validated vs live-gated)
+//! # Honest status (cap4-validated end-to-end)
 //!
-//! - **Offline-validated** (this engine + every submodule): the whole
-//!   decrypt→KCP→RTP pipeline is exercised end-to-end against **synthetic
-//!   vectors** built per the spec's send path (inline-IV + PKCS#7 + CBC, datagram
-//!   HMAC, KCP `frg` framing) — see the e2e tests below. Suite 3 (AES-128-CBC +
-//!   HMAC-SHA256) is the cap3-observed default (`security_level == 3`); suite 4
-//!   (AES-128-GCM) round-trips but its on-wire framing is **[G]** unconfirmed.
+//! - **cap4-validated** (this engine + every submodule): the whole
+//!   decrypt→KCP→imm-wrapper→RTP pipeline is replayed against the **real cap4
+//!   media capture** (`tests/cap4_replay.rs`, `#[ignore]`d / local-only) and
+//!   produces byte-identical H.264 NAL units to the independently-pinned ground
+//!   truth. Suite 3 (AES-128-CBC + **HMAC-SHA1**, 20-byte trailer) is the
+//!   confirmed default (`security_level == 3`); suite 4 (AES-128-GCM) round-trips
+//!   on synthetic vectors but its on-wire framing is **[G]** unconfirmed.
 //! - **Live-gated** (NOT runnable here — no live broker/camera): ICE connectivity
-//!   to srflx/relay (full STUN/TURN handshake, [`transport`] docs) and the real
-//!   media-bytes validation, which needs a capture (the spec's TASK-0068). There
-//!   is **no `emulator_captures/cap4`** in this tree, so no captured media bytes
-//!   exist to byte-validate against — the pipeline is proven on synthetic vectors
-//!   only, stated plainly.
+//!   to srflx/relay (full STUN/TURN handshake, [`transport`] docs). The media
+//!   decode itself is no longer synthetic-only — cap4 settled the framing that
+//!   the spec had left as **[G]** (the imm wrapper + fixed-12B header, and the
+//!   20-byte HMAC-SHA1 trailer that corrected the spec's 32-byte HMAC-SHA256).
 
 pub mod crypto;
+pub mod frame;
 pub mod g711;
 pub mod h264;
 pub mod kcp;
@@ -54,7 +58,8 @@ pub enum CipherSuite {
     /// attempt returns a loud error rather than a fabricated transform).
     ChaCha20,
     /// Suite 3 — **AES-128-CBC** per segment (inline 16B IV, PKCS#7) + a trailing
-    /// 32-byte datagram **HMAC-SHA256**. The cap3-observed default. **[C]**
+    /// 20-byte datagram **HMAC-SHA1**. The cap3-observed default, cap4-validated
+    /// end-to-end. **[C]**
     AesCbcHmac,
     /// Suite 4 — AES-128-GCM per segment (inline 16B IV, 16B trailing tag, NO
     /// datagram HMAC). **[G]** framing unconfirmed.
@@ -79,7 +84,7 @@ impl CipherSuite {
         }
     }
 
-    /// Whether this suite carries the trailing 32-byte datagram HMAC (suite 3).
+    /// Whether this suite carries the trailing 20-byte datagram HMAC (suite 3).
     #[must_use]
     pub fn has_datagram_hmac(self) -> bool {
         matches!(self, Self::AesCbcHmac)
@@ -205,20 +210,25 @@ impl MediaEngine {
     /// Process one received UDP datagram into zero or more decoded [`MediaUnit`]s.
     ///
     /// Runs the full §1 pipeline: (suite 3) HMAC verify+strip → `conv` demux →
-    /// KCP input with the per-segment AES decrypt hook → `frg` reassembly → RTP
-    /// parse. A datagram on the **control** `conv` (`0x010000f3`) is signaling,
-    /// not media, and yields `[]` (handled by the MQTT signaling layer, not here).
+    /// KCP input with the per-segment AES decrypt hook → `frg` reassembly →
+    /// imm-wrapper + fixed-12B RTP parse. A datagram on the **control** `conv`
+    /// (`0x010000f3`) is signaling, not media, and yields `[]` (handled by the
+    /// MQTT signaling layer, not here).
     ///
-    /// One reassembled KCP message is assumed to be exactly one bare RTP packet
-    /// (`re/media_decode_spec.md` §3 caveat **[G]**: media RTP could instead be
-    /// imm-length-prefixed inside the KCP message — only a media capture settles
-    /// it; an RTP parse failure here surfaces that case loudly rather than
-    /// silently mis-decoding).
+    /// cap4 settled the caveat the spec had left **[G]**: a reassembled KCP
+    /// message is **not** a bare RTP packet — it is an imm wrapper (28B, or 36B
+    /// with a metadata block) + a *fixed* 12-byte RTP-like header + payload (see
+    /// [`frame`]). A message that does not locate a media frame (a control/setup
+    /// record, or a truncated frame) is skipped — it yields no [`MediaUnit`]
+    /// rather than aborting the datagram — mirroring the native depacketizer,
+    /// which only emits located RTP frames. (A genuine mis-decode cannot hide
+    /// here: the upstream HMAC + PKCS#7 gates already rejected any wrong-key or
+    /// corrupt datagram before this point.)
     ///
     /// # Errors
     /// - [`Error::Transport`] on a failed HMAC (suite 3 — wrong key / corrupt),
-    ///   a malformed KCP segment, a per-segment decrypt failure (wrong key / bad
-    ///   PKCS#7 / GCM auth), or an RTP parse failure.
+    ///   a malformed KCP segment, or a per-segment decrypt failure (wrong key /
+    ///   bad PKCS#7 / GCM auth).
     /// - [`Error::Transport`] for the unimplemented ChaCha20 suite (2).
     pub fn push_datagram(&mut self, datagram: &[u8]) -> Result<Vec<MediaUnit>, Error> {
         // 1. Datagram integrity (suite 3 only): verify + strip the 32-byte HMAC.
@@ -257,11 +267,14 @@ impl MediaEngine {
             }
         }
 
-        // 5/6. Drain complete KCP messages → parse each as one RTP packet.
+        // 5/6. Drain complete KCP messages → strip the imm wrapper + parse the
+        // fixed-12B RTP-like header. Messages that do not locate a media frame
+        // (control/setup records) are skipped, not errored (see the doc above).
         let mut units = Vec::new();
         for msg in chan.drain_messages() {
-            let pkt = rtp::parse_rtp(&msg)?;
-            units.push(MediaUnit::from_rtp(&pkt));
+            if let Some(pkt) = frame::parse_media_frame(&msg) {
+                units.push(MediaUnit::from_rtp(&pkt));
+            }
         }
         Ok(units)
     }
@@ -294,6 +307,7 @@ impl SegmentDecryptor for PlaintextDecryptor {
 #[cfg(test)]
 mod tests {
     use super::crypto::test_support::{append_hmac, cbc_seal_segment, gcm_seal_segment};
+    use super::frame::test_support::wrap_imm;
     use super::kcp::test_support::kcp_push;
     use super::rtp::test_support::build_rtp;
     use super::*;
@@ -336,18 +350,21 @@ mod tests {
         assert!(MediaEngine::new(CipherSuite::Plaintext, Vec::new()).is_ok());
     }
 
-    // ── End-to-end: suite 3, single-segment RTP packet ─────────────────────
-    // Builds a full §1 datagram (RTP → CBC-seal segment → KCP PUSH → +HMAC) and
-    // runs it through the engine, validating §4 Steps A (HMAC) + C (PKCS#7) + D
-    // (RTP V=2 + NAL-type-in-range) implicitly via a clean decode.
+    // ── End-to-end: suite 3, single-segment media frame ────────────────────
+    // Builds a full §1 datagram (imm-wrapped fixed-12B RTP → CBC-seal segment →
+    // KCP PUSH → +HMAC-SHA1) and runs it through the engine, validating §4 Steps
+    // A (HMAC) + C (PKCS#7) + D (frame located + NAL-type-in-range) via a clean
+    // decode.
 
     #[test]
     fn suite3_single_segment_round_trips() {
-        // An H.264 single-NAL (type 1) RTP payload, PT 96, marker set.
+        // An H.264 single-NAL (type 1) RTP payload, PT 96, marker set, wrapped in
+        // the PATH-A imm wrapper (byte0 0x03 = video) — the cap4-pinned framing.
         let nal = [0x41u8, 0xDE, 0xAD, 0xBE, 0xEF];
         let rtp_bytes = build_rtp(96, true, 0x0042, 0x0001_0000, 0x1234_5678, &nal);
+        let msg = wrap_imm(0x03, &rtp_bytes, None);
 
-        let seg = cbc_seal_segment(&rtp_bytes, KEY, &iv(0xA0));
+        let seg = cbc_seal_segment(&msg, KEY, &iv(0xA0));
         let body = kcp_push(CONV, 0, 0, &seg);
         let datagram = append_hmac(&body, KEY);
 
@@ -375,8 +392,11 @@ mod tests {
     fn suite3_fragmented_message_reassembles_and_decodes() {
         let payload: Vec<u8> = (0..200u32).map(|i| (i & 0xff) as u8).collect();
         let rtp_bytes = build_rtp(0, false, 7, 8000, 0xAABB_CCDD, &payload); // PCMU
-        let mid = rtp_bytes.len() / 2;
-        let (chunk0, chunk1) = rtp_bytes.split_at(mid);
+                                                                             // The imm wrapper is on the WHOLE message; split the wrapped frame across
+                                                                             // two KCP fragments so reassembly must restore it before the frame parse.
+        let msg = wrap_imm(0x03, &rtp_bytes, None);
+        let mid = msg.len() / 2;
+        let (chunk0, chunk1) = msg.split_at(mid);
 
         let seg0 = cbc_seal_segment(chunk0, KEY, &iv(0x01));
         let seg1 = cbc_seal_segment(chunk1, KEY, &iv(0x02));
@@ -403,8 +423,9 @@ mod tests {
         stap.extend_from_slice(&3u16.to_be_bytes());
         stap.extend_from_slice(&[0x68, 0xCE, 0x3C]); // PPS
         let rtp_bytes = build_rtp(96, false, 1, 90_000, 1, &stap);
+        let msg = wrap_imm(0x03, &rtp_bytes, None);
 
-        let seg = cbc_seal_segment(&rtp_bytes, KEY, &iv(0x55));
+        let seg = cbc_seal_segment(&msg, KEY, &iv(0x55));
         let datagram = append_hmac(&kcp_push(CONV, 0, 0, &seg), KEY);
 
         let mut engine = MediaEngine::from_security_level(3, KEY.to_vec()).unwrap();
@@ -424,8 +445,9 @@ mod tests {
     fn suite4_gcm_round_trips() {
         let nal = [0x41u8, 0x11, 0x22, 0x33];
         let rtp_bytes = build_rtp(96, true, 9, 90_000, 5, &nal);
+        let msg = wrap_imm(0x03, &rtp_bytes, None);
         // Suite 4 has NO datagram HMAC — the segment carries the GCM tag inline.
-        let seg = gcm_seal_segment(&rtp_bytes, KEY, &iv(0x07));
+        let seg = gcm_seal_segment(&msg, KEY, &iv(0x07));
         let datagram = kcp_push(CONV, 0, 0, &seg);
 
         let mut engine = MediaEngine::from_security_level(4, KEY.to_vec()).unwrap();
@@ -439,8 +461,10 @@ mod tests {
     #[test]
     fn suite0_plaintext_round_trips() {
         let rtp_bytes = build_rtp(0, false, 1, 100, 1, b"plain pcmu frame");
-        // Plaintext suite: the segment payload IS the RTP bytes, no IV, no HMAC.
-        let datagram = kcp_push(CONV, 0, 0, &rtp_bytes);
+        let msg = wrap_imm(0x03, &rtp_bytes, None);
+        // Plaintext suite: the segment payload IS the (imm-wrapped) bytes, no IV,
+        // no HMAC.
+        let datagram = kcp_push(CONV, 0, 0, &msg);
         let mut engine = MediaEngine::from_security_level(0, Vec::new()).unwrap();
         let units = engine.push_datagram(&datagram).unwrap();
         assert_eq!(units.len(), 1);

@@ -2,11 +2,18 @@
 //!
 //! Two distinct, ordered transforms (`re/media_decode_spec.md` §1, §2):
 //!
-//! 1. **Datagram HMAC-SHA256 (suite 3 only)** — [`verify_and_strip_hmac`]. The
-//!    whole UDP datagram carries a trailing 32-byte `HMAC-SHA256(key16, body)`
+//! 1. **Datagram HMAC-SHA1 (suite 3 only)** — [`verify_and_strip_hmac`]. The
+//!    whole UDP datagram carries a trailing **20-byte** `HMAC-SHA1(key16, body)`
 //!    where `key16` is the 16 raw bytes of the SDP `a=aes-key` (same key as the
 //!    AES below). Verified + stripped BEFORE KCP sees the bytes
-//!    (`FUN_0016e350.c:66-79`, §1 step 2). **[C]**
+//!    (`FUN_0016e350.c:66-79`, §1 step 2). **[C — cap4-pinned]**
+//!
+//!    cap4 correction: the trailer is **20 bytes = HMAC-SHA1**, NOT the 32-byte
+//!    HMAC-SHA256 the spec first assumed. Proven two independent ways on the
+//!    captured stream: (a) `HMAC-SHA1(key16, datagram[..len-20])` reproduces the
+//!    real trailing 20 bytes for every sampled datagram; (b) the receiver builds
+//!    the MAC via `mbedtls_md_info_from_type(5)` (`FUN_0016a004:100`) and in the
+//!    device's mbedtls 3.x (PSA-aligned) enum, type `5 == SHA-1`.
 //!
 //! 2. **Per-segment AES decrypt** — [`decrypt_segment_cbc`] (suite 3) /
 //!    [`decrypt_segment_gcm`] (suite 4). Each KCP segment payload is
@@ -15,10 +22,12 @@
 //!    plaintext is PKCS#7-padded (`ctx_session_chan_process_pkt.c:12-30`, §2).
 //!    **[C for CBC; G for GCM framing]**
 //!
-//! Confidence tags mirror the spec: **[C]** suite 3 (CBC + HMAC) is confirmed and
-//! is the cap3-observed default (`security_level == 3`); **[G]** suite 4 (GCM)
-//! framing is inferred from the cipher vtable and NOT observed live — its exact
-//! nonce length / tag placement is unconfirmed and flagged at the call site.
+//! Confidence tags mirror the spec: **[C]** suite 3 (CBC + HMAC-SHA1) is
+//! confirmed — it is the cap3-observed default (`security_level == 3`) and the
+//! cap4 media capture validates the whole transform end-to-end (the recovered
+//! H.264 decodes cleanly); **[G]** suite 4 (GCM) framing is inferred from the
+//! cipher vtable and NOT observed live — its exact nonce length / tag placement
+//! is unconfirmed and flagged at the call site.
 
 use crate::Error;
 
@@ -26,14 +35,15 @@ use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockDecryptMut, KeyIvInit};
 use aes::Aes128;
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha1::Sha1;
 
 /// AES block size (and CBC IV / GCM-nonce length used by this path), in bytes.
 pub const AES_BLOCK: usize = 16;
 /// The inline per-segment IV length (cleartext prefix of every segment payload).
 pub const IV_LEN: usize = 16;
-/// The trailing datagram HMAC-SHA256 tag length (suite 3). `md_get_size(SHA256)`.
-pub const HMAC_TAG_LEN: usize = 32;
+/// The trailing datagram HMAC-SHA1 tag length (suite 3). `md_get_size(SHA1)` =
+/// 20 bytes — cap4-pinned (see the module header; mbedtls md type `5 == SHA-1`).
+pub const HMAC_TAG_LEN: usize = 20;
 /// The trailing per-segment GCM auth-tag length (suite 4).
 pub const GCM_TAG_LEN: usize = 16;
 /// The minimum AES-128 / SDP-`a=aes-key` key length this path accepts.
@@ -42,17 +52,20 @@ pub const MEDIA_KEY_LEN: usize = 16;
 /// AES-128-CBC decryptor type alias (RustCrypto `cbc` over `aes`).
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
 
-/// Verify and strip the trailing 32-byte `HMAC-SHA256` tag from a suite-3 media
+/// Verify and strip the trailing 20-byte `HMAC-SHA1` tag from a suite-3 media
 /// datagram, returning the integrity-checked body (KCP header + IV + ciphertext)
 /// with the tag removed.
 ///
 /// Mirrors the native ingress (`FUN_0016e350.c:34, 66-79`): reject a datagram
 /// shorter than `tag_len + 24` (one KCP header + the tag), recompute
-/// `HMAC-SHA256(key16, datagram[0 .. len-32])`, and constant-time-compare against
-/// the trailing 32 bytes. A mismatch is the native `"invalid md code"` drop.
+/// `HMAC-SHA1(key16, datagram[0 .. len-20])`, and constant-time-compare against
+/// the trailing 20 bytes. A mismatch is the native `"invalid md code"` drop.
 ///
 /// **A match alone proves the 16-byte media key and the datagram framing are
-/// correct** (`re/media_decode_spec.md` §4 Step A).
+/// correct** (`re/media_decode_spec.md` §4 Step A). On cap4 this is also the
+/// per-session key gate: the capture carries several overlapping sessions on the
+/// same `conv`, and only the datagrams whose HMAC validates under *this* key
+/// belong to *this* session — the rest are dropped here exactly as native does.
 ///
 /// # Errors
 /// - [`Error::Transport`] if the datagram is too short to carry a header + tag.
@@ -62,20 +75,20 @@ pub fn verify_and_strip_hmac<'a>(datagram: &'a [u8], key16: &[u8]) -> Result<&'a
     // The native gate is `len < tag_len + 24` (one 24-byte KCP header + the tag).
     if datagram.len() < HMAC_TAG_LEN + crate::stream::media::kcp::IKCP_OVERHEAD {
         return Err(Error::Transport(format!(
-            "media datagram is {} bytes; need at least {} (24B KCP header + 32B HMAC)",
+            "media datagram is {} bytes; need at least {} (24B KCP header + 20B HMAC)",
             datagram.len(),
             HMAC_TAG_LEN + crate::stream::media::kcp::IKCP_OVERHEAD
         )));
     }
     let split = datagram.len() - HMAC_TAG_LEN;
     let (body, tag) = datagram.split_at(split);
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key16)
-        .map_err(|e| Error::Transport(format!("HMAC-SHA256 key init failed: {e}")))?;
+    let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(key16)
+        .map_err(|e| Error::Transport(format!("HMAC-SHA1 key init failed: {e}")))?;
     mac.update(body);
     // `verify_slice` is constant-time (mirrors `mbedtls`'s safe compare).
     mac.verify_slice(tag).map_err(|_| {
         Error::Transport(
-            "media datagram HMAC-SHA256 mismatch (\"invalid md code\"): wrong media key \
+            "media datagram HMAC-SHA1 mismatch (\"invalid md code\"): wrong media key \
              or corrupt datagram"
                 .to_string(),
         )
@@ -253,10 +266,10 @@ pub(crate) mod test_support {
         out
     }
 
-    /// Append a trailing `HMAC-SHA256(key16, body)` tag to `body` (suite 3).
+    /// Append a trailing 20-byte `HMAC-SHA1(key16, body)` tag to `body` (suite 3).
     #[must_use]
     pub fn append_hmac(body: &[u8], key16: &[u8]) -> Vec<u8> {
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key16).expect("hmac key");
+        let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(key16).expect("hmac key");
         mac.update(body);
         let tag = mac.finalize().into_bytes();
         let mut out = body.to_vec();

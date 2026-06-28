@@ -119,6 +119,15 @@ pub struct StreamArgs {
     /// larger than this are FU-A fragmented.
     #[arg(long, default_value_t = DEFAULT_MTU)]
     pub mtu: usize,
+
+    /// DIAGNOSTIC (live only): arm the TASK-0080 302 topic probe. In addition to
+    /// the RE-derived strict subscribe `smart/mb/in/<devId>`, ALSO subscribe to the
+    /// candidate inbound topics (`smart/mb/in/<uid>`, `smart/mb/<uid>`) and the
+    /// inbound wildcard, and log the EXACT topic + `header.type` of every inbound
+    /// 302 (message bodies withheld) — so a live run reveals WHERE the camera's
+    /// answer actually lands when it is otherwise silent. Hidden from `--help`.
+    #[arg(long, hide = true, default_value_t = false)]
+    pub diag_topics: bool,
 }
 
 /// Entry point for the `stream` subcommand.

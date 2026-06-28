@@ -16,7 +16,9 @@
 
 use babymonitor_core::stream::mqtt_crypto::{build_302_frame, parse_302_frame};
 use babymonitor_core::stream::sdp::{build_offer_sdp, OfferSdpParams};
-use babymonitor_core::stream::signaling::{SignalingEnvelope, SignalingPath, SignalingType};
+use babymonitor_core::stream::signaling::{
+    OfferEnvelopeArgs, SignalingEnvelope, SignalingPath, SignalingType,
+};
 
 // A synthetic 16-byte localKey for the 302-frame round-trip (never a real key).
 const SYNTH_LOCAL_KEY: &[u8; 16] = b"0123456789abcdef";
@@ -68,6 +70,86 @@ fn assert_offer_sdp_reproduces(sdp: &str) {
     );
 }
 
+/// TASK-0080: assert the offer **builder** ([`SignalingEnvelope::offer`], the same
+/// path the live `build_offer` drives) reproduces the captured offer for the
+/// capture's own inputs — header + msg (sdp, preconnect, token, tcp_token, log).
+///
+/// Two levels:
+/// 1. **Semantic fidelity** (order/whitespace-independent): the rebuilt offer,
+///    re-parsed to a `Value`, equals the captured offer `Value`. This catches a
+///    wrong fixed field (`moto_id`, `is_pre`, `preconnect`, `type`) or a dropped
+///    `tcp_token`/`log`.
+/// 2. **Byte-order fidelity**: the rebuilt offer serializes with the cap3 header
+///    key sequence (`from..path`) and msg key sequence (`sdp..log`), and carries
+///    `"moto_id":""` + `"is_pre":0` verbatim.
+fn assert_offer_builder_reproduces(env: &SignalingEnvelope, captured_inner: &str) {
+    let path = env.header.path.expect("offer header carries a path");
+    let args = OfferEnvelopeArgs {
+        from: env.header.from.clone().expect("offer header.from"),
+        to: env.header.to.clone().expect("offer header.to"),
+        sessionid: env
+            .header
+            .sessionid
+            .clone()
+            .expect("offer header.sessionid"),
+        trace_id: env.header.trace_id.clone().expect("offer header.trace_id"),
+        p2p_skill: env.header.p2p_skill.expect("offer header.p2p_skill"),
+        security_level: env
+            .header
+            .security_level
+            .expect("offer header.security_level"),
+        sdp: env.msg.sdp.clone().expect("offer msg.sdp"),
+        ice_servers: env.msg.token.clone().unwrap_or_default(),
+        tcp_token: env.msg.tcp_token.clone(),
+        log: env.msg.log.clone(),
+    };
+    let rebuilt = SignalingEnvelope::offer(&args, path);
+    let rebuilt_str = String::from_utf8(rebuilt.to_json().expect("serialize rebuilt offer"))
+        .expect("rebuilt offer is utf8");
+
+    // (1) Semantic fidelity.
+    let got: serde_json::Value = serde_json::from_str(&rebuilt_str).expect("rebuilt offer json");
+    let want: serde_json::Value =
+        serde_json::from_str(captured_inner).expect("captured offer json");
+    assert_eq!(
+        got, want,
+        "the offer builder must reproduce the captured offer content (header + msg) byte-for-byte"
+    );
+
+    // (2) Byte-order fidelity — the keys appear in the cap3 sequence.
+    let in_order = |keys: &[&str]| {
+        let mut last = 0usize;
+        for k in keys {
+            let at = rebuilt_str
+                .find(&format!("\"{k}\":"))
+                .unwrap_or_else(|| panic!("rebuilt offer is missing key {k}"));
+            assert!(at >= last, "rebuilt offer key {k} is out of cap3 order");
+            last = at;
+        }
+    };
+    in_order(&[
+        "from",
+        "to",
+        "sessionid",
+        "moto_id",
+        "type",
+        "trace_id",
+        "is_pre",
+        "p2p_skill",
+        "security_level",
+        "path",
+    ]);
+    in_order(&["sdp", "preconnect", "token", "tcp_token", "log"]);
+    assert!(
+        rebuilt_str.contains("\"moto_id\":\"\""),
+        "moto_id present-but-empty (cap3)"
+    );
+    assert!(
+        rebuilt_str.contains("\"is_pre\":0"),
+        "is_pre:0 (cap3 offer)"
+    );
+}
+
 /// Validate one capture file: every message parses to the typed envelope, offers
 /// reproduce their SDP, the answer's engine inputs extract, and each round-trips
 /// through the 302 frame codec.
@@ -96,6 +178,9 @@ fn validate_capture(path: &std::path::Path) {
                     Some(SignalingPath::Mqtt) | Some(SignalingPath::Lan)
                 ));
                 assert_offer_sdp_reproduces(sdp);
+                // TASK-0080: the offer BUILDER reproduces the whole captured offer
+                // (header + msg.tcp_token + msg.log), not just the SDP.
+                assert_offer_builder_reproduces(&env, &inner);
             }
             SignalingType::Candidate => {
                 n_candidate += 1;
@@ -115,12 +200,18 @@ fn validate_capture(path: &std::path::Path) {
             SignalingType::Disconnect => {}
         }
 
-        // Every message round-trips through the localKey-AES 302 frame codec
-        // (base64 variant + {data,gwId,protocol,pv,t} frame).
-        let frame = build_302_frame(inner.as_bytes(), SYNTH_LOCAL_KEY, "SYNTH_DEV", "2.2", 0)
+        // Every message round-trips through the binary message-2.2 302 frame codec
+        // (pv + crc + s + o + AES-ECB(localKey, {data,protocol,t} envelope)).
+        let frame = build_302_frame(inner.as_bytes(), SYNTH_LOCAL_KEY, "2.2", 4, 588790, 0)
             .expect("build 302 frame");
-        let back = parse_302_frame(&frame, SYNTH_LOCAL_KEY).expect("parse 302 frame");
-        assert_eq!(back, inner.as_bytes(), "302 frame round-trip is lossless");
+        let back = parse_302_frame(&frame, SYNTH_LOCAL_KEY, "2.2").expect("parse 302 frame");
+        // The envelope wrap/unwrap re-serializes JSON, so compare structurally.
+        let back_v: serde_json::Value = serde_json::from_slice(&back).unwrap();
+        let inner_v: serde_json::Value = serde_json::from_str(&inner).unwrap();
+        assert_eq!(
+            back_v, inner_v,
+            "302 frame round-trip preserves the 302 json"
+        );
         // And the decrypted plaintext re-parses to the same envelope.
         let env2 = SignalingEnvelope::from_json(&back).unwrap();
         assert_eq!(env2.header.r#type, env.header.r#type);

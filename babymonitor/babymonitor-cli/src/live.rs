@@ -224,6 +224,22 @@ const HOME_SPACE_LIST_VERSION: &str = "1.0";
 const DEVICE_LIST_ACTION: &str = "m.life.my.group.device.list";
 const DEVICE_LIST_VERSION: &str = "2.2";
 
+/// `rtc.config.get` — the per-camera WebRTC-over-MQTT session config
+/// (TASK-0078). CAPTURE-VERIFIED (emulator_captures/cap1 + cap3): the genuine app
+/// sends `a=smartlife.m.rtc.config.get` (`thing.*`→`smartlife.*`-rewritten) at
+/// **v1.0**, session-required (signed `sid`, ET=3 under the session `ecode`), with
+/// `postData = {"devId":"<devId>"}`. The decrypted `result` is parsed by
+/// [`babymonitor_core::stream::rtc_config::RtcConfig`].
+const RTC_CONFIG_GET_ACTION: &str = "thing.m.rtc.config.get";
+const RTC_CONFIG_GET_VERSION: &str = "1.0";
+
+/// `p2p.main.pre.link.get` — the pre-link warm-up. CAPTURE-VERIFIED (cap1): the
+/// decrypted `result` is a bare boolean (`true`) — it carries **no config** (it
+/// only nudges the cloud to pre-warm the relay), so it is an optional best-effort
+/// call, NOT a source of any runtime field.
+const PRE_LINK_GET_ACTION: &str = "thing.m.p2p.main.pre.link.get";
+const PRE_LINK_GET_VERSION: &str = "1.0";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Loaded secrets (from secrets/, never echoed)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1794,6 +1810,187 @@ pub fn run_injected_device_list(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// rtc.config.get — fetch the per-camera WebRTC session config (TASK-0078)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Fetch + ET=3-decrypt the camera's `rtc.config.get` config for `dev_id`, using a
+/// SEPARATELY-CAPTURED session injected into the on-disk [`SessionStore`] (the same
+/// token-injectable discipline as [`run_injected_device_list`]). This is the live
+/// REST half of making `stream --live` self-sufficient: it yields the decrypted
+/// `result` object the CLI parses into a
+/// [`babymonitor_core::stream::rtc_config::RtcConfig`] and assembles a runtime
+/// bundle from — so no hand-written `secrets/stream_runtime.json` is needed.
+///
+/// READ-ONLY: it sends exactly ONE signed `smartlife.m.rtc.config.get` (v1.0,
+/// `postData = {"devId":<dev_id>}`, `sid` signed, ET=3 under the session `ecode`)
+/// and returns the decrypted `result`. The raw decrypted response is captured to
+/// gitignored `secrets/tuya_rtc_config.json` (never logged).
+///
+/// `store` is injected (real default-path store in production, temp store in
+/// tests). NO secret value (sid/uid/auth/keys) is ever logged or returned in a
+/// human-facing message.
+///
+/// # Errors
+/// - [`LiveError::Config`] if no session is injected or a secret is missing.
+/// - [`LiveError::Network`]/[`LiveError::Protocol`] on transport / decode failure.
+/// - [`LiveError::SignRejected`]/[`LiveError::Server`] if the server rejects the call.
+pub fn fetch_rtc_config(
+    secrets_dir: &Path,
+    apk_path: &Path,
+    store: &SessionStore,
+    dev_id: &str,
+) -> Result<serde_json::Value, LiveError> {
+    if dev_id.trim().is_empty() {
+        return Err(LiveError::Config(
+            "fetch_rtc_config: devId is empty (need the camera's devId)".to_string(),
+        ));
+    }
+    let session = store
+        .load()
+        .map_err(|e| LiveError::Config(format!("session store: {e}")))?
+        .ok_or_else(|| {
+            LiveError::Config(
+                "no session injected in the store — rtc.config.get needs a captured sid"
+                    .to_string(),
+            )
+        })?;
+
+    let cfg = load_config(secrets_dir, apk_path)?;
+    let host = host_from_mobile_api_base(&session.mobile_api_base);
+    probe_host(&host)?;
+    eprintln!(
+        "live: rtc.config.get — host {host} reachable; fetching camera config (values withheld)."
+    );
+
+    let user_agent = format!(
+        "Thing-UA=APP/Android/{}/SDK/{}",
+        cfg.app_version, THING_SDK_VERSION
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(user_agent)
+        .build()
+        .map_err(|e| LiveError::Network(format!("build http client: {e}")))?;
+
+    // Best-effort pre-link warm-up, faithful to the app sequence (the genuine app
+    // fires `p2p.main.pre.link.get` BEFORE `rtc.config.get` to pre-warm the relay).
+    // It carries no config (cap1: the decrypted result is a bare boolean), so a
+    // failure here is logged and IGNORED — it never blocks the config fetch.
+    prewarm_pre_link(&client, &host, &cfg, &session.sid, session.ecode.as_deref());
+
+    let resp = send_rtc_config(
+        &client,
+        &host,
+        &cfg,
+        &session.sid,
+        session.ecode.as_deref(),
+        dev_id,
+    )?;
+    // Capture the DECRYPTED business envelope to gitignored secrets/ (carries
+    // per-session secrets/PII → never logged, only written under secrets/).
+    capture_to_secrets(&cfg, "tuya_rtc_config.json", &resp.raw)?;
+    if !resp.success {
+        return Err(classify_error(&resp));
+    }
+    eprintln!("live: rtc.config.get OK (camera config captured to secrets/tuya_rtc_config.json).");
+    Ok(resp.result)
+}
+
+/// Build + send the signed `rtc.config.get` for one `dev_id`. Split out so the
+/// envelope assembly is testable and the post-data shape is pinned in one place.
+fn send_rtc_config(
+    client: &reqwest::blocking::Client,
+    host: &str,
+    cfg: &LiveConfig,
+    sid: &str,
+    ecode: Option<&str>,
+    dev_id: &str,
+) -> Result<AtopResponse, LiveError> {
+    let post_data = rtc_config_post_data(dev_id);
+    let extra = sid_extra(sid);
+    let (env, body) = build_signed_envelope_with(
+        cfg,
+        RTC_CONFIG_GET_ACTION,
+        RTC_CONFIG_GET_VERSION,
+        &post_data,
+        &extra,
+        ecode,
+    )?;
+    send_atop(client, host, cfg, &env, Some(&body), ecode)
+}
+
+/// The `rtc.config.get` postData: compact `{"devId":"<dev_id>"}` (CAPTURE-VERIFIED,
+/// cap1 — the only field). Built via serde so the `dev_id` is JSON-escaped.
+fn rtc_config_post_data(dev_id: &str) -> String {
+    serde_json::json!({ "devId": dev_id }).to_string()
+}
+
+/// Best-effort `p2p.main.pre.link.get` warm-up (CAPTURE-VERIFIED, cap1: v1.0,
+/// session-required, **NO postData**, decrypted result is a bare boolean `true`).
+/// The app fires it before `rtc.config.get`; it carries no config, so any failure
+/// is logged and swallowed (it must NEVER block the load-bearing config fetch).
+fn prewarm_pre_link(
+    client: &reqwest::blocking::Client,
+    host: &str,
+    cfg: &LiveConfig,
+    sid: &str,
+    ecode: Option<&str>,
+) {
+    let result = (|| -> Result<(), LiveError> {
+        let env = build_signed_envelope_no_post_data(
+            cfg,
+            PRE_LINK_GET_ACTION,
+            PRE_LINK_GET_VERSION,
+            &sid_extra(sid),
+        )?;
+        let resp = send_atop(client, host, cfg, &env, None, ecode)?;
+        if !resp.success {
+            return Err(classify_error(&resp));
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => eprintln!("live: pre.link.get warm-up ok."),
+        Err(e) => eprintln!("live: pre.link.get warm-up skipped (non-fatal): {e}"),
+    }
+}
+
+/// The STATIC half of the MQTT CONNECT credentials, computed offline from
+/// `secrets/` + the APK cert hash (TASK-0078): the `appId` (= appKey), the
+/// `chKey` (native `getChKey`), and the master key **G** as lowercase hex. The
+/// SESSION half (`uid`/`ecode`/`token = sid`/`partnerIdentity`) comes from the
+/// session, not here. Lets `stream --live` assemble the runtime bundle in-process
+/// without a hand-written `secrets/stream_runtime.json`. NO value is logged.
+pub struct DerivedMqttKeyMaterial {
+    /// `mAppId` = the OEM appKey (`ThingSmartNetWork.mAppId`).
+    pub app_id: String,
+    /// `getChKey(mAppId)` — the per-app channel-auth token (capture-verified
+    /// `sign::ch_key`; 8-char hex).
+    pub ch_key: String,
+    /// Master key **G** as lowercase hex (`sign::assemble_master_key_g`) — the
+    /// HMAC key the broker password derivation (`doCommandNative(2)`) folds.
+    pub master_key_g_hex: String,
+}
+
+/// Compute [`DerivedMqttKeyMaterial`] from `secrets/` + the offline APK cert hash.
+///
+/// # Errors
+/// [`LiveError::Config`]/[`LiveError::Cert`]/[`LiveError::Crypto`] if a secret is
+/// missing/malformed or the cert-hash / master-key derivation fails.
+pub fn derive_mqtt_key_material(
+    secrets_dir: &Path,
+    apk_path: &Path,
+) -> Result<DerivedMqttKeyMaterial, LiveError> {
+    let cfg = load_config(secrets_dir, apk_path)?;
+    let g = master_key_g(&cfg)?;
+    Ok(DerivedMqttKeyMaterial {
+        app_id: cfg.material.app_key.clone(),
+        ch_key: cfg.ch_key.clone(),
+        master_key_g_hex: hex::encode(g),
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Orchestration: the one-shot live login
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -3122,6 +3319,18 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&device_list_post_data(7)).unwrap();
         assert!(v["gid"].is_number());
         assert_eq!(v["gid"].as_i64(), Some(7));
+    }
+
+    // rtc.config.get postData is the compact {"devId":"<id>"} the cap1 capture
+    // shows (the only field), JSON-escaped via serde. SYNTHETIC devId.
+    #[test]
+    fn rtc_config_post_data_is_devid_only() {
+        assert_eq!(
+            rtc_config_post_data("synthdev0001ufmo"),
+            r#"{"devId":"synthdev0001ufmo"}"#
+        );
+        let v: serde_json::Value = serde_json::from_str(&rtc_config_post_data("a\"b")).unwrap();
+        assert_eq!(v["devId"].as_str(), Some("a\"b"), "devId is JSON-escaped");
     }
 
     // parse_home_gids extracts each home's numeric gid from the home.space.list

@@ -125,19 +125,25 @@ pub struct SignalingHeader {
 /// A STUN entry is `{ "urls":"stun:host:port" }`; a TURN entry adds
 /// `credential`/`ttl`/`username`. `urls` is a single string in cap3 (the
 /// per-server entry), so we model it as `String`.
+///
+/// Field declaration order matches the cap3 offer's `token` TURN entry
+/// byte-for-byte (`credential,ttl,urls,username`) so a re-serialized offer
+/// reproduces the captured key order; `urls` is the only always-present field
+/// (a STUN entry is just `{"urls":…}`), the rest are TURN-only and skip when
+/// absent (TASK-0080).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IceServer {
-    /// The server URL (`stun:…` / `turn:…`).
-    pub urls: String,
-    /// TURN long-term credential username (`<expiry>:<devId>`), if present.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub username: Option<String>,
     /// TURN long-term credential (HMAC), if present. **SECRET-adjacent.**
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<String>,
     /// TURN credential TTL in seconds, if present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<i64>,
+    /// The server URL (`stun:…` / `turn:…`).
+    pub urls: String,
+    /// TURN long-term credential username (`<expiry>:<devId>`), if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
 }
 
 /// The `msg.tcp_token` object (cap3) — the TCP-relay descriptor.

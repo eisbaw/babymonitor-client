@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-06-26 17:38'
-updated_date: '2026-06-27 19:47'
+updated_date: '2026-06-28 07:00'
 labels:
   - stream
   - signaling
@@ -92,4 +92,8 @@ IMPLEMENTED: 302 codec byte-validated vs cap3 + 9 mock-transport tests (publish 
 ## Wired into the assembled live stream driver
 
 The 302 signaling client (connect_and_negotiate + MqttSignalingSession + BrokerConfig::from_credentials) is now wired into the ONE assembled driver babymonitor-cli/src/stream_live.rs (gated --features live): load session -> derive MQTT creds (mqtt_auth doCommandNative cmd2 password) -> RumqttcTransport TLS connect (live-tls 8883) -> publish 302 offer (imm SDP) -> poll for the camera answer -> extract remote ICE creds + media aes-key. Live socket I/O is REACHED not faked; no broker in sandbox -> honest StreamPending. AC#1 (live broker connect+auth) remains owner-gated/UNVERIFIED on the wire: re/live_stream_run.md documents the Frida hook on SdkMqttCertificationInfo/qpqbppd to dump the real clientId/username/password and diff vs derive_credentials. Gates GREEN (just e2e; --features live clippy). Not committed.
+
+LIVE-GATED (unverified vs wire): MQTT CONNECT auth (derive_credentials bit-exact vs Python+decompile, but no captured CONNECT — validate via Frida hook on qpqbppd.java bdpdqbp/qddqppb/bppdpdq, see re/live_stream_run.md); the 302 publish/subscribe TOPICS are injected, not derived (hook pbbppqb.java:399 to capture).
+
+TASK-0078 (follow-up): the 302 publish/subscribe topics — the #1 signaling unknown left injected by this task — are now DERIVED two-source from Java: smart/mb/out/<devId> (publish) / smart/mb/in/<devId> (subscribe) (re/mqtt_signaling.md §1a, stream::topics). Also wired the in-process self-sufficient runtime assembly (rtc.config.get + broker host User.domain.mobileMqttsUrl:8883 + MQTT token=User.sid) so stream --live no longer needs a hand-written secrets/stream_runtime.json. Media a=aes-key confirmed MINTED (not rtc.config session.aesKey) from cap3.
 <!-- SECTION:NOTES:END -->

@@ -16,6 +16,8 @@
 //! and the media engine is a follow-up. This is the signer's discipline: never a
 //! fake stream, never `todo!()`.
 
+use std::time::Duration;
+
 use crate::stream::connect::{build_connect_v2, ConnectV2Args, LanMode, CONNECT_SESSION_LEN};
 use crate::stream::frame::Frame;
 use crate::stream::signaling::{
@@ -130,9 +132,9 @@ fn parse_ice_servers(ices: &str) -> Vec<crate::stream::signaling::IceServer> {
 ///
 /// The offline tests implement this with an in-memory fake (no broker); the live
 /// path implements it with `rumqttc` against the device's Tuya MQTT channel. The
-/// payload bytes here are the ALREADY-localKey-AES-encrypted 302 payload (the AES
-/// primitive lives in [`super::mqtt_crypto`] and is recovered; the full envelope
-/// variant/framing assembly is the part still live-gated).
+/// payload bytes here are the complete localKey-AES binary message-2.2 frame
+/// (built by [`super::mqtt_crypto::build_302_frame`], cap5-pinned + byte-validated);
+/// the transport just publishes them verbatim.
 pub trait MqttTransport {
     /// Publish an (encrypted) 302 payload to the device's signaling channel.
     ///
@@ -143,9 +145,28 @@ pub trait MqttTransport {
     /// Try to receive the next inbound (encrypted) 302 payload, if one is ready.
     /// Returns `Ok(None)` when nothing is pending (non-blocking).
     ///
+    /// The returned [`Inbound302`] carries the MQTT `topic` the payload landed on
+    /// (when the transport knows it — the live `rumqttc` transport fills it; the
+    /// offline fake leaves it `None`). The topic drives the TASK-0080 `--diag-topics`
+    /// diagnostic (which inbound topic the camera's answer actually arrives on).
+    ///
     /// # Errors
     /// [`Error::Transport`] on a receive failure.
-    fn try_recv_302(&mut self) -> Result<Option<Vec<u8>>, Error>;
+    fn try_recv_302(&mut self) -> Result<Option<Inbound302>, Error>;
+}
+
+/// One inbound (still-encrypted) 302 payload plus the MQTT `topic` it arrived on.
+///
+/// `topic` is `Some` on the live `rumqttc` transport (the broker tells us the
+/// publish topic) and `None` on the offline fake (no broker). It is used ONLY for
+/// the TASK-0080 topic diagnostic logging — never for routing decisions on the
+/// strict path.
+#[derive(Debug, Clone)]
+pub struct Inbound302 {
+    /// The MQTT topic the payload was published on, when the transport knows it.
+    pub topic: Option<String>,
+    /// The localKey-AES-encrypted 302 frame bytes (decrypted by the caller).
+    pub payload: Vec<u8>,
 }
 
 /// The standard-WebRTC engine seam (webrtc-rs's job — a filed follow-up).
@@ -245,9 +266,9 @@ impl<'a, T: MqttTransport, E: WebRtcEngine> LiveSessionDriver<'a, T, E> {
     }
 
     /// Drive the LIVE session: build the `connect_v2` control JSON + the Tuya
-    /// `imm` offer SDP, wrap the offer in a 302 frame (now AES-ECB/localKey
-    /// encrypted + base64-framed — cap3-pinned), and **publish it over both the
-    /// `mqtt` and `lan` paths** through the transport seam. Then return
+    /// `imm` offer SDP, wrap the offer in the binary message-2.2 302 frame
+    /// (AES-ECB/localKey, cap5-pinned), and **publish it over both the `mqtt` and
+    /// `lan` paths** through the transport seam. Then return
     /// [`Error::StreamPending`].
     ///
     /// # Honest gating
@@ -292,9 +313,9 @@ impl<'a, T: MqttTransport, E: WebRtcEngine> LiveSessionDriver<'a, T, E> {
         })?;
 
         // 3. Build the offer envelopes (mqtt + lan) and publish each as a 302
-        //    frame (AES-ECB/localKey + base64 + {data,gwId,protocol,pv,t} frame)
-        //    via the shared [`MqttSignalingSession`] orchestrator — the same
-        //    transport-coupled layer the live `rumqttc` path uses.
+        //    frame (the binary message-2.2 frame, cap5-pinned) via the shared
+        //    [`MqttSignalingSession`] orchestrator — the same transport-coupled
+        //    layer the live `rumqttc` path uses.
         let flow = SignalingFlow::new(
             self.creds.p2p_id.clone(),
             self.creds.dev_id.clone(),
@@ -409,6 +430,32 @@ impl SignalingFlow {
         self.state
     }
 
+    /// `header.from` — the app/account **uid** (cap3 offer `header.from` ==
+    /// SDP `cname`).
+    #[must_use]
+    pub fn from(&self) -> &str {
+        &self.from
+    }
+
+    /// `header.to` — the camera **devId** (cap3 offer `header.to`).
+    #[must_use]
+    pub fn to(&self) -> &str {
+        &self.to
+    }
+
+    /// `header.sessionid` — `<devId><unix_seconds><8-rand>` (cap3).
+    #[must_use]
+    pub fn sessionid(&self) -> &str {
+        &self.sessionid
+    }
+
+    /// `header.trace_id` — `<uuidv4>_<devId>_<unix_millis>` (cap3); the key the
+    /// app correlates the camera answer on.
+    #[must_use]
+    pub fn trace_id(&self) -> &str {
+        &self.trace_id
+    }
+
     /// Build the outbound `offer` envelopes — one per [`SignalingPath`]
     /// (`mqtt` then `lan`), as cap3 sends the offer over both. Advances the
     /// state to [`SessionState::Connecting`].
@@ -517,6 +564,27 @@ pub enum InboundSignal {
     Disconnect,
 }
 
+/// The full result of a live 302 negotiation: the camera `answer` PLUS every
+/// remote ICE candidate the camera **trickled** as separate 302 `candidate`
+/// messages.
+///
+/// This pairing matters because the camera's answer SDP carries **no**
+/// `a=candidate:` lines (cap3 + cap4 ground truth: 0 candidates in the answer
+/// SDP). The camera trickles its host/srflx candidates as separate `candidate`
+/// messages — some interleaved before the answer, most AFTER it — so
+/// `remote_candidates`, NOT the answer SDP, is the remote candidate set the media
+/// transport selects a host candidate from. A driver that required candidates in
+/// the answer SDP would fail every real session even on a LAN.
+#[derive(Debug, Clone)]
+pub struct NegotiationOutcome {
+    /// The parsed camera answer (remote ICE creds + media key + relay descriptors).
+    pub answer: ParsedAnswer,
+    /// The remote ICE candidate lines (`a=candidate:…`) trickled over 302, in
+    /// arrival order and de-duplicated (the camera re-sends each over `mqtt`+`lan`).
+    /// The empty end-of-candidates sentinel is filtered out.
+    pub remote_candidates: Vec<String>,
+}
+
 /// A 302 signaling session bound to an [`MqttTransport`]: the engine-free
 /// orchestrator that frames + publishes the offer/candidates and decrypts +
 /// parses inbound 302 frames into [`InboundSignal`]s.
@@ -524,8 +592,8 @@ pub enum InboundSignal {
 /// This is the transport-coupled layer shared by the live `rumqttc` path
 /// ([`super::transport::connect_and_negotiate`]) and the offline mock-transport
 /// tests. It owns a [`SignalingFlow`] (routing ids + lifecycle) plus the device
-/// `localKey`/`dev_id`/`pv` needed to wrap each envelope in the outer
-/// `{data,gwId,protocol,pv,t}` 302 frame ([`super::mqtt_crypto::build_302_frame`]).
+/// `localKey`/`dev_id`/`pv` needed to wrap each envelope in the binary
+/// message-2.2 302 frame ([`super::mqtt_crypto::build_302_frame`], cap5-pinned).
 ///
 /// The transport is a generic seam, so the full publish → poll → answer flow is
 /// exercised offline against a fake in-memory transport with NO broker (see the
@@ -536,6 +604,38 @@ pub struct MqttSignalingSession<'a, T: MqttTransport> {
     local_key: Vec<u8>,
     dev_id: String,
     pv: String,
+    /// Per-publish `s`(sequence) / `o`(order) counters for the message-2.2 frame.
+    /// The camera dedups `(devId,s,o)` over a 5 s window (`qdddqdp.java:725`), so
+    /// each publish needs a tuple distinct from any *recent* one — for this device,
+    /// across *any* concurrent/retried session, and across separate CLI runs. We
+    /// seed both from independent OS entropy (64-bit tuple entropy ⇒ collision is
+    /// negligible even on a sub-second reconnect) and increment per frame.
+    seq: u32,
+    order: u32,
+    /// Inbound 302 frames that actually arrived on our topic (decodable or not).
+    inbound_seen: usize,
+    /// Of those, ones we could NOT decode as a 302 under this `local_key`/`pv`.
+    /// If every arrived frame is undecodable, the failure is a wrong localKey/pv —
+    /// surfaced as a distinct error rather than a generic "camera silent".
+    inbound_undecodable: usize,
+}
+
+/// Seed the `(s, o)` counters from independent OS entropy so no two sessions for
+/// the same device alias a `(devId,s,o)` tuple inside the camera's 5 s dedup
+/// window (a same-second retry / separate CLI run would otherwise silently get
+/// `12003 cloud command repeat`). Best-effort: a time+golden-ratio mix is the
+/// fallback if `/dev/urandom` is unreadable (keeps `s != o`).
+fn seed_so() -> (u32, u32) {
+    let mut b = [0u8; 8];
+    if OsRandom.fill(&mut b).is_ok() {
+        (
+            u32::from_be_bytes(b[0..4].try_into().unwrap()),
+            u32::from_be_bytes(b[4..8].try_into().unwrap()),
+        )
+    } else {
+        let t = now_unix() as u32;
+        (t, t ^ 0x9E37_79B9)
+    }
 }
 
 impl<'a, T: MqttTransport> MqttSignalingSession<'a, T> {
@@ -549,13 +649,27 @@ impl<'a, T: MqttTransport> MqttSignalingSession<'a, T> {
         dev_id: impl Into<String>,
         pv: impl Into<String>,
     ) -> Self {
+        let (seq, order) = seed_so();
         Self {
             transport,
             flow,
             local_key,
             dev_id: dev_id.into(),
             pv: pv.into(),
+            seq,
+            order,
+            inbound_seen: 0,
+            inbound_undecodable: 0,
         }
+    }
+
+    /// Take the next `(s, o)` tuple for a publish and advance the counters. Each
+    /// MQTT publish must carry a distinct tuple (camera 5 s dedup).
+    fn next_so(&mut self) -> (u32, u32) {
+        let so = (self.seq, self.order);
+        self.seq = self.seq.wrapping_add(1);
+        self.order = self.order.wrapping_add(1);
+        so
     }
 
     /// The current signaling lifecycle state.
@@ -564,15 +678,17 @@ impl<'a, T: MqttTransport> MqttSignalingSession<'a, T> {
         self.flow.state()
     }
 
-    /// Frame one envelope (AES-ECB/localKey + base64 + outer 302 frame) and
-    /// publish it on the device's signaling channel through the transport seam.
+    /// Frame one envelope (the binary message-2.2 frame: pv+crc+s+o+AES-ECB/localKey)
+    /// and publish it on the device's signaling channel through the transport seam.
     fn publish_envelope(&mut self, env: &SignalingEnvelope) -> Result<(), Error> {
         let inner = env.to_json()?;
+        let (s, o) = self.next_so();
         let frame = crate::stream::mqtt_crypto::build_302_frame(
             &inner,
             &self.local_key,
-            &self.dev_id,
             &self.pv,
+            s,
+            o,
             now_unix(),
         )?;
         self.transport.publish_302(&self.dev_id, &self.pv, &frame)
@@ -613,11 +729,59 @@ impl<'a, T: MqttTransport> MqttSignalingSession<'a, T> {
     /// - [`Error::SignalingParse`]/[`Error::StreamConfig`]/[`Error::SdpAesKey`]
     ///   on a malformed frame / wrong localKey / a malformed answer SDP.
     pub fn poll_inbound(&mut self) -> Result<Option<InboundSignal>, Error> {
-        let Some(frame) = self.transport.try_recv_302()? else {
+        let Some(inbound) = self.transport.try_recv_302()? else {
             return Ok(None);
         };
-        let inner = crate::stream::mqtt_crypto::parse_302_frame(&frame, &self.local_key)?;
-        let env = SignalingEnvelope::from_json(&inner)?;
+        // A frame actually arrived on a topic we accept. Count it so a timeout can
+        // distinguish "no frames at all" (camera silent) from "frames arrived but
+        // none decoded" (wrong localKey/pv).
+        self.inbound_seen += 1;
+        let diag = crate::stream::transport::diag_enabled();
+        let topic = inbound.topic.as_deref().unwrap_or("<unknown>");
+
+        // Decrypt the localKey-AES 302 frame. The camera multiplexes OTHER Tuya
+        // message protocols on `smart/mb/in/<devId>` (observed live: `protocol:23`
+        // status/heartbeat frames, plus user pushes on sibling topics in diag mode).
+        // A frame we cannot decode as a 302 is simply not our answer — SKIP it and
+        // keep polling rather than aborting the whole negotiation. (Validated live:
+        // the camera's real `Answer`/`Candidate` frames interleave with protocol-23
+        // frames on the same topic.)
+        let inner = match crate::stream::mqtt_crypto::parse_302_frame(
+            &inbound.payload,
+            &self.local_key,
+            &self.pv,
+        ) {
+            Ok(inner) => inner,
+            Err(e) => {
+                self.inbound_undecodable += 1;
+                if diag {
+                    eprintln!(
+                        "302 diag: inbound on topic='{topic}' is NOT a decodable 302 frame ({e}); skipped"
+                    );
+                }
+                return Ok(None);
+            }
+        };
+        let env = match SignalingEnvelope::from_json(&inner) {
+            Ok(env) => env,
+            Err(e) => {
+                self.inbound_undecodable += 1;
+                if diag {
+                    eprintln!(
+                        "302 diag: inbound on topic='{topic}' decrypted but is NOT a 302 envelope ({e}); skipped"
+                    );
+                }
+                return Ok(None);
+            }
+        };
+        if diag {
+            // TASK-0080 AC#3: log the EXACT topic + header.type of every accepted
+            // 302 (body withheld) so the live run reveals WHERE the camera answers.
+            eprintln!(
+                "302 diag: ACCEPTED 302 on topic='{topic}' header.type={:?} (body withheld)",
+                env.header.r#type
+            );
+        }
         match env.header.r#type {
             SignalingType::Answer => {
                 let parsed = self.flow.ingest(&env)?.ok_or_else(|| {
@@ -646,46 +810,143 @@ impl<'a, T: MqttTransport> MqttSignalingSession<'a, T> {
         }
     }
 
-    /// Drive the full offer/answer exchange: publish the `offer`, then each local
-    /// ICE `candidate` plus the end-of-candidates sentinel (all over `mqtt`+`lan`),
-    /// then poll up to `max_polls` times for the camera `answer`.
+    /// Drive the full offer/answer exchange AND collect the camera's **trickled**
+    /// ICE candidates ([`NegotiationOutcome`]) — the robust live path (TASK-0077).
     ///
-    /// Transport-generic, so the offline tests run the whole exchange through a
-    /// mock transport (the answer frame pre-loaded) and the live path runs it
-    /// through `rumqttc`. Inbound remote candidates seen before the answer are
-    /// ignored here; the live caller wires them into the ICE engine via
-    /// [`poll_inbound`](Self::poll_inbound).
+    /// Phase 1 (answer wait): publish the `offer`, then each local `candidate`
+    /// plus the end-of-candidates sentinel (all over `mqtt`+`lan`), then poll up to
+    /// `answer_polls` times for the camera `answer`, collecting any remote
+    /// `candidate` that arrives interleaved before it.
+    ///
+    /// Phase 2 (trickle window): after the answer, keep polling up to
+    /// `trickle_polls` more times, collecting the remote `candidate` messages the
+    /// camera trickles AFTER the answer. This is essential: the answer SDP carries
+    /// no `a=candidate:` lines (cap3/cap4), so the host candidate the media
+    /// transport needs *only* arrives here. A `disconnect` ends the window early.
+    ///
+    /// `poll_interval` is slept after an empty (non-blocking) poll to pace the live
+    /// `rumqttc` transport; offline tests pass [`Duration::ZERO`] (a no-op sleep)
+    /// so they run instantly against a pre-loaded fake transport.
+    ///
+    /// Transport-generic, so the offline tests run the whole exchange — including
+    /// post-answer trickle — through a mock transport with the frames pre-loaded.
     ///
     /// # Errors
     /// - publish/framing errors (see [`publish_offer`](Self::publish_offer));
-    /// - [`Error::Transport`] if the camera `disconnect`s first, or if no answer
-    ///   arrives within `max_polls` polls (the honest no-answer state — never a
-    ///   fabricated stream).
+    /// - [`Error::Transport`] if the camera `disconnect`s before the answer, or if
+    ///   no answer arrives within `answer_polls` polls (the honest no-answer state
+    ///   — never a fabricated stream).
+    pub fn negotiate_with_trickle(
+        &mut self,
+        offer_args: &OfferEnvelopeArgs,
+        local_candidates: &[String],
+        answer_polls: usize,
+        trickle_polls: usize,
+        poll_interval: Duration,
+    ) -> Result<NegotiationOutcome, Error> {
+        self.publish_offer(offer_args)?;
+        for line in local_candidates {
+            self.publish_candidate(line)?;
+        }
+        self.publish_candidate("")?; // end-of-candidates sentinel (cap3)
+
+        let mut remote_candidates: Vec<String> = Vec::new();
+
+        // Phase 1: wait for the answer, collecting any interleaved remote candidate.
+        let mut answer: Option<ParsedAnswer> = None;
+        for _ in 0..answer_polls {
+            match self.poll_inbound()? {
+                Some(InboundSignal::Answer(a)) => {
+                    answer = Some(*a);
+                    break;
+                }
+                Some(InboundSignal::RemoteCandidate(line)) => {
+                    push_unique(&mut remote_candidates, line);
+                }
+                Some(InboundSignal::Disconnect) => {
+                    return Err(Error::Transport(
+                        "camera disconnected before sending an answer".to_string(),
+                    ));
+                }
+                None => sleep_nonzero(poll_interval),
+            }
+        }
+        let answer = match answer {
+            Some(a) => a,
+            // Distinguish a genuinely-silent camera from a wrong-key misconfig: if
+            // frames DID arrive on our topic but none decoded as a 302 under this
+            // localKey/pv, that is the diagnostic, not "camera silent".
+            None if self.inbound_seen > 0 && self.inbound_seen == self.inbound_undecodable => {
+                return Err(Error::Transport(format!(
+                    "received {} frame(s) on the 302 topic but NONE decoded as a 302 under the \
+                     configured localKey/pv — likely a wrong localKey or pv (not camera-silent)",
+                    self.inbound_seen
+                )));
+            }
+            None => {
+                return Err(Error::Transport(format!(
+                    "no answer received within {answer_polls} polls (camera silent; \
+                     {} inbound frame(s) seen, {} undecodable)",
+                    self.inbound_seen, self.inbound_undecodable
+                )));
+            }
+        };
+
+        // Phase 2: the trickle window — collect the candidates the camera sends
+        // AFTER the answer (the answer SDP itself carries none; cap3/cap4).
+        for _ in 0..trickle_polls {
+            match self.poll_inbound()? {
+                Some(InboundSignal::RemoteCandidate(line)) => {
+                    push_unique(&mut remote_candidates, line);
+                }
+                Some(InboundSignal::Disconnect) => break,
+                // A retransmitted answer is ignored; we already have one.
+                Some(InboundSignal::Answer(_)) => {}
+                None => sleep_nonzero(poll_interval),
+            }
+        }
+
+        Ok(NegotiationOutcome {
+            answer,
+            remote_candidates,
+        })
+    }
+
+    /// Drive the offer/answer exchange and return just the camera `answer`
+    /// (no post-answer trickle window). A thin wrapper over
+    /// [`negotiate_with_trickle`](Self::negotiate_with_trickle); the live path uses
+    /// the trickle variant so it actually collects the host candidate.
+    ///
+    /// # Errors
+    /// As [`negotiate_with_trickle`](Self::negotiate_with_trickle).
     pub fn negotiate(
         &mut self,
         offer_args: &OfferEnvelopeArgs,
         local_candidates: &[String],
         max_polls: usize,
     ) -> Result<ParsedAnswer, Error> {
-        self.publish_offer(offer_args)?;
-        for line in local_candidates {
-            self.publish_candidate(line)?;
-        }
-        self.publish_candidate("")?; // end-of-candidates sentinel (cap3)
-        for _ in 0..max_polls {
-            match self.poll_inbound()? {
-                Some(InboundSignal::Answer(answer)) => return Ok(*answer),
-                Some(InboundSignal::Disconnect) => {
-                    return Err(Error::Transport(
-                        "camera disconnected before sending an answer".to_string(),
-                    ))
-                }
-                Some(InboundSignal::RemoteCandidate(_)) | None => {}
-            }
-        }
-        Err(Error::Transport(format!(
-            "no answer received within {max_polls} polls (camera silent, or wrong topic/creds)"
-        )))
+        Ok(self
+            .negotiate_with_trickle(offer_args, local_candidates, max_polls, 0, Duration::ZERO)?
+            .answer)
+    }
+}
+
+/// Append `line` to `out` only if not already present. Trickle candidates are
+/// re-sent over BOTH the `mqtt` and `lan` paths (cap4), so the same
+/// `a=candidate:` line arrives twice — dedupe by exact line to avoid a doubled
+/// candidate set.
+fn push_unique(out: &mut Vec<String>, line: String) {
+    if !out.contains(&line) {
+        out.push(line);
+    }
+}
+
+/// Sleep only for a non-zero duration. The live path paces its non-blocking polls
+/// (e.g. 20 ms) so it does not busy-spin the rumqttc eventloop; offline tests pass
+/// [`Duration::ZERO`], for which this is an instant no-op (no scheduler hit).
+fn sleep_nonzero(d: Duration) {
+    if !d.is_zero() {
+        std::thread::sleep(d);
     }
 }
 
@@ -737,8 +998,11 @@ mod tests {
             self.published.push(payload.to_vec());
             Ok(())
         }
-        fn try_recv_302(&mut self) -> Result<Option<Vec<u8>>, Error> {
-            Ok(self.inbound.pop_front())
+        fn try_recv_302(&mut self) -> Result<Option<Inbound302>, Error> {
+            Ok(self.inbound.pop_front().map(|payload| Inbound302 {
+                topic: None,
+                payload,
+            }))
         }
     }
 
@@ -830,9 +1094,12 @@ mod tests {
         // build path is real, not stubbed).
         assert_eq!(t.published.len(), 2, "offer published over mqtt + lan");
         for frame in &t.published {
-            let inner =
-                crate::stream::mqtt_crypto::parse_302_frame(frame, creds.local_key.as_bytes())
-                    .unwrap();
+            let inner = crate::stream::mqtt_crypto::parse_302_frame(
+                frame,
+                creds.local_key.as_bytes(),
+                &creds.pv,
+            )
+            .unwrap();
             let env = SignalingEnvelope::from_json(&inner).unwrap();
             assert_eq!(env.header.r#type, SignalingType::Offer);
             assert!(env.msg.sdp.as_deref().unwrap().contains("imm 6001"));
@@ -1022,11 +1289,11 @@ mod tests {
         )
     }
 
-    // Build an inbound 302 FRAME (AES-ECB/localKey + base64 + outer frame) from an
+    // Build an inbound 302 FRAME (message-2.2 binary frame: pv+crc+s+o+AES) from an
     // envelope, exactly as the camera would put it on the wire.
     fn frame_for(env: &SignalingEnvelope) -> Vec<u8> {
         let inner = env.to_json().unwrap();
-        crate::stream::mqtt_crypto::build_302_frame(&inner, SYNTH_LK, "DEV", "2.2", 0).unwrap()
+        crate::stream::mqtt_crypto::build_302_frame(&inner, SYNTH_LK, "2.2", 1, 1, 0).unwrap()
     }
 
     fn new_session(t: &mut FakeTransport) -> MqttSignalingSession<'_, FakeTransport> {
@@ -1060,7 +1327,8 @@ mod tests {
         );
         let mut got = Vec::new();
         for (i, frame) in t.published.iter().enumerate() {
-            let inner = crate::stream::mqtt_crypto::parse_302_frame(frame, SYNTH_LK).unwrap();
+            let inner =
+                crate::stream::mqtt_crypto::parse_302_frame(frame, SYNTH_LK, "2.2").unwrap();
             let env = SignalingEnvelope::from_json(&inner).unwrap();
             let want = if i < 2 {
                 SignalingType::Offer
@@ -1152,9 +1420,13 @@ mod tests {
     }
 
     // NEGATIVE: a frame built under one localKey cannot be decrypted with another
-    // — poll fails loud (wrong key / corrupt frame), never returns garbage.
+    // — an inbound frame we cannot decrypt (wrong localKey, or any junk/other-
+    //   protocol frame the camera multiplexes onto our topic) is SKIPPED, never
+    //   returned as garbage and never an abort. (Validated live: the camera sends
+    //   `protocol:23` status frames on `smart/mb/in/<devId>` interleaved with the
+    //   real Answer/Candidate 302s; aborting on them would kill the negotiation.)
     #[test]
-    fn session_poll_rejects_wrong_local_key() {
+    fn session_poll_skips_undecodable_inbound() {
         let mut t = FakeTransport::default();
         let answer = answer_env(
             "v=0\r\nm=application 9 tuya 6001\r\na=ice-ufrag:x\r\na=ice-pwd:y\r\na=aes-key:00112233445566778899aabbccddeeff\r\n",
@@ -1167,7 +1439,8 @@ mod tests {
             "DEV",
             "2.2",
         );
-        assert!(s.poll_inbound().is_err());
+        // Wrong key ⇒ the frame is undecodable ⇒ skipped (Ok(None)), not an error.
+        assert!(s.poll_inbound().unwrap().is_none());
     }
 
     // negotiate(): publish offer + candidate + sentinel over both paths, then poll
@@ -1189,6 +1462,124 @@ mod tests {
         assert_eq!(parsed.media_key.len(), 16);
         // offer(2) + 1 candidate(2) + end-of-candidates sentinel(2) = 6 frames.
         assert_eq!(t.published.len(), 6);
+    }
+
+    // A wrong localKey must NOT be reported as "camera silent": frames arrive on
+    // the topic but none decode, so negotiate surfaces a DISTINCT misconfig error
+    // (restores the fail-fast diagnostic the skip-undecodable change would mask).
+    #[test]
+    fn session_negotiate_wrong_localkey_reports_distinct_error() {
+        let mut t = FakeTransport::default();
+        let answer = answer_env(
+            "v=0\r\nm=application 9 tuya 6001\r\na=ice-ufrag:x\r\na=ice-pwd:y\r\na=aes-key:00112233445566778899aabbccddeeff\r\n",
+        );
+        // Frames built under SYNTH_LK; the session below uses a DIFFERENT key, so
+        // every arrived frame is undecodable.
+        t.inbound.push_back(frame_for(&answer));
+        t.inbound.push_back(frame_for(&answer));
+        let args = synth_offer_args();
+        let cands: Vec<String> = Vec::new();
+        let err = {
+            let mut s = MqttSignalingSession::new(
+                &mut t,
+                SignalingFlow::new("USER", "DEV", "SESS", "t"),
+                b"fedcba9876543210".to_vec(), // secret-scan:allow (synthetic wrong key)
+                "DEV",
+                "2.2",
+            );
+            s.negotiate(&args, &cands, 8)
+                .expect_err("wrong localKey must not negotiate an answer")
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("wrong localKey") && !msg.contains("camera silent"),
+            "expected a distinct wrong-localKey diagnostic, got: {msg}"
+        );
+    }
+
+    // negotiate_with_trickle(): the camera's host candidate arrives as TRICKLED
+    // 302 `candidate` messages (the answer SDP carries none — cap3/cap4). Phase 2
+    // must collect the post-answer candidates; duplicates over mqtt+lan are
+    // deduped, the empty end-of-candidates sentinel is filtered, and a candidate
+    // interleaved BEFORE the answer is collected too.
+    #[test]
+    fn session_negotiate_with_trickle_collects_post_answer_candidates() {
+        let mut t = FakeTransport::default();
+        let cand_pre = SignalingEnvelope::candidate(
+            "DEV",
+            "USER",
+            "SESS",
+            "trace-1",
+            "a=candidate:1 1 UDP 1694498815 192.0.2.7 60862 typ srflx\r\n",
+            SignalingPath::Mqtt,
+        );
+        let answer = answer_env(
+            "v=0\r\nm=application 9 tuya 6001\r\na=ice-ufrag:SYN0\r\na=ice-pwd:SYNTHICEPWD0000000000000\r\na=aes-key:00112233445566778899aabbccddeeff\r\n",
+        );
+        // Same host candidate line trickled over BOTH paths after the answer.
+        let host_line = "a=candidate:2 1 UDP 2130706431 10.0.2.15 58363 typ host\r\n";
+        let host_mqtt = SignalingEnvelope::candidate(
+            "DEV",
+            "USER",
+            "SESS",
+            "trace-1",
+            host_line,
+            SignalingPath::Mqtt,
+        );
+        let host_lan = SignalingEnvelope::candidate(
+            "DEV",
+            "USER",
+            "SESS",
+            "trace-1",
+            host_line,
+            SignalingPath::Lan,
+        );
+        let sentinel =
+            SignalingEnvelope::candidate("DEV", "USER", "SESS", "trace-1", "", SignalingPath::Mqtt);
+        for f in [&cand_pre, &answer, &host_mqtt, &host_lan, &sentinel] {
+            t.inbound.push_back(frame_for(f));
+        }
+        let args = synth_offer_args();
+        let outcome = {
+            let mut s = new_session(&mut t);
+            s.negotiate_with_trickle(&args, &[], 4, 8, std::time::Duration::ZERO)
+                .expect("answer negotiated with trickle")
+        };
+        assert_eq!(outcome.answer.remote_ufrag, "SYN0");
+        assert_eq!(outcome.answer.media_key.len(), 16);
+        // srflx (pre-answer) + host (post-answer, deduped across mqtt+lan) = 2.
+        assert_eq!(
+            outcome.remote_candidates.len(),
+            2,
+            "srflx + host, the host deduped across mqtt+lan"
+        );
+        assert!(outcome
+            .remote_candidates
+            .iter()
+            .any(|c| c.contains("typ host")));
+        assert!(outcome
+            .remote_candidates
+            .iter()
+            .any(|c| c.contains("typ srflx")));
+    }
+
+    // negotiate_with_trickle(): an answer with NO trickled candidates still returns
+    // the answer with an empty candidate set (the caller decides how to proceed —
+    // it does NOT error here; the no-candidate decision belongs to the media layer).
+    #[test]
+    fn session_negotiate_with_trickle_answer_without_candidates() {
+        let mut t = FakeTransport::default();
+        let answer = answer_env(
+            "v=0\r\nm=application 9 tuya 6001\r\na=ice-ufrag:SYN0\r\na=ice-pwd:SYNTHICEPWD0000000000000\r\na=aes-key:00112233445566778899aabbccddeeff\r\n",
+        );
+        t.inbound.push_back(frame_for(&answer));
+        let args = synth_offer_args();
+        let mut s = new_session(&mut t);
+        let outcome = s
+            .negotiate_with_trickle(&args, &[], 4, 4, std::time::Duration::ZERO)
+            .unwrap();
+        assert_eq!(outcome.answer.remote_ufrag, "SYN0");
+        assert!(outcome.remote_candidates.is_empty());
     }
 
     // NEGATIVE: no answer within the poll budget is the honest no-answer state

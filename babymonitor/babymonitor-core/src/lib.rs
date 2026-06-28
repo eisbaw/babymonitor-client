@@ -112,23 +112,6 @@ pub enum Error {
     #[error("SDP aes-key error: {0}")]
     SdpAesKey(String),
 
-    /// **RESOLVED (cap3) — retained for API stability.** Formerly returned while
-    /// the 302 `pv → output-variant` binding + outer MQTT framing were unpinned.
-    ///
-    /// The cap3 capture pinned both: the variant is **Base64** (the decrypt seam
-    /// `qpqddqd.bdpdqbp(ct, localKey)` is `AESUtil.decryptWithBase64`,
-    /// `emulator_captures/cap3/DECRYPT.md` §2) and the outer frame is
-    /// `{data, gwId, protocol, pv, t}` (`pbbppqb.java:399-406`). Both are now
-    /// implemented in [`stream::mqtt_crypto`] ([`stream::mqtt_crypto::build_302_frame`]),
-    /// so this variant is no longer produced by the 302 path. (Honest residual:
-    /// cap3 logged decrypted plaintext only, so the AES→base64→frame layer is
-    /// round-trip-tested, not byte-compared against captured ciphertext.)
-    #[error(
-        "302-publish envelope pending (RESOLVED by cap3: Base64 variant + \
-         {{data,gwId,protocol,pv,t}} frame — see stream::mqtt_crypto)"
-    )]
-    MqttEnvelopePending,
-
     /// A frame model operation failed: an unrecognized `imm_p2p_rtc_frame_t.type`,
     /// an unsupported rtpmap codec, or an empty payload
     /// (`re/webrtc_session.md` §4).
@@ -144,15 +127,13 @@ pub enum Error {
     #[error("webrtc engine error: {0}")]
     WebRtcEngine(String),
 
-    /// The honest **not-yet-live** state of the live A/V session: the client
-    /// cannot actually stream because every runtime input
-    /// (token/p2pId/p2pKey/ices/session/localKey/pv) rides an authenticated device
-    /// session that this core path does not establish, the 302-publish envelope
-    /// assembly is pending ([`Error::MqttEnvelopePending`] — the AES primitive is
-    /// implemented, but the pv→variant binding + outer framing need a live
-    /// capture), and the WebRTC media engine is a follow-up (no webrtc-rs in this
-    /// build — TASK-0037). The live driver returns THIS rather than a fabricated
-    /// stream or `todo!()` — exactly the signer's TOKEN-PENDING discipline.
+    /// The honest **not-yet-live** state of *this offline core driver*: it builds
+    /// and publishes the offer but does not open a real broker socket, so it cannot
+    /// complete the negotiation. (The 302 framing is fully resolved and byte-pinned
+    /// by cap5 — see [`stream::mqtt_crypto::build_302_frame`]; the self-contained
+    /// live path lives in [`stream::transport::connect_and_negotiate`] under the
+    /// `live-tls` feature.) The offline driver returns THIS rather than a
+    /// fabricated stream or `todo!()` — exactly the signer's TOKEN-PENDING discipline.
     #[error(
         "live A/V stream is pending: cannot stream until authenticated device \
          creds, 302 framing, and the WebRTC media engine land (TASK-0037)"

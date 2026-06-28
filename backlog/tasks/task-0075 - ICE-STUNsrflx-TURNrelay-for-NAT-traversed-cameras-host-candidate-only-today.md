@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-06-26 22:20'
-updated_date: '2026-06-27 18:46'
+updated_date: '2026-06-27 20:05'
 labels:
   - stream
   - ice
@@ -63,4 +63,6 @@ Implemented the minimal ICE connectivity layer per the cap4-proven scope: HOST-d
 
 ### Note (unrelated, pre-existing)
 just secret-scan is RED only on pre-existing emulator_captures/*/flows.full.txt + pcaps (known, tracked by TASK-0066; emulator_captures is not gitignored). ZERO hits reference the new source/test files. No git commit made (per instruction).
+
+STUN/ICE host-direct DONE: media/stun.rs (Binding + MESSAGE-INTEGRITY HMAC-SHA1 + FINGERPRINT + XOR-MAPPED-ADDRESS) KAT byte-exact vs cap4 real ICE-check packets (tests/cap4_stun_kat.rs); host-candidate-direct path wired (cap4 reached the camera on LAN host). REMAINING (remote/NAT only): TURN Allocate/relay is a typed stub; srflx validated loopback-only (not vs the real stun: server).
 <!-- SECTION:NOTES:END -->

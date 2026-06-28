@@ -11,9 +11,9 @@
 //!   (`{sdp|candidate, token:[ices], tcp_token, log}`), not a string
 //!   (`re/webrtc_session.md` §2 + `emulator_captures/cap3/signaling_plaintext.jsonl`).
 //! - [`mqtt_crypto`] — the SDP `a=aes-key:<hex>` media-key hex codec (byte-exact,
-//!   `re/webrtc_session.md` §3c) + the 302-payload localKey-AES (AES-128/ECB/PKCS5,
-//!   key=localKey, no IV, **Base64** variant — pinned by cap3) + the outer
-//!   `{data,gwId,protocol,pv,t}` MQTT frame codec.
+//!   `re/webrtc_session.md` §3c) + the 302 localKey-AES (AES-128/ECB/PKCS5,
+//!   key=localKey, no IV) wrapped in the **binary Tuya message-2.2 frame**
+//!   (`pv ++ crc32 ++ s ++ o ++ AES`, cap5-pinned — `re/mqtt_2_2_frame.md`).
 //! - [`connect`] — the `connect_v2` control-JSON builder (byte-exact template,
 //!   `re/webrtc_session.md` §1).
 //! - [`sdp`] — parse/emit the Tuya-custom `m=application` + `a=aes-key` section
@@ -77,9 +77,11 @@ pub mod frame;
 pub mod media;
 pub mod mqtt_auth;
 pub mod mqtt_crypto;
+pub mod rtc_config;
 pub mod sdp;
 pub mod session;
 pub mod signaling;
+pub mod topics;
 pub mod transport;
 
 use crate::Error;
@@ -122,6 +124,13 @@ pub struct StreamCredentials {
     pub ices: String,
     /// `P2pConfig.session` — the session descriptor. **SECRET**.
     pub session: String,
+    /// `P2pConfig.tcpRelay` as a compact JSON string — echoed (with a re-minted
+    /// `sessionId`) as the offer `msg.tcp_token` (cap3). `""` if the cloud returned
+    /// none, in which case the offer omits it. **SECRET-adjacent** (relay HMAC).
+    pub tcp_relay: String,
+    /// `P2pConfig.log` as a compact JSON string — passed through verbatim as the
+    /// offer `msg.log` (cap3). `""` if absent. **SECRET-adjacent** (log auth key).
+    pub log: String,
     /// The device `localKey` — the AES key for the 302 MQTT payload. **SECRET**.
     pub local_key: String,
     /// Protocol version (`DeviceBean.pv`) — the `pv` arg of the MQTT publish.
@@ -164,6 +173,8 @@ impl std::fmt::Debug for StreamCredentials {
             .field("p2p_key", &dbg_secret(&self.p2p_key))
             .field("ices", &dbg_secret(&self.ices))
             .field("session", &dbg_secret(&self.session))
+            .field("tcp_relay", &dbg_secret(&self.tcp_relay))
+            .field("log", &dbg_secret(&self.log))
             .field("local_key", &dbg_secret(&self.local_key))
             .field("pv", &self.pv)
             .finish()
@@ -185,6 +196,8 @@ pub(crate) mod test_support {
             p2p_key: "SYNTH_P2PKEY_0000".into(),
             ices: "[]".into(),
             session: "{}".into(),
+            tcp_relay: String::new(),
+            log: String::new(),
             // 16 bytes of synthetic key material (AES-128 sized).
             local_key: "0123456789abcdef".into(), // secret-scan:allow (synthetic test value)
             pv: "2.2".into(),

@@ -41,6 +41,9 @@ babymonitor/babymonitor-core/tests/fixtures/*
 # Synthetic (SYNTH_*) redacted cap3 signaling fixture for tests/signaling_cap3.rs
 # — no real capture value; secret-scan remains the backstop.
 !babymonitor/babymonitor-core/tests/fixtures/signaling_cap3_redacted.jsonl
+# Synthetic redacted rtc.config.get fixture for tests/rtc_config_cap.rs (TASK-0078)
+# — fully synthetic ids/keys, no real capture value; secret-scan is the backstop.
+!babymonitor/babymonitor-core/tests/fixtures/rtc_config_redacted.json
 
 # Rust
 target/
@@ -64,5 +67,9 @@ result-*
 # Backlog tool runtime artifact
 backlog/email-preferences.json
 
-# Live emulator network captures (contain real deviceId/appKey/signatures).
-# Tracked intentionally for RE; LOCAL ONLY — do NOT push without redacting.
+# Live emulator network captures (contain real deviceId/localKey/appKey/media
+# keys/signatures/PII). LOCAL ONLY — never committable. cap0–cap3 predate this
+# rule and remain tracked for RE history; everything new (cap4/cap5/…) is ignored
+# so the per-session media keys + localKey-AES frames can never be committed.
+# secret-scan excludes this tree (see EXCLUDE_GLOBS) exactly like secrets/.
+emulator_captures/

@@ -1,0 +1,46 @@
+{
+  "id": "synthdev0001ufmo",
+  "motoId": "signaling00000",
+  "p2pType": 4,
+  "p2pSpecifiedType": 4,
+  "supportsWebrtc": true,
+  "auth": "U1lOVEhfQVVUSF9CNjQ9",
+  "password": "ab12cd34",
+  "skill": "{\"localStorage\":1,\"cloudStorage\":1,\"webrtc\":3,\"video_num\":3,\"sdk_version\":\"4.8.8\"}",
+  "sessionTid": "00000000-0000-0000-0000-000000000000_synthdev0001ufmo",
+  "p2pConfig": {
+    "auth": "U1lOVEhfQVVUSF9CNjQ9",
+    "expire": 1700000000,
+    "motoId": "signaling00000",
+    "transmission": "kcp",
+    "preconnect": true,
+    "ices": [
+      { "urls": "stun:1.2.3.4:3478" },
+      { "urls": "stun:[2a00:0:0:0:0:0:0:1]:3478" },
+      {
+        "urls": "turn:5.6.7.8:3478",
+        "username": "1700000000:synthdev0001ufmo",
+        "credential": "U1lOVEhfQ1JFRD0=",
+        "ttl": 36000
+      }
+    ],
+    "session": {
+      "aesKey": "00112233445566778899aabbccddeeff",
+      "aes_key": "00112233445566778899aabbccddeeff",
+      "devId": "synthdev0001ufmo",
+      "expire": 1700000000,
+      "icePassword": "SynthIcePwd0123456789012",
+      "iceUfrag": "SyUf",
+      "sessionId": "synthSID01",
+      "traceId": "00000000-0000-0000-0000-000000000000",
+      "uid": "eu0000000000000synth"
+    },
+    "tcpRelay": {
+      "credential": "U1lOVEhfVENQPQ==",
+      "domain": "localhost",
+      "sessionId": "synthSID02",
+      "urls": ["tcp4:9.9.9.9:1443"],
+      "username": "1700000000:synthdev0001ufmo"
+    }
+  }
+}

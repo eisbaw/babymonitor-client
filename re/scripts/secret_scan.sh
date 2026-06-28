@@ -39,7 +39,10 @@ PATTERNS=(
   "Bearer token|[Bb]earer[[:space:]]+[A-Za-z0-9._~+/-]{16,}=*"
   "JWT|eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{3,}"
   "Session/access token|(access[_-]?token|session[_-]?(id|token)|sessiontoken)[[:space:]'\":=]+[A-Za-z0-9._-]{16,}"
-  "Tuya localKey|local[_-]?key[[:space:]'\":=]+[A-Za-z0-9]{8,}"
+  # A real Tuya localKey is exactly a 16-char value, so require {16,} (was {8,},
+  # which false-flagged prose like "localKey injected via …"). Still catches every
+  # real localKey; only drops short English-word matches after a "localKey" token.
+  "Tuya localKey|local[_-]?key[[:space:]'\":=]+[A-Za-z0-9]{16,}"
   "Email address|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
   "GPS coordinates|[\"'(]?-?[0-9]{1,3}\.[0-9]{4,}[\"']?[[:space:]]*,[[:space:]]*[\"'(]?-?[0-9]{1,3}\.[0-9]{4,}"
 )
@@ -49,6 +52,10 @@ EXCLUDE_GLOBS=(
   ":!secrets/**" ":!extracted/**" ":!decompiled/**" ":!analysis/**"
   ":!reports/**" ":!target/**" ":!**/*.xapk" ":!**/*.apk" ":!**/*.png"
   ":!**/*.jpg" ":!**/*.bmp" ":!Cargo.lock"
+  # Live mitm/Frida captures — real localKey/token/media-key/PII RE artifacts,
+  # LOCAL ONLY + gitignored (new captures) exactly like secrets/. Excluded from
+  # the gate (it scans committable SOURCE, not the quarantined capture tree).
+  ":!emulator_captures/**"
 )
 
 # Allowlist: substrings that are known-safe (the user's own committed email in

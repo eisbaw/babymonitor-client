@@ -41,7 +41,9 @@
 
 use babymonitor_core::sign::{PendingBmpToken, SigningKeyMaterial};
 use babymonitor_core::stream::frame::Frame;
-use babymonitor_core::stream::session::{LiveSessionDriver, MqttTransport, OsRandom, WebRtcEngine};
+use babymonitor_core::stream::session::{
+    Inbound302, LiveSessionDriver, MqttTransport, OsRandom, WebRtcEngine,
+};
 use babymonitor_core::stream::StreamCredentials;
 use babymonitor_core::{device, Error};
 
@@ -100,15 +102,13 @@ fn live_login_then_device_list_finds_scd921() {
 /// the offline suite; never opens an MQTT/WebRTC socket in `just e2e`/CI.
 ///
 /// CURRENT (stream-pending) behaviour, asserted honestly when run with
-/// `--ignored`: the live session driver surfaces [`Error::StreamPending`] because
+/// `--ignored`: the offline session driver surfaces [`Error::StreamPending`] because
 /// (a) every runtime credential (token/p2pId/p2pKey/ices/session/localKey/pv)
 /// rides an authenticated session that this harness does not yet establish, so it
-/// cannot fetch the device's `CameraInfoBean`/`P2pConfig`, (b) the 302-payload
-/// localKey-AES
-/// PRIMITIVE is now implemented (AES-128/ECB/PKCS5, key=localKey), but the full
-/// 302 envelope assembly is pending (`Error::MqttEnvelopePending`: the
-/// pv→output-variant binding + outer Tuya MQTT framing need a live capture —
-/// TASK-0037), and (c) the WebRTC media engine (webrtc-rs) is a follow-up
+/// cannot fetch the device's `CameraInfoBean`/`P2pConfig`, (b) the 302 localKey-AES
+/// frame is now fully implemented + byte-pinned by cap5 (the binary message-2.2
+/// frame — `stream::mqtt_crypto::build_302_frame`), but this offline driver opens
+/// no broker socket, and (c) the WebRTC media engine (webrtc-rs) is a follow-up
 /// (TASK-0037). It makes NO network call and renders NO fabricated frame.
 ///
 /// FUTURE (once auth unblocks + a real SCD921 returns p2pType=4): replace the
@@ -137,7 +137,7 @@ fn live_webrtc_session_renders_first_frame() {
         fn publish_302(&mut self, _d: &str, _p: &str, _b: &[u8]) -> Result<(), Error> {
             panic!("transport must NOT be driven while the stream is pending");
         }
-        fn try_recv_302(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        fn try_recv_302(&mut self) -> Result<Option<Inbound302>, Error> {
             panic!("transport must NOT be driven while the stream is pending");
         }
     }
@@ -171,6 +171,8 @@ fn live_webrtc_session_renders_first_frame() {
         p2p_key: "SYNTH_P2PKEY".into(),
         ices: "[]".into(),
         session: "{}".into(),
+        tcp_relay: String::new(),
+        log: String::new(),
         local_key: "0123456789abcdef".into(), // secret-scan:allow (synthetic test value)
         pv: "2.2".into(),
     };

@@ -349,6 +349,78 @@ pub fn encode_server_query(txid: [u8; 12], software: Option<&str>) -> Vec<u8> {
     buf
 }
 
+/// Encode a Binding **Success** response: echo `txid`, carry XOR-MAPPED-ADDRESS =
+/// `mapped` (the requester's source address as we observed it), then append
+/// MESSAGE-INTEGRITY (HMAC-SHA1 keyed by `integrity_key`) and FINGERPRINT.
+///
+/// This is the reply an ICE agent sends to a peer's connectivity check so the
+/// peer confirms consent-to-send (RFC 8445 §7.3, RFC 7675). For the babymonitor
+/// host-direct path the camera (the controlled agent) periodically checks us to
+/// keep ITS consent fresh; answering with this success keeps the camera streaming
+/// during a sustained session. `integrity_key` is OUR **local** ICE password (the
+/// short-term credential the inbound check authenticated under).
+///
+/// # Errors
+/// [`Error::Transport`] if the message overruns 65535 bytes after the header, or
+/// HMAC key init fails (see [`message_integrity`]).
+pub fn encode_binding_success(
+    txid: [u8; 12],
+    mapped: SocketAddr,
+    integrity_key: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes()); // length patched at the end
+    buf.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+    buf.extend_from_slice(&txid);
+
+    push_attr(
+        &mut buf,
+        ATTR_XOR_MAPPED_ADDRESS,
+        &encode_xor_mapped_address(mapped, &txid),
+    );
+    let mi = message_integrity(&buf, integrity_key)?;
+    push_attr(&mut buf, ATTR_MESSAGE_INTEGRITY, &mi);
+    let fp = fingerprint(&buf);
+    push_attr(&mut buf, ATTR_FINGERPRINT, &fp.to_be_bytes());
+
+    let len_after = u16::try_from(buf.len() - HEADER_LEN).map_err(|_| {
+        Error::Transport("STUN message exceeds 65535 bytes after header".to_string())
+    })?;
+    buf[2..4].copy_from_slice(&len_after.to_be_bytes());
+    Ok(buf)
+}
+
+/// Encode an XOR-MAPPED-ADDRESS attribute VALUE (`[reserved, family, xport(2),
+/// xaddr(..)]`) for `addr` — the inverse of [`decode_xor_mapped_address`] (RFC
+/// 5389 §15.2).
+fn encode_xor_mapped_address(addr: SocketAddr, txid: &[u8; 12]) -> Vec<u8> {
+    let cookie = MAGIC_COOKIE.to_be_bytes();
+    let xport = addr.port() ^ ((MAGIC_COOKIE >> 16) as u16);
+    let mut v = Vec::with_capacity(20);
+    v.push(0x00); // reserved
+    match addr.ip() {
+        IpAddr::V4(ip) => {
+            v.push(0x01);
+            v.extend_from_slice(&xport.to_be_bytes());
+            for (i, o) in ip.octets().iter().enumerate() {
+                v.push(o ^ cookie[i]);
+            }
+        }
+        IpAddr::V6(ip) => {
+            v.push(0x02);
+            v.extend_from_slice(&xport.to_be_bytes());
+            let mut key = [0u8; 16];
+            key[..4].copy_from_slice(&cookie);
+            key[4..].copy_from_slice(txid);
+            for (i, o) in ip.octets().iter().enumerate() {
+                v.push(o ^ key[i]);
+            }
+        }
+    }
+    v
+}
+
 /// Append one STUN attribute `[type(2) | length(2) | value | pad-to-4]` to `buf`.
 fn push_attr(buf: &mut Vec<u8>, typ: u16, value: &[u8]) {
     buf.extend_from_slice(&typ.to_be_bytes());
@@ -669,6 +741,62 @@ mod tests {
         assert!(msg.attr(ATTR_FINGERPRINT).is_some());
         assert!(msg.attr(ATTR_USERNAME).is_none());
         assert!(msg.attr(ATTR_MESSAGE_INTEGRITY).is_none());
+    }
+
+    // ── Binding Success responder (consent reply; RFC 7675 keepalive) ──────
+    // A camera connectivity check (Binding Request keyed by OUR local pwd) is
+    // answered with encode_binding_success: the response must echo the txid, carry
+    // XOR-MAPPED-ADDRESS = the camera's address, and verify MESSAGE-INTEGRITY +
+    // FINGERPRINT under the same local pwd. This is the offline KAT for the
+    // "answer the camera's checks so it keeps streaming" path.
+    #[test]
+    fn binding_success_response_round_trips_and_authenticates() {
+        let local_pwd = b"SyntheticLocalPwd0123456"; // secret-scan:allow (synthetic test pwd)
+        let camera: SocketAddr = "192.0.2.50:43210".parse().unwrap();
+        let txid = *b"camcheck1234";
+        let resp = encode_binding_success(txid, camera, local_pwd).unwrap();
+
+        let msg = StunMessage::decode(&resp).unwrap();
+        assert!(msg.is_binding_success());
+        assert_eq!(&msg.txid, b"camcheck1234");
+        // XOR-MAPPED-ADDRESS decodes back to the camera's address.
+        assert_eq!(msg.xor_mapped_address().unwrap(), Some(camera));
+        // MESSAGE-INTEGRITY verifies under the local pwd, and FINGERPRINT is
+        // self-consistent.
+        assert!(verify_message_integrity(&resp, local_pwd).unwrap());
+        let fp_off = find_attr_offset(&resp, ATTR_FINGERPRINT).unwrap().unwrap();
+        let embedded = u32::from_be_bytes([
+            resp[fp_off + 4],
+            resp[fp_off + 5],
+            resp[fp_off + 6],
+            resp[fp_off + 7],
+        ]);
+        assert_eq!(fingerprint(&resp[..fp_off]), embedded);
+    }
+
+    // The wrong key must fail the response MESSAGE-INTEGRITY (key-binding bites).
+    #[test]
+    fn binding_success_wrong_key_fails_integrity() {
+        let resp = encode_binding_success(
+            *b"abcdefghijkl",
+            "198.51.100.9:5000".parse().unwrap(),
+            b"SyntheticLocalPwd0123456", // secret-scan:allow
+        )
+        .unwrap();
+        assert!(!verify_message_integrity(&resp, b"the-wrong-ice-password00").unwrap());
+        // secret-scan:allow
+    }
+
+    // The private XOR-MAPPED-ADDRESS encoder is the exact inverse of the decoder
+    // for both families (used by encode_binding_success).
+    #[test]
+    fn xor_mapped_encode_decode_inverse() {
+        for s in ["203.0.113.7:51234", "[2001:db8::1]:5000"] {
+            let addr: SocketAddr = s.parse().unwrap();
+            let txid = *b"0123456789ab";
+            let v = super::encode_xor_mapped_address(addr, &txid);
+            assert_eq!(decode_xor_mapped_address(&v, &txid).unwrap(), addr);
+        }
     }
 
     /// Test-only XOR-MAPPED-ADDRESS encoder (the inverse of the decoder).

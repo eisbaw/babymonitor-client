@@ -22,7 +22,7 @@ All under gitignored `secrets/`:
 | `secrets/tuya_login.json` | `{ "email", "password", "twofa_code_file": "secrets/2fa.txt" }` | your Philips/Avent account |
 | `secrets/tuya_appkey.json` | `{ "appKey", "appSecret", "ttid", "version_name" }` | the app (`re/tuya_cloud_config.md`) |
 | `secrets/bmp_token.txt` | the `t_s.bmp` token (one line) | `re/bmp_token_provenance.md` |
-| `secrets/stream_runtime.json` | the per-session stream bundle (see §3) | your live device session |
+| `secrets/stream_runtime.json` | OPTIONAL override — auto-built in-process when absent (§3, TASK-0078) | your live device session |
 | device `localKey` | the 16-byte AES key for the 302 MQTT payload | the device-list response |
 
 The cert hash is computed offline from the extracted APK — no extra file.
@@ -84,13 +84,25 @@ From that device record, note the camera's `devId`, `localKey`, and `pv`.
 
 ---
 
-## 3. Assemble the runtime bundle
+## 3. (Optional) the runtime bundle — now AUTO-BUILT in-process (TASK-0078)
 
-The live stream needs a handful of per-session secrets that the cloud hands out
-across a few authenticated calls. Gather them into ONE gitignored file
-`secrets/stream_runtime.json` (this is the project's token-injectable pattern —
-NOT a fabricated wire format; it is exactly the inputs the core
-`StreamCredentials` / `BrokerConfig` / `MqttAuthInputs` types already require):
+**You no longer need to hand-assemble `secrets/stream_runtime.json`.** When it is
+absent, `stream --live` AUTO-BUILDS the runtime in-process from the session
+(`babymonitor-cli/src/stream_live.rs::build_runtime_from_session`):
+
+- **device** ← `secrets/tuya_device_list.json` (devId, localKey, pv, skills.p2pType);
+- **camera** ← ONE live `rtc.config.get` for that devId (ices, session, the per-session
+  `auth` signaling token); the media `a=aes-key` is **MINTED** per session by the
+  client (cap3: offer==answer aes-key, both != that session's
+  `rtc.config session.aesKey`), NOT taken from `rtc.config`;
+- **broker** ← the captured login `User.domain.mobileMqttsUrl` (:8883) + the DERIVED
+  302 topics `smart/mb/out|in/<devId>` + `User.partnerIdentity`;
+- **mqtt**   ← `User.sid` (= `MqttConnectConfig.token`) + the offline-derived
+  appId/chKey/master-key-G.
+
+A hand-written `secrets/stream_runtime.json` is still HONORED (override / back-compat).
+Its shape (still the inputs the core `StreamCredentials`/`BrokerConfig`/`MqttAuthInputs`
+types require) is:
 
 ```json
 {
@@ -192,10 +204,14 @@ These are real gaps; do not assume they "just work":
    stage 4 is confirmed; if not, the discrepancy is in the username field order or
    the `ecode`/`G` feed.
 
-2. **The 302 publish/subscribe topics are INJECTED, not derived.** The exact Tuya
-   302 topic template is not statically pinned, so `stream_runtime.json` carries the
-   topics verbatim. Confirm them by hooking the publish (`pbbppqb.java:399-406`) or
-   the broker subscribe.
+2. **The 302 publish/subscribe topics are now DERIVED** (TASK-0078), no longer
+   injected: `smart/mb/out/<devId>` (publish) + `smart/mb/in/<devId>` (subscribe),
+   pinned two-source from the Java publish path (`re/mqtt_signaling.md` §1a;
+   `stream::topics`). **Residual:** the literal topic string is not capture-confirmed
+   (the broker is TLS:8883, off the cap0–cap3 HTTP proxy; cap4 is the media UDP pcap)
+   — only its input `devId` is validated against the cap3 302 `header.to`. Confirm the
+   exact wire topic on the live run by hooking the publish (`pbbppqb.java`) or the
+   broker subscribe (`bqbppdq.java:3661`).
 
 3. **TURN relay is a documented stub.** cap4 reached the camera via a LAN **host**
    candidate with no relay, so host-direct works on the same Wi-Fi as the camera.

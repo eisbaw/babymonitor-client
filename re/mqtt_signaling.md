@@ -71,6 +71,48 @@ itself (AES-128/ECB/PKCS5, key = localKey ASCII bytes, no IV) is pinned in
 Implemented: `stream::mqtt_crypto::{build_302_frame, parse_302_frame,
 encrypt_302_payload, decrypt_302_payload}`.
 
+### 1a. The 302 publish/subscribe TOPICS — now DERIVED (TASK-0078)
+
+(confidence: confirmed for the template — two independent Java sources; the literal
+topic string is NOT capture-confirmed (broker is TLS:8883, off the HTTP proxy), but
+its INPUT `devId` is validated against the cap3 302 `header.to`.)
+
+The 302 signaling rides the **standard mobile device-control MQTT channel** (not a
+dedicated WebRTC topic), so the topics are the ordinary Tuya mobile topics keyed by
+the camera `devId`:
+
+```
+publish (app → camera: offer + ICE candidates)   = smart/mb/out/<devId>
+subscribe (camera → app: answer + ICE candidates) = smart/mb/in/<devId>
+```
+
+Derivation chain (each cite is a decompiled path):
+- `P2PMQTTServiceManager.send302MessageThroughMqtt` → `homeCamera.publish(devId, pv,
+  localKey, json, 302, cb)` (`…/smart/p2p/utils/P2PMQTTServiceManager.java:1550`).
+- `homeCamera.publish(str, …)` sets the topic id to its FIRST arg (`devId`):
+  `new MqttControlBuilder()…​.r(str)…` (`…/smart/p2p/qqpddqd.java:1130-1137`);
+  `MqttControlBuilder.r()` writes field `g` (`…/interior/mqtt/MqttControlBuilder.java:861,920`),
+  returned by `.i()` (`:258`).
+- `MqttServerManager.publishDevice` then **subscribes** `"smart/mb/in/" + i` and
+  **publishes** `"smart/mb/out/" + i` (`…/sdk/mqtt/bqbppdq.java:3660-3678`, the 302
+  send `send302Message(bArr, "smart/mb/out/" + pdqppqb)` at `:1503/1515`; the
+  `smart/mb/out/` constant is `bqbppdq.qqpddqd` `:61`).
+
+Implemented: `stream::topics::{publish_topic, subscribe_topic}` (offline-tested).
+This **resolves** the prior "topics are injected, not derived" gap
+(`re/live_stream_run.md` §6.2).
+
+### 1b. The MQTT broker host — login `domain.mobileMqttsUrl:8883`
+
+(confidence: confirmed — `bqbppdq.java:1901-1929` + the cap1 login `domain`.)
+
+`connectMethod.serverUrl = "ssl://" + getBaseConfigInfo().getDomain().getMobileMqttsUrl()
++ ":" + pqpbpqd.qbqqdqq` where `qbqqdqq == 8883` (`…/sdk/mqtt/pqpbpqd.java:32`). The
+host is the per-account login-response field `User.domain.mobileMqttsUrl` (cap1: an
+`m1.<region>` host). The MQTT-CONNECT `token` is `User.sid`
+(`UserConfigSessionLogoutManager.java:868-869`: `setToken(iBaseUser.getSid())`) and
+the user-prefix is `User.partnerIdentity`.
+
 ---
 
 ## 2. The inner 302 envelope — cap3 CORRECTION of `webrtc_session.md` §2b

@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-06-26 20:20'
-updated_date: '2026-06-27 19:46'
+updated_date: '2026-06-27 20:05'
 labels:
   - stream
   - decoder
@@ -70,6 +70,8 @@ WIRING (0069/0070/0037): new babymonitor-cli/src/stream_live.rs (gated --feature
 DOCS: wrote re/live_stream_run.md (owner steps: secrets, MFA two-run, stream cmd, vlc URL, live-gated risks incl. the Frida hook on qpqbppd/SdkMqttCertificationInfo to verify MQTT CONNECT creds); fixed stale re/stream_playback.md (cap4 now exists+byte-validates; auth is 20B HMAC-SHA1 not SHA256; downstream audio S16LE not G.711; A/V mux).
 
 HONEST: AC#5 (cap4 decode validation) is now MET byte-exact. Live stages 4-6 (broker/camera sockets) are owner-run (no broker/camera in sandbox) - NOT executed here. secret-scan: my files add ZERO findings (synthetic localKey injected via placeholder + allow-marked const). check-evidence has residual findings on the operational run-docs (pre-existing-red gate; mis-parses shell # comments as headers; not in just e2e).
+
+AUDIO FIXED + muxed: downstream 16kHz mono S16LE raw PCM (media/audio.rs), byte-matches cap4 (1,532,800 B); A/V mux carries video+audio (stream-validate). CAVEAT (R2): the byte-match proves depacketize, NOT the 16kHz/S16LE LABEL (that is stage6_extract assumption, PT99 dynamic, no rtpmap) — confirm rate/encoding by LISTENING to a decoded clip.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

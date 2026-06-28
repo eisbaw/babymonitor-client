@@ -843,6 +843,12 @@ impl<'a, T: MqttTransport> MqttSignalingSession<'a, T> {
         answer_polls: usize,
         trickle_polls: usize,
         poll_interval: Duration,
+        // Early-exit the trickle window the instant the collected remote candidates
+        // are sufficient (e.g. a usable `typ host` arrived) — avoids draining the
+        // full `trickle_polls` (~30 s) before the media path can be opened. The live
+        // path passes [`has_usable_host_candidate`]; the answer-only `negotiate`
+        // wrapper passes `|_| false`.
+        stop_when: impl Fn(&[String]) -> bool,
     ) -> Result<NegotiationOutcome, Error> {
         self.publish_offer(offer_args)?;
         for line in local_candidates {
@@ -892,12 +898,25 @@ impl<'a, T: MqttTransport> MqttSignalingSession<'a, T> {
             }
         };
 
+        // A usable candidate may have arrived interleaved BEFORE the answer — then
+        // there is nothing to wait for; skip the trickle window entirely.
+        if stop_when(&remote_candidates) {
+            return Ok(NegotiationOutcome {
+                answer,
+                remote_candidates,
+            });
+        }
+
         // Phase 2: the trickle window — collect the candidates the camera sends
-        // AFTER the answer (the answer SDP itself carries none; cap3/cap4).
+        // AFTER the answer (the answer SDP itself carries none; cap3/cap4). Stop as
+        // soon as `stop_when` is satisfied (a usable host candidate is in hand).
         for _ in 0..trickle_polls {
             match self.poll_inbound()? {
                 Some(InboundSignal::RemoteCandidate(line)) => {
                     push_unique(&mut remote_candidates, line);
+                    if stop_when(&remote_candidates) {
+                        break;
+                    }
                 }
                 Some(InboundSignal::Disconnect) => break,
                 // A retransmitted answer is ignored; we already have one.
@@ -926,9 +945,30 @@ impl<'a, T: MqttTransport> MqttSignalingSession<'a, T> {
         max_polls: usize,
     ) -> Result<ParsedAnswer, Error> {
         Ok(self
-            .negotiate_with_trickle(offer_args, local_candidates, max_polls, 0, Duration::ZERO)?
+            .negotiate_with_trickle(
+                offer_args,
+                local_candidates,
+                max_polls,
+                0,
+                Duration::ZERO,
+                |_| false,
+            )?
             .answer)
     }
+}
+
+/// Whether `lines` already contain a usable `typ host` ICE candidate — the
+/// early-exit predicate for the trickle window (the host-direct media path needs
+/// exactly one). True if any line parses to a [`CandidateKind::Host`].
+///
+/// [`CandidateKind::Host`]: crate::stream::media::transport::CandidateKind::Host
+#[must_use]
+pub fn has_usable_host_candidate(lines: &[String]) -> bool {
+    use crate::stream::media::transport::{parse_candidate, CandidateKind};
+    lines
+        .iter()
+        .filter_map(|l| parse_candidate(l).ok())
+        .any(|c| c.kind == CandidateKind::Host)
 }
 
 /// Append `line` to `out` only if not already present. Trickle candidates are
@@ -1542,7 +1582,9 @@ mod tests {
         let args = synth_offer_args();
         let outcome = {
             let mut s = new_session(&mut t);
-            s.negotiate_with_trickle(&args, &[], 4, 8, std::time::Duration::ZERO)
+            // `|_| false` keeps the FULL drain (regression guard) so both the
+            // pre-answer srflx and the post-answer host candidate are collected.
+            s.negotiate_with_trickle(&args, &[], 4, 8, std::time::Duration::ZERO, |_| false)
                 .expect("answer negotiated with trickle")
         };
         assert_eq!(outcome.answer.remote_ufrag, "SYN0");
@@ -1576,10 +1618,48 @@ mod tests {
         let args = synth_offer_args();
         let mut s = new_session(&mut t);
         let outcome = s
-            .negotiate_with_trickle(&args, &[], 4, 4, std::time::Duration::ZERO)
+            .negotiate_with_trickle(&args, &[], 4, 4, std::time::Duration::ZERO, |_| false)
             .unwrap();
         assert_eq!(outcome.answer.remote_ufrag, "SYN0");
         assert!(outcome.remote_candidates.is_empty());
+    }
+
+    // negotiate_with_trickle() early-exits phase 2 the instant a usable `typ host`
+    // candidate is collected (does NOT drain the full trickle window) — the
+    // TASK-0083 time-to-first-frame fix.
+    #[test]
+    fn session_negotiate_with_trickle_early_exits_on_host_candidate() {
+        let mut t = FakeTransport::default();
+        let answer = answer_env(
+            "v=0\r\nm=application 9 tuya 6001\r\na=ice-ufrag:SYN0\r\na=ice-pwd:SYNTHICEPWD0000000000000\r\na=aes-key:00112233445566778899aabbccddeeff\r\n",
+        );
+        t.inbound.push_back(frame_for(&answer));
+        // One post-answer host candidate (over mqtt+lan = 2 frames), then nothing.
+        let host = SignalingEnvelope::candidate(
+            "DEV",
+            "USER",
+            "SESS",
+            "trace-1",
+            "a=candidate:1 1 UDP 2130706431 10.0.2.15 58363 typ host\r\n",
+            SignalingPath::Mqtt,
+        );
+        t.inbound.push_back(frame_for(&host));
+        let args = synth_offer_args();
+        // A LARGE trickle budget: if early-exit works, it returns without exhausting
+        // it (the FakeTransport has no more frames, so a full drain would still
+        // return, but this asserts the host candidate IS collected promptly).
+        let mut s = new_session(&mut t);
+        let outcome = s
+            .negotiate_with_trickle(
+                &args,
+                &[],
+                4,
+                10_000,
+                std::time::Duration::ZERO,
+                super::has_usable_host_candidate,
+            )
+            .unwrap();
+        assert!(super::has_usable_host_candidate(&outcome.remote_candidates));
     }
 
     // NEGATIVE: no answer within the poll budget is the honest no-answer state

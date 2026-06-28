@@ -322,28 +322,74 @@ pub trait MediaTransport {
 /// real socket, so it is never exercised in the offline tests.
 pub struct UdpMediaTransport {
     socket: UdpSocket,
+    /// The connected peer (the camera host candidate), once [`connect_peer`] runs.
+    /// `None` between an early [`bind`] and the peer being known — the socket can
+    /// still RECEIVE the camera's early connectivity checks in that window.
+    ///
+    /// [`bind`]: UdpMediaTransport::bind
+    /// [`connect_peer`]: UdpMediaTransport::connect_peer
+    peer: Option<SocketAddr>,
+}
+
+/// Classify a non-blocking UDP `recv`/`send` result. `WouldBlock` (nothing ready)
+/// AND `ConnectionRefused` (a prior datagram drew an ICMP port-unreachable because
+/// the camera has not opened its media port YET) are both **transient** during ICE
+/// — map them to `Ok(None)` so the pump keeps retransmitting the connectivity
+/// check instead of aborting. Any other error is a real failure.
+pub(crate) fn classify_recv(res: std::io::Result<usize>) -> Result<Option<usize>, Error> {
+    match res {
+        Ok(n) => Ok(Some(n)),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::ConnectionRefused =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(Error::Transport(format!("media UDP io: {e}"))),
+    }
 }
 
 impl UdpMediaTransport {
-    /// Bind a local UDP socket and `connect` it to `peer` (a selected candidate's
-    /// `ip:port`), so only that peer's datagrams are received. Non-blocking.
+    /// Bind a local UDP socket (ephemeral when `local` port is 0) WITHOUT yet
+    /// connecting a peer, non-blocking. Use this EARLY (before signaling) so the
+    /// OS-assigned source port is known and can be trickled to the camera as our
+    /// host candidate; call [`connect_peer`](Self::connect_peer) once the camera's
+    /// host candidate arrives.
     ///
-    /// LIVE-ONLY: opens a socket. The caller picks `peer` via [`order_candidates`]
-    /// (and, for srflx/relay, must have completed the STUN/TURN handshake that is
-    /// out of scope here).
+    /// # Errors
+    /// [`Error::Transport`] if binding or setting non-blocking fails.
+    pub fn bind(local: SocketAddr) -> Result<Self, Error> {
+        let socket = UdpSocket::bind(local)
+            .map_err(|e| Error::Transport(format!("bind media UDP socket {local}: {e}")))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| Error::Transport(format!("set media socket non-blocking: {e}")))?;
+        Ok(Self { socket, peer: None })
+    }
+
+    /// `connect` the already-bound socket to `peer` (the selected camera host
+    /// candidate's `ip:port`), so subsequent `send`/`recv` target only that peer.
+    ///
+    /// # Errors
+    /// [`Error::Transport`] if the connect fails.
+    pub fn connect_peer(&mut self, peer: SocketAddr) -> Result<(), Error> {
+        self.socket
+            .connect(peer)
+            .map_err(|e| Error::Transport(format!("connect media UDP to {peer}: {e}")))?;
+        self.peer = Some(peer);
+        Ok(())
+    }
+
+    /// Bind a local UDP socket and `connect` it to `peer` in one step (the cap4
+    /// host-direct path / back-compat). Equivalent to [`bind`](Self::bind) +
+    /// [`connect_peer`](Self::connect_peer).
     ///
     /// # Errors
     /// [`Error::Transport`] if binding, connecting, or setting non-blocking fails.
     pub fn connect(local: SocketAddr, peer: SocketAddr) -> Result<Self, Error> {
-        let socket = UdpSocket::bind(local)
-            .map_err(|e| Error::Transport(format!("bind media UDP socket {local}: {e}")))?;
-        socket
-            .connect(peer)
-            .map_err(|e| Error::Transport(format!("connect media UDP to {peer}: {e}")))?;
-        socket
-            .set_nonblocking(true)
-            .map_err(|e| Error::Transport(format!("set media socket non-blocking: {e}")))?;
-        Ok(Self { socket })
+        let mut t = Self::bind(local)?;
+        t.connect_peer(peer)?;
+        Ok(t)
     }
 
     /// The local address the socket is bound to (after an ephemeral-port bind, the
@@ -370,6 +416,17 @@ impl UdpMediaTransport {
         self.socket
             .send(buf)
             .map_err(|e| Error::Transport(format!("media UDP send: {e}")))
+    }
+
+    /// Like [`send_datagram`](Self::send_datagram) but tolerant of the transient
+    /// ICE conditions: `WouldBlock` and `ConnectionRefused` (the camera's media
+    /// port not open yet) return `Ok(None)` instead of erroring, so a queued ICMP
+    /// port-unreachable on a connectivity check does not abort the pump.
+    ///
+    /// # Errors
+    /// [`Error::Transport`] on any non-transient send failure.
+    pub fn try_send(&self, buf: &[u8]) -> Result<Option<usize>, Error> {
+        classify_recv(self.socket.send(buf))
     }
 
     /// Send an ICE connectivity-check Binding Request to the connected peer.
@@ -468,17 +525,35 @@ pub fn allocate_turn_relay(_server: SocketAddr) -> Result<SocketAddr, Error> {
 
 impl MediaTransport for UdpMediaTransport {
     fn recv_datagram(&mut self, buf: &mut [u8]) -> Result<Option<usize>, Error> {
-        match self.socket.recv(buf) {
-            Ok(n) => Ok(Some(n)),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-            Err(e) => Err(Error::Transport(format!("media UDP recv: {e}"))),
-        }
+        // ECONNREFUSED here means a prior check hit the camera's not-yet-open media
+        // port (ICMP port-unreachable); it is transient during ICE — keep polling.
+        classify_recv(self.socket.recv(buf))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // classify_recv: WouldBlock + ConnectionRefused (transient during ICE — the
+    // camera's media port not open yet) map to Ok(None); a real error is Err.
+    #[test]
+    fn classify_recv_tolerates_wouldblock_and_connrefused() {
+        use std::io::{Error as IoErr, ErrorKind};
+        assert_eq!(classify_recv(Ok(42)).unwrap(), Some(42));
+        assert_eq!(
+            classify_recv(Err(IoErr::from(ErrorKind::WouldBlock))).unwrap(),
+            None
+        );
+        assert_eq!(
+            classify_recv(Err(IoErr::from(ErrorKind::ConnectionRefused))).unwrap(),
+            None
+        );
+        assert!(matches!(
+            classify_recv(Err(IoErr::from(ErrorKind::BrokenPipe))),
+            Err(Error::Transport(_))
+        ));
+    }
 
     // cap3 candidate shapes (IPs are synthetic/local; the cap3 values are not
     // committed — these reproduce the STRUCTURE: host/srflx/relay).

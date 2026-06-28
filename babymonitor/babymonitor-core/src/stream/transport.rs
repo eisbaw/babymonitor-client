@@ -549,6 +549,9 @@ pub fn connect_and_negotiate(
         params.max_polls,
         params.trickle_polls,
         params.poll_interval,
+        // Stop the trickle window the instant the camera's `typ host` candidate is
+        // in hand, so the media path opens promptly (TASK-0083 time-to-first-frame).
+        crate::stream::session::has_usable_host_candidate,
     )
 }
 

@@ -85,6 +85,15 @@ const SIGNALING_POLL_INTERVAL: Duration = Duration::ZERO;
 /// How often to send an RFC 7675 consent-refresh STUN check on the media path.
 const CONSENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Initial retransmit timeout for the nominating ICE connectivity check (RFC 5389
+/// RTO). The first check fires immediately; thereafter the interval doubles each
+/// retransmit until [`NOMINATE_RTO_MAX`], so a camera that needs a moment to open
+/// its media port still gets a check it can answer (the cap5-validated path).
+const NOMINATE_RTO_INITIAL: Duration = Duration::from_millis(250);
+
+/// Cap on the nomination retransmit interval (RFC 5389 backoff ceiling).
+const NOMINATE_RTO_MAX: Duration = Duration::from_secs(3);
+
 /// Generous wait for the FIRST media datagram. Camera startup (encoder warm-up)
 /// can exceed 20 s, so we do not give up on the session until this elapses with no
 /// media at all (TASK-0077 AC#3).
@@ -266,12 +275,27 @@ pub fn run_live_stream(args: &StreamArgs) -> Result<(), Error> {
     creds.validate()?;
     let session_handles = SessionHandles::mint(&creds.dev_id)?;
     let offer = build_offer(&creds, &session_handles)?;
+
+    // Bind the media UDP socket EARLY so we know our source port, then gather our
+    // local host candidate(s) and trickle them to the camera during signaling — the
+    // root-cause fix (TASK-0083): the camera must learn OUR address to open a path
+    // back to us (the real app sends its host candidate; we previously sent none).
+    let rng = OsRandom;
+    let mut transport =
+        mtransport::UdpMediaTransport::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
+    let local_port = transport.local_addr()?.port();
+    let local_candidates =
+        gather_local_host_candidates(&broker.host, broker.port, local_port, &rng);
     eprintln!(
-        "stream (live): stage 4-6 — connecting broker {}:{} (TLS={}), publishing 302 offer, awaiting answer…",
-        broker.host, broker.port, broker.tls
+        "stream (live): stage 4-6 — connecting broker {}:{} (TLS={}), publishing 302 offer + \
+         {} local candidate(s), awaiting answer…",
+        broker.host,
+        broker.port,
+        broker.tls,
+        local_candidates.len()
     );
 
-    let outcome = negotiate(&broker, &creds, &offer)?;
+    let outcome = negotiate(&broker, &creds, &offer, &local_candidates)?;
     let answer = &outcome.answer;
     eprintln!(
         "stream (live): answer received — remote ICE creds + media key extracted; {} trickled candidate(s) collected.",
@@ -284,10 +308,11 @@ pub fn run_live_stream(args: &StreamArgs) -> Result<(), Error> {
         remote_ufrag: answer.remote_ufrag.clone(),
         remote_pwd: answer.remote_pwd.clone(),
     };
-    let (mut transport, host) =
-        open_media_transport(answer, &outcome.remote_candidates, &ice, &session_handles)?;
+    // Point the pre-bound socket at the camera's host candidate (no re-bind; the
+    // nominating check is driven by the pump's retransmit state machine).
+    let host = select_and_connect(&mut transport, answer, &outcome.remote_candidates)?;
     eprintln!(
-        "stream (live): stage 6 ICE — host-direct UDP to {} (nomination check sent).",
+        "stream (live): stage 6 ICE — host-direct UDP to {} (nominating with RFC 5389 backoff).",
         host.socket_addr()
     );
 
@@ -295,10 +320,11 @@ pub fn run_live_stream(args: &StreamArgs) -> Result<(), Error> {
     // Suite 3 (AES-128-CBC + 20B HMAC-SHA1) is the cap3/cap4-observed default; the
     // negotiated security_level rides the answer header (cap4 == 3).
     let mut engine = MediaEngine::from_security_level(3, answer.media_key.clone())?;
-    // The consent/keepalive context: refresh OUR check ~every 5 s, and answer the
-    // camera's inbound checks, so neither side's consent-to-send expires mid-stream.
-    let keepalive = PathKeepalive::new(ice, &host)?;
-    pump_to_output(args, &mut engine, &mut transport, &keepalive)
+    // The consent/keepalive + nomination context: retransmit our nominating check
+    // (RFC 5389 backoff) until validated, refresh consent ~every 5 s, and answer the
+    // camera's inbound checks so neither side's consent-to-send expires mid-stream.
+    let mut keepalive = PathKeepalive::new(ice, &host)?;
+    pump_to_output(args, &mut engine, &mut transport, &mut keepalive)
 }
 
 /// Mint the per-session local handles (ICE ufrag/pwd, media key, the unix-second
@@ -545,12 +571,14 @@ fn parse_log(log_json: &str) -> Option<serde_json::Value> {
     }
 }
 
-/// LIVE: connect the broker, run the 302 offer/answer exchange, and collect the
-/// camera's trickled ICE candidates ([`NegotiationOutcome`]).
+/// LIVE: connect the broker, run the 302 offer/answer exchange (trickling OUR
+/// `local_candidates` to the camera, so it learns where to reach us), and collect
+/// the camera's trickled ICE candidates ([`NegotiationOutcome`]).
 fn negotiate(
     broker: &BrokerConfig,
     creds: &StreamCredentials,
     offer: &Offer,
+    local_candidates: &[String],
 ) -> Result<NegotiationOutcome, Error> {
     let ices = parse_ice_servers(&creds.ices);
     let offer_args = offer.flow.make_offer_args(
@@ -559,14 +587,13 @@ fn negotiate(
         offer.tcp_token.clone(),
         offer.log.clone(),
     );
-    let local_candidates: Vec<String> = Vec::new(); // host-direct: rely on the camera's host candidate
     let params = LiveSignalingParams {
         flow: offer.flow.clone(),
         local_key: creds.local_key.as_bytes(),
         dev_id: &creds.dev_id,
         pv: &creds.pv,
         offer_args: &offer_args,
-        local_candidates: &local_candidates,
+        local_candidates,
         max_polls: MAX_ANSWER_POLLS,
         trickle_polls: TRICKLE_POLLS,
         poll_interval: SIGNALING_POLL_INTERVAL,
@@ -574,17 +601,91 @@ fn negotiate(
     connect_and_negotiate(broker, params)
 }
 
-/// LIVE: build the remote candidate set (the TRICKLED candidates merged with any
-/// in the answer SDP — the latter is empty in practice, cap3/cap4), select the
-/// camera's host candidate, open a connected UDP transport to it, and send the
-/// initial nominating ICE connectivity check (so the camera opens consent and
-/// starts sending media).
-fn open_media_transport(
+/// Discover this host's LAN source IP by `connect`ing a throwaway UDP socket toward
+/// `(toward_host, toward_port)` and reading its bound local address. UDP connect
+/// sends NO packet — the kernel just resolves the egress interface for that route
+/// (toward the camera/broker, which on the camera's LAN is our LAN address). This
+/// uses ONLY std (no interface-enumeration crate — those are not in the offline
+/// cargo cache and would break `just assert-offline`).
+///
+/// Returns `None` if the bind/connect fails or resolves to a loopback/unspecified
+/// address (unusable as a candidate the camera can reach).
+fn primary_lan_ip(toward_host: &str, toward_port: u16) -> Option<std::net::IpAddr> {
+    let sock = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    sock.connect((toward_host, toward_port)).ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    if ip.is_loopback() || ip.is_unspecified() {
+        return None;
+    }
+    Some(ip)
+}
+
+/// Build one `a=candidate:` host line in the app's exact wire shape
+/// (`re/mqtt_signaling.md`: `a=candidate:<foundation> 1 UDP 2130706431 <ip> <port>
+/// typ host\r\n`). `2130706431` is the app's fixed host-candidate priority; the
+/// foundation is a random 10-digit string (the app's shape); component 1 = RTP.
+///
+/// # Errors
+/// Propagates [`Error`] from the random-source.
+fn format_host_candidate<R: RandomSource>(
+    ip: std::net::IpAddr,
+    port: u16,
+    rng: &R,
+) -> Result<String, Error> {
+    // 10-digit decimal foundation (app shape), minted from 4 random bytes.
+    let mut b = [0u8; 4];
+    rng.fill(&mut b)?;
+    let foundation = 1_000_000_000u64 + (u64::from(u32::from_be_bytes(b)) % 3_000_000_000u64);
+    Ok(format!(
+        "a=candidate:{foundation} 1 UDP 2130706431 {ip} {port} typ host\r\n"
+    ))
+}
+
+/// Gather OUR local host ICE candidate(s) to trickle to the camera: the LAN source
+/// IP (egress toward the broker, which on the camera's LAN is our LAN address)
+/// paired with the media socket's bound `local_port`. Empty if no usable LAN IP is
+/// found (then the camera cannot reach us — host-direct cannot work, surfaced
+/// honestly downstream). Logs the chosen `ip:port` (no secret) so a wrong pick on a
+/// multi-homed host is visible.
+fn gather_local_host_candidates<R: RandomSource>(
+    broker_host: &str,
+    broker_port: u16,
+    local_port: u16,
+    rng: &R,
+) -> Vec<String> {
+    match primary_lan_ip(broker_host, broker_port) {
+        Some(ip) => match format_host_candidate(ip, local_port, rng) {
+            Ok(line) => {
+                eprintln!("stream (live): local host candidate = {ip}:{local_port}");
+                vec![line]
+            }
+            Err(e) => {
+                eprintln!("stream (live): could not format local candidate ({e}); none trickled");
+                Vec::new()
+            }
+        },
+        None => {
+            eprintln!(
+                "stream (live): no usable LAN source IP found (loopback/unspecified only); \
+                 cannot trickle a host candidate — the camera will not learn our address"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// LIVE: from the camera's answer SDP + trickled candidates, select the camera's
+/// host candidate and `connect` the ALREADY-BOUND media socket to it, returning the
+/// selected host. The socket was bound early (so our host candidate could be
+/// trickled); here we only point it at the peer. The nominating connectivity check
+/// is NOT sent here — it is owned by the pump's retransmit state machine
+/// ([`PathKeepalive`]) so the camera (which may need a moment to open its port) is
+/// re-checked with RFC 5389 backoff.
+fn select_and_connect(
+    transport: &mut mtransport::UdpMediaTransport,
     answer: &ParsedAnswer,
     trickled: &[String],
-    ice: &IceCredentials,
-    h: &SessionHandles,
-) -> Result<(mtransport::UdpMediaTransport, mtransport::IceCandidate), Error> {
+) -> Result<mtransport::IceCandidate, Error> {
     // The camera's answer SDP carries NO a=candidate lines (cap3/cap4 ground
     // truth); its host/srflx candidates arrive as trickled 302 `candidate`
     // messages. Merge any in-SDP candidates (usually none) with the trickled set;
@@ -597,28 +698,16 @@ fn open_media_transport(
             Err(e) => eprintln!("stream (live): skipping unparseable trickled candidate: {e}"),
         }
     }
-    if candidates.is_empty() {
-        return Err(Error::Transport(
-            "no ICE candidates from the camera (none in the answer SDP — expected — and none \
+    let host = mtransport::select_host_candidate(&candidates).ok_or_else(|| {
+        Error::Transport(
+            "no ICE host candidate from the camera (none in the answer SDP — expected — and none \
              trickled over 302 within the window): host-direct needs a host candidate. If the \
              camera is remote/NAT'd, a srflx/relay path (STUN/TURN) is required (documented stub)."
                 .to_string(),
-        ));
-    }
-    // Bind an ephemeral local UDP socket on all interfaces.
-    let local = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
-    let (transport, host) = mtransport::connect_host_direct(local, &candidates)?;
-    // Build + send the nominating check, MESSAGE-INTEGRITY-keyed by the camera pwd.
-    let check = ice.build_check(
-        random_txid()?,
-        host.priority,
-        IceRole::Controlling(controlling_tiebreaker()?),
-        true, // USE-CANDIDATE on the host-direct nominated pair
-        Some("babymonitor-rs"),
-    )?;
-    transport.send_datagram(&check)?;
-    let _ = h; // local ICE creds already folded into `ice`
-    Ok((transport, host))
+        )
+    })?;
+    transport.connect_peer(host.socket_addr())?;
+    Ok(host)
 }
 
 /// The media-path consent/keepalive context (RFC 7675). Holds what is needed to
@@ -629,6 +718,17 @@ struct PathKeepalive {
     peer: SocketAddr,
     priority: u32,
     tiebreaker: u64,
+    /// The nominating connectivity-check transaction id, minted ONCE so every
+    /// retransmit is byte-identical and the camera's Binding Success echoes it.
+    nominate_txid: [u8; 12],
+    /// Set once the pair is proven (our nomination got a Success, or media flowed);
+    /// stops the retransmit.
+    validated: bool,
+    /// When the next nomination retransmit is due (seeded to "now" so the first
+    /// check fires immediately on entering the pump).
+    next_nominate: Instant,
+    /// Current RFC 5389 retransmit timeout, doubling per send up to the cap.
+    rto: Duration,
 }
 
 impl PathKeepalive {
@@ -638,7 +738,60 @@ impl PathKeepalive {
             peer: host.socket_addr(),
             priority: host.priority,
             tiebreaker: controlling_tiebreaker()?,
+            nominate_txid: random_txid()?,
+            validated: false,
+            next_nominate: Instant::now(),
+            rto: NOMINATE_RTO_INITIAL,
         })
+    }
+
+    /// Build the (byte-identical across retransmits) connectivity-check Binding
+    /// Request: Controlling role, MESSAGE-INTEGRITY keyed by the camera's ICE
+    /// password, over the FIXED [`nominate_txid`](Self::nominate_txid).
+    ///
+    /// **NO USE-CANDIDATE** — the SCD921 (p2pType=4) does FULL ICE: it answers a
+    /// plain check with a Binding Success AND sends its own checks back, then media
+    /// flows. cap4 (`media.pcap`) shows the real app sends 141 checks to the camera
+    /// with USE-CANDIDATE on NONE of them. Setting it (aggressive nomination) gets
+    /// our check ignored — the camera-silent-media cause this fixes.
+    fn nominating_check(&self) -> Result<Vec<u8>, Error> {
+        self.ice.build_check(
+            self.nominate_txid,
+            self.priority,
+            IceRole::Controlling(self.tiebreaker),
+            false, // plain connectivity check (cap4: app never sets USE-CANDIDATE)
+            Some("babymonitor-rs"),
+        )
+    }
+
+    /// Whether a nomination retransmit is due at `now` (and the pair is not yet
+    /// validated).
+    fn nominate_due(&self, now: Instant) -> bool {
+        !self.validated && now >= self.next_nominate
+    }
+
+    /// Record that a nomination check was just sent: schedule the next retransmit
+    /// one RTO out and double the RTO (capped) — RFC 5389 backoff.
+    fn mark_nominate_sent(&mut self, now: Instant) {
+        self.next_nominate = now + self.rto;
+        self.rto = (self.rto * 2).min(NOMINATE_RTO_MAX);
+    }
+
+    /// Mark the candidate pair validated (stop nominating): our check succeeded or
+    /// authenticated media arrived.
+    fn mark_validated(&mut self) {
+        self.validated = true;
+    }
+
+    /// Whether `dg` is the Binding **Success** to OUR nomination (echoes our
+    /// [`nominate_txid`](Self::nominate_txid)). A foreign txid / a request / a
+    /// non-STUN packet is `Ok(false)`.
+    ///
+    /// # Errors
+    /// [`Error::Transport`] if STUN decode fails.
+    fn is_our_success(&self, dg: &[u8]) -> Result<bool, Error> {
+        let msg = stun::StunMessage::decode(dg)?;
+        Ok(msg.is_binding_success() && msg.txid == self.nominate_txid)
     }
 
     /// Build a fresh outbound consent-refresh Binding Request (new txid each call,
@@ -762,7 +915,7 @@ fn pump_to_output(
     args: &StreamArgs,
     engine: &mut MediaEngine,
     transport: &mut mtransport::UdpMediaTransport,
-    keep: &PathKeepalive,
+    keep: &mut PathKeepalive,
 ) -> Result<(), Error> {
     let mut sink = LiveAvSink::spawn(args)?;
     let mut depay = H264Depacketizer::new();
@@ -772,24 +925,60 @@ fn pump_to_output(
         args.port
     );
     let mut timers = PumpTimers::live();
+    let diag = babymonitor_core::stream::transport::diag_enabled();
+    let (
+        mut n_nom,
+        mut n_stun_in,
+        mut n_our_success,
+        mut n_cam_check,
+        mut n_media_ok,
+        mut n_media_drop,
+    ) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     loop {
+        let now = Instant::now();
+        // Bidirectional ICE: until the pair is validated, (re)transmit our
+        // nominating check with RFC 5389 backoff. try_send tolerates the transient
+        // ICMP "Connection refused" while the camera's media port is not open yet —
+        // the retransmit reaches it once it is (the cap5-validated recovery).
+        if keep.nominate_due(now) {
+            transport.try_send(&keep.nominating_check()?)?;
+            keep.mark_nominate_sent(now);
+            n_nom += 1;
+        }
         // RFC 7675 consent freshness: keep our consent-to-send alive during the
         // (possibly >20 s) startup AND the sustained stream.
         if timers.consent_due() {
-            transport.send_datagram(&keep.refresh_check()?)?;
+            transport.try_send(&keep.refresh_check()?)?;
             timers.mark_consent();
         }
         match transport.recv_datagram(&mut buf)? {
             Some(n) => {
                 let dg = &buf[..n];
                 if is_stun(dg) {
-                    // A camera connectivity check (answer it so the camera keeps
-                    // streaming) or a response to ours (nothing to send). A
-                    // malformed STUN-looking packet is logged + ignored, never
-                    // fatal to the stream.
+                    n_stun_in += 1;
+                    if diag && n_stun_in <= 5 {
+                        let mt = stun::StunMessage::decode(dg)
+                            .map(|m| m.msg_type)
+                            .unwrap_or(0);
+                        eprintln!("media-diag: inbound STUN #{n_stun_in} type=0x{mt:04x} len={n}");
+                    }
+                    // The Binding Success to OUR nomination proves the path — stop
+                    // retransmitting. Otherwise it is the camera's inbound check:
+                    // answer it so its consent-to-send stays fresh. A malformed
+                    // STUN-looking packet is logged + ignored, never fatal.
+                    if keep.is_our_success(dg).unwrap_or(false) {
+                        if n_our_success == 0 {
+                            eprintln!(
+                                "stream (live): nomination VALIDATED — camera accepted our check."
+                            );
+                        }
+                        n_our_success += 1;
+                        keep.mark_validated();
+                    }
                     match keep.consent_reply(dg) {
                         Ok(Some(reply)) => {
-                            transport.send_datagram(&reply)?;
+                            n_cam_check += 1;
+                            transport.try_send(&reply)?;
                         }
                         Ok(None) => {}
                         Err(e) => eprintln!("stream (live): ignoring malformed STUN packet: {e}"),
@@ -797,8 +986,11 @@ fn pump_to_output(
                 } else {
                     match engine.push_datagram(dg) {
                         Ok(units) => {
+                            n_media_ok += 1;
                             // A valid (authenticated) media datagram — the path is
-                            // alive even if this one did not complete a frame yet.
+                            // alive (validate it, stopping nomination) even if this
+                            // one did not complete a frame yet.
+                            keep.mark_validated();
                             timers.mark_media();
                             for u in &units {
                                 if u.is_video() {
@@ -817,6 +1009,7 @@ fn pump_to_output(
                         // (TASK-0077 AC#2 — keep the path alive). The HMAC/padding
                         // gates still reject it, so nothing mis-decoded slips through.
                         Err(e) => {
+                            n_media_drop += 1;
                             eprintln!("stream (live): dropping undecodable media datagram: {e}");
                         }
                     }
@@ -824,7 +1017,11 @@ fn pump_to_output(
             }
             None => {
                 if let Some(reason) = timers.idle_reason() {
-                    eprintln!("stream (live): {reason}; stopping.");
+                    eprintln!(
+                        "stream (live): {reason}; stopping. [ICE summary: nominations_sent={n_nom} \
+                         inbound_stun={n_stun_in} our_success={n_our_success} camera_checks_answered={n_cam_check} \
+                         media_ok={n_media_ok} media_dropped={n_media_drop}]"
+                    );
                     break;
                 }
                 std::thread::sleep(MEDIA_POLL_INTERVAL);
@@ -1687,6 +1884,61 @@ mod tests {
         );
         assert!(stun::verify_message_integrity(&chk, REMOTE_PWD.as_bytes()).unwrap());
         assert!(msg.attr(stun::ATTR_USE_CANDIDATE).is_none());
+    }
+
+    // format_host_candidate produces the app's exact wire shape and round-trips
+    // through the parser to a typ-host candidate with the fixed priority.
+    #[test]
+    fn format_host_candidate_matches_app_wire_shape() {
+        let ip: std::net::IpAddr = "192.0.2.233".parse().unwrap();
+        let line = format_host_candidate(ip, 40898, &OsRandom).unwrap();
+        assert!(line.starts_with("a=candidate:"), "line: {line}");
+        assert!(line.ends_with("\r\n"));
+        let c = mtransport::parse_candidate(&line).unwrap();
+        assert_eq!(c.kind, mtransport::CandidateKind::Host);
+        assert_eq!(c.component, 1);
+        assert_eq!(c.transport, "UDP");
+        assert_eq!(c.priority, 2_130_706_431); // app's fixed host priority
+        assert_eq!(c.ip, ip);
+        assert_eq!(c.port, 40898);
+    }
+
+    // The nomination retransmit follows RFC 5389 backoff (250ms, 500ms, 1s, 2s,
+    // then capped at 3s) and stops once the pair is validated.
+    #[test]
+    fn keepalive_nomination_rto_backoff_and_cap() {
+        let mut keep = make_keepalive();
+        let mut t = Instant::now();
+        let mut gaps = Vec::new();
+        for _ in 0..7 {
+            keep.mark_nominate_sent(t);
+            gaps.push(keep.next_nominate - t);
+            t = keep.next_nominate;
+        }
+        assert_eq!(gaps[0], Duration::from_millis(250));
+        assert_eq!(gaps[1], Duration::from_millis(500));
+        assert_eq!(gaps[2], Duration::from_secs(1));
+        assert_eq!(gaps[3], Duration::from_secs(2));
+        assert!(gaps.iter().all(|g| *g <= NOMINATE_RTO_MAX));
+        assert_eq!(gaps[4], NOMINATE_RTO_MAX);
+        assert_eq!(gaps[6], NOMINATE_RTO_MAX);
+        keep.mark_validated();
+        assert!(!keep.nominate_due(t + Duration::from_secs(60)));
+    }
+
+    // is_our_success matches ONLY a Binding Success echoing our nominate_txid.
+    #[test]
+    fn keepalive_is_our_success_matches_only_our_txid() {
+        let keep = make_keepalive();
+        let addr: SocketAddr = "192.0.2.9:5000".parse().unwrap();
+        let ours =
+            stun::encode_binding_success(keep.nominate_txid, addr, REMOTE_PWD.as_bytes()).unwrap();
+        assert!(keep.is_our_success(&ours).unwrap());
+        let foreign = stun::encode_binding_success([9u8; 12], addr, REMOTE_PWD.as_bytes()).unwrap();
+        assert!(!keep.is_our_success(&foreign).unwrap());
+        // our own nominating REQUEST is not a success.
+        let req = keep.nominating_check().unwrap();
+        assert!(!keep.is_our_success(&req).unwrap());
     }
 
     // STUN packets (which share the media 5-tuple) are split out from media so the

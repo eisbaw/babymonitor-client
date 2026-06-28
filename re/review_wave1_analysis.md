@@ -135,8 +135,14 @@ decompiled/js/assets/kit_js/miniapp_PlayNetKit.js.pretty` yields only
 `ice`; and (2) a grep for real WebRTC handshake primitives —
 `rg -lc 'RTCPeerConnection|createOffer|ice-ufrag'
 decompiled/js/assets/kit_js/*.pretty` — returns **zero** hits. So the JS layer is
-transport-agnostic; the real WebRTC SDP/ICE/DTLS-SRTP machinery is native
+transport-agnostic; the real WebRTC SDP/ICE machinery is native
 (`re/symbols/libThingP2PSDK.dynsym.txt`).
+**(Superseded 2026-06-28, v0.1.0-live-stream):** F1's confirmed core stands — the
+SDP/ICE/WebRTC-signaling machinery is native, not in the JS bundle, and ICE *is*
+used for connectivity in the live pipeline. But the earlier media-crypto detail
+"DTLS-SRTP" (dropped above) is FALSIFIED: the live media transport is KCP +
+AES-128-CBC(inline-IV, PKCS7) per segment + 20-byte HMAC-SHA1(media_key16) per
+datagram, NOT DTLS-SRTP (TASK-0083 DONE; keyframe decodes end-to-end).
 **Why blocking:** a Rust implementer reading js_bundle_map first could chase a
 non-existent JS WebRTC stack. **Winner: `streaming_mode.md`.**
 **Fix:** correct the `js_bundle_map.md` PlayNetKit row to remove the "73 ice hits"
@@ -298,7 +304,9 @@ the device/stream record symbols resolve (`DeviceBean`,
    per-device `CameraInfoBean` fetch.
 3. **Stream:** `p2pType`/`skill` select WebRTC-over-MQTT (code 302) vs PPCS; the
    `frame`/`packet` AV path is native and deferred to Wave-2 spikes
-   (TASK-0009/0010).
+   (TASK-0009/0010). *(Forward-pointer, 2026-06-28, v0.1.0-live-stream: this
+   Wave-1-era deferral is now resolved — the live media transport is implemented
+   (TASK-0083 DONE) and a 1080p H.264 keyframe decodes end-to-end.)*
 
 **Gaps a Rust implementer would trip on (all honestly flagged in the docs, none
 hidden):** the byte-exact `sign` was `needs-runtime-hook` but is now

@@ -1,5 +1,21 @@
 # WebRTC-over-MQTT Live A/V Session — Implementable Spec (TASK-0010)
 
+> **STATUS BANNER — milestone `v0.1.0-live-stream` (2026-06-28, commit `fa930f0`).**
+> The self-contained Rust client now connects to the REAL SCD921 and decodes the
+> **live 1080p H.264 keyframe END-TO-END** (displayed in VLC). **The live media
+> transport is NOT DTLS-SRTP / webrtc-rs SRTP.** It is a custom **ICE + KCP +
+> AES-128-CBC (inline-IV, PKCS7) per segment + 20-byte HMAC-SHA1(`media_key16`) per
+> datagram**, multiplexed over **conv ids** (`0`=control/auth, `1`=video, `2`=
+> downstream audio — 16 kHz mono S16LE, inferred). The static native-lib recoveries
+> below — §1 `connect_v2` JSON, §2 the 302 envelope, §3a–§3c the SDP encoder strings
+> — remain **accurate descriptions of the lib code**, but they describe the Tuya
+> SDK's **WebRTC mode**, which is **NOT the wire path this device uses for live A/V**.
+> Several DTLS-SRTP / webrtc-rs claims below are superseded — each is flagged inline
+> (look for "Superseded 2026-06-28, v0.1.0-live-stream"). The conv=0 media
+> authorization (§5b) is the actual unblock. Sustained continuous A/V is NOT yet
+> verified (see §9 follow-ups). Secrets remain referenced by `secrets/` location
+> only.
+
 The end-to-end, implementable spec for the Tuya WebRTC-over-MQTT live A/V session
 the SCD921 uses, so the Rust stream client (TASK-0034) can be built against it.
 This goes **deeper than** `re/streaming_mode.md` (the transport verdict + 302
@@ -42,11 +58,28 @@ channel, AES-encrypted with the device `localKey`). The device replies with an
 **answer** SDP over 302; trickle-ICE **candidates** flow both ways as more 302
 messages. The SDP carries standard WebRTC ICE/DTLS-SRTP attributes **plus a
 Tuya-custom `m=application` section with an `a=aes-key:<hex>` line** that conveys
-the media AES key. After the DTLS-SRTP handshake, audio/video frames arrive; the
-Rust client reads them via the frame plane (`recv_frame` → `imm_p2p_rtc_frame_t`),
-H.264 video + G.711/Opus audio. **Verdict: implementable with webrtc-rs + rumqttc
-given the runtime-gated inputs (token, p2pId/p2pKey, ices, connect_session), with
-one residual that only a live capture closes — see §9.**
+the media AES key.
+
+**(Superseded 2026-06-28, v0.1.0-live-stream — the media plane below replaces the
+old "after the DTLS-SRTP handshake" claim.)** The SCD921's live A/V does **NOT**
+ride a DTLS-SRTP handshake or webrtc-rs SRTP tracks. After ICE connectivity the
+client opens a custom **`imm`/KCP application channel over the negotiated UDP path**
+and the media flows there: **KCP**-segmented, each segment **AES-128-CBC encrypted
+(inline IV, PKCS7)** and each datagram authenticated with a **20-byte
+HMAC-SHA1(`media_key16`)**. Three logical streams are multiplexed by **conv id**:
+`conv=0` = control/auth, `conv=1` = video (H.264), `conv=2` = downstream audio
+(16 kHz mono S16LE, inferred). The media key (`media_key16`) is the SDP
+`a=aes-key` value (§3c) and feeds AES-128-CBC+HMAC, **not** SRTP. **webrtc-rs
+DTLS-SRTP is NOT used for media.**
+
+The static native lib still exposes the frame plane (`recv_frame` → `imm_p2p_rtc_frame_t`),
+H.264 video + G.711/Opus audio — but that is the SDK's WebRTC mode, not the live
+wire path. **Verdict (Superseded 2026-06-28, v0.1.0-live-stream → now proven):** a
+self-contained Rust client (custom ICE + KCP + AES-128-CBC/HMAC-SHA1 media over
+`rumqttc` 302 signaling, **NO webrtc-rs media path**) decodes the live keyframe
+end-to-end (§9). The runtime-gated inputs (token, p2pId/p2pKey, ices,
+connect_session, localKey, and the camera password for conv=0 auth) are still
+required — see §5b, §9.
 
 ---
 
@@ -284,9 +317,14 @@ a=ssrc:<ssrc> cname:<cname>
 ```
 Codecs confirmed via strings: **`H264`** and **`PCMU`** (the SDP-negotiated audio
 codec is G.711 µ-law); the camera-level `skill` also advertises Opus/H265 (the
-media codecs), but the WebRTC m-line audio codec in the encoder is PCMU. All of
-this is **vanilla WebRTC** — webrtc-rs builds equivalent SDP natively. Confidence:
-confirmed (the format strings are literal in Ghidra and r2).
+media codecs), but the WebRTC m-line audio codec in the encoder is PCMU. This SDP
+shape is **vanilla WebRTC** as emitted by the SDK's encoder, and webrtc-rs could
+build equivalent SDP. Confidence: confirmed (the format strings are literal in
+Ghidra and r2). **(Superseded 2026-06-28, v0.1.0-live-stream as the live path:**
+the `m=audio`/`m=video` SRTP tracks these strings describe are **present in the
+native lib but NOT the path the SCD921 uses for live A/V** — the live frames ride
+the `imm`/KCP AES-CBC+HMAC channel (§3c/§3d/banner), not SRTP. This section stays as
+an accurate record of the lib's WebRTC mode.)**
 
 ### 3c. m=application section — the Tuya-custom `imm` codec + the MEDIA AES KEY
 (confidence: confirmed — two sources: `libThingP2PSDK.so` `imm_p2p_rtc_sdp_encode`
@@ -314,16 +352,22 @@ r2) emits `sdp_ctx + 0x86` — the buffer that `imm_p2p_rtc_sdp_set_aes_key` /
 a raw key of up to **23 bytes** (`param_3<<1 < 0x30`, i.e. `len*2 < 48`) at
 `sdp_ctx+0x86`, as ASCII hex. **This is the F3 "key carried in SDP" hypothesis,
 now CONFIRMED by decompilation:** the media AES key is conveyed **in the SDP**
-(the `imm`/application m-section), not derived from a DTLS exporter. So a single
-capture of the offer/answer 302 messages yields the media key directly — this is
-the **prime pcap-unblockable artifact** (§9).
+(the `imm`/application m-section), not derived from a DTLS exporter. A single
+capture of the offer/answer 302 messages yields the media key directly — and
+**(Superseded 2026-06-28, v0.1.0-live-stream)** this has been captured: the
+`a=aes-key` value is the **`media_key16`** that feeds **AES-128-CBC (inline IV,
+PKCS7) + per-datagram 20-byte HMAC-SHA1**, the live media crypto (§3d/banner),
+**not** SRTP.
 
-> Implication for Rust: the `a=aes-key` line and the `m=application`/`imm` codec
-> are **Tuya-custom**. webrtc-rs will not produce or parse them; the Rust client
-> must (a) emit the `aes-key` it chose into its offer's application section, and
-> (b) read the peer's `aes-key` from the answer's application section, then apply
-> that key to the `imm`-codec media (the proprietary AV transport that rides the
-> ICE/DTLS pipe alongside, or instead of, the standard SRTP tracks).
+> Implication for Rust (Superseded 2026-06-28, v0.1.0-live-stream — now the proven
+> path): the `a=aes-key` line and the `m=application`/`imm` codec are
+> **Tuya-custom**. webrtc-rs will not produce or parse them; the Rust client must
+> (a) emit the `aes-key` it chose into its offer's application section, and (b) read
+> the peer's `aes-key` (= `media_key16`) from the answer's application section, then
+> apply that key to the `imm`-codec media. **RESOLVED:** the proprietary `imm`/KCP
+> AV transport rides the negotiated ICE/UDP pipe **instead of** (not alongside) the
+> standard SRTP tracks — the live frames come over `imm`/KCP, and the SRTP tracks
+> are not the path this device uses.
 
 ### 3d. ICE / DTLS-SRTP (standard WebRTC, webrtc-rs handles)
 - **ICE:** `imm_p2p_ice_session_create` + `…_add_remote_candidate` +
@@ -336,12 +380,21 @@ the **prime pcap-unblockable artifact** (§9).
 - **DTLS-SRTP:** bundled **static mbedTLS** inside `libThingP2PSDK.so`
   (`mbedtls_ssl_conf_dtls_srtp_protection_profiles`, cert `CN=Cert,O=WebRTC,C=US`,
   `imm_p2p_misc_generate_cert`/`_calculate_cert_fingerprint`). The fingerprint is
-  emitted as `a=fingerprint`. This is **standard DTLS-SRTP** — webrtc-rs does it.
+  emitted as `a=fingerprint`. This is standard DTLS-SRTP code that webrtc-rs could
+  speak. **(Superseded 2026-06-28, v0.1.0-live-stream:** this DTLS-SRTP path is
+  **present in the native lib but NOT the path the SCD921 uses for live A/V.** The
+  live media rides the `imm`/KCP AES-CBC+HMAC channel below, not SRTP. The code is
+  recorded here as an accurate lib description only.)**
   (`re/native_libs.md` headline + p2p_triage §1c.)
-- **Reliable data plane:** strings reveal **KCP** pacing (`kcp pacing ...`) and an
-  ARQ/NACK layer (`handle nack %d failed: rtx budget limited`) on top of the UDP
-  transport — Tuya's reliability for the `imm` data path. This is **Tuya-custom**;
-  see §4.
+- **Reliable data plane — THE ACTUAL MEDIA TRANSPORT** (Superseded 2026-06-28,
+  v0.1.0-live-stream — promoted from "only if using imm" to the proven path):
+  strings reveal **KCP** pacing (`kcp pacing ...`) and an ARQ/NACK layer
+  (`handle nack %d failed: rtx budget limited`) on top of the UDP transport — Tuya's
+  reliability for the `imm` data path. **This `imm`/KCP path IS the live A/V
+  transport** the SCD921 uses (not SRTP). On top of KCP: each segment is
+  **AES-128-CBC encrypted (inline IV, PKCS7)** and each datagram carries a **20-byte
+  HMAC-SHA1(`media_key16`)**; streams are multiplexed by **conv id** (`0`=control/
+  auth, `1`=video, `2`=downstream audio). This is **Tuya-custom**; see §4 and §5b.
 
 ---
 
@@ -470,15 +523,67 @@ The **Initialize 3-callback contract** drives the state machine from the host
 - `on_state(char* id, int, int, rtc_state, rtc_active_state_e, int)` — **session
   state change** (the host learns connect/active/close transitions).
 
-Driver sequence the Rust client implements:
+Driver sequence the Rust client implements **(Superseded 2026-06-28,
+v0.1.0-live-stream — the tail "DTLS-SRTP handshake → on_state=active → recv_frame
+loop" is replaced by the proven `imm`/KCP path):**
 `init → (optional pre_connect) → connect_v2 [builds+sends offer via on_msg] →
 recv answer (302) [set_signaling] → trickle candidates both ways (302) →
-ICE connectivity → DTLS-SRTP handshake → on_state=active →
-recv_frame loop`. (The `recv_frame`/`send_frame` data path itself gates on the
-internal frame-transfer states **0/5**, not 3 — see the state-gate note above.)
+ICE connectivity`. The real ICE behaviors the live client needs (live-validated):
+the client **binds the media UDP socket early**, **trickles its own host
+candidate**, uses **NO USE-CANDIDATE** flag, and **tolerates ICMP ECONNREFUSED** on
+the media path. There is **no DTLS-SRTP handshake**. After ICE comes the
+**`conv=0` media-start** (AUTH + VERSION + 3 cmd PDUs — see §5b) and then **`conv=1`
+video** (H.264) over KCP + AES-128-CBC/HMAC-SHA1. (The native `recv_frame`/
+`send_frame` data path — the SDK's WebRTC mode — still gates on the internal
+frame-transfer states **0/5**, not 3 — see the state-gate note above; it is not the
+live wire path.)
 (confidence: likely — the call set is directly present in the
 `Initialize` callback contract + the cmd builders of `libThingP2PSDK.so`; the
 precise inter-leaving of candidate vs answer timing needs a live capture, §9.)
+
+### 5b. conv=0 media-channel authorization + media-start order (the actual unblock)
+
+(Added 2026-06-28, v0.1.0-live-stream. This is the conv=0 control/auth handshake
+that the old implicit "DTLS-SRTP = auth" model missed. **Supersedes** the assumption
+that ICE+DTLS-SRTP alone unlocks the stream.)
+
+Once ICE connectivity is up, the live A/V is gated by an **application-level
+authorization on `conv=0`**, sent over the `imm`/KCP channel and **suite-3 sealed**
+(AES-128-CBC inline-IV/PKCS7 + 20-byte HMAC-SHA1(`media_key16`)). Sending nothing —
+or sending the wrong credential — makes the camera tear down `conv=0` (total KCP
+silence); the correct blob makes it accept auth and begin streaming. This was the
+final unblock for the keyframe path.
+
+**Auth credential** (confidence: live-validated, not byte-verified):
+- `username` = the constant **`"admin"`**.
+- `password` = **`md5_hex_lower( <camera password> ++ "||" ++ <localKey> )`** — a
+  32-char lowercase-hex string. Separator is the literal `"||"`. The
+  **lowercase-hex** encoding is **INFERRED** (the `HexUtil.a` body did not survive
+  decompile) but **live-validated** (the derived value is accepted; the raw camera
+  password is rejected). Evidence: jadx `IPCThingP2PCamera.connect` (the username/
+  password/separator construction) + `chaos::MD5Utils.b` = `HexUtil.a(MD5(...))`.
+  Rust: `control::derive_media_auth_password()` + the `media_auth_args()` seam in
+  `stream_live.rs`. The camera password and `localKey` are secrets — referenced by
+  `secrets/` location only; **no derived MD5 value is written here.**
+
+**Native blob builder** (confidence: confirmed offsets):
+`C++ ThingNetProtocolManager::SendAuthorizationInfo @002c8028` builds a **104-byte
+blob**: `magic@0 = 0x12345678`, `reqId@4`, `username@8` (`strncpy 0x1f`),
+`password@0x28` (`strncpy 0x3f`). Sent as `conv=0` `sn=0`.
+
+**Media-start order** (confidence: confirmed from cap4; reqId values likely):
+all PDUs are CONTIGUOUS on `conv=0` and suite-3 sealed:
+1. `AUTH` — `sn=0`, 104 B (the blob above, `SendAuthorizationInfo @002c8028`).
+2. `VERSION` — `sn=1`, 24 B = `SendCommand(0, 10, 0, {0x00010000})`.
+3. three cap4 command PDUs — `sn=2,3,4`: commands `(9,0)`, `(6,0)` ("open video"),
+   `(6,4)`.
+
+`SendCommand` builder `@002c5e54`: `@0` magic `0x12345678`, `@4` reqId (MEDIUM
+confidence — captured values 4,3,5 are non-monotonic and unexplained), `@8`
+direction (`0`=app cmd / `1`=camera resp), `@0xc = (low_cmd<<16)|high_cmd`, `@0x10`
+payload-len, `@0x14` payload. After this, the camera opens **`conv=1`** (video).
+conv id map: `0`=control/auth, `1`=video, `2`=downstream audio (16 kHz mono S16LE,
+inferred).
 
 ---
 
@@ -508,12 +613,13 @@ WebRTC ref `tuya-ipc-terminal` (same 302 + SDP architecture).)
 |---|---|---|
 | SDP session/audio/video sections (§3a/3b) | ✅ webrtc-rs builds/parses | — |
 | ICE (gather/connectivity/trickle) | ✅ | ICE servers come from runtime `P2pConfig.ices` (inject) |
-| DTLS-SRTP handshake + SRTP | ✅ (mbedTLS on device ↔ webrtc-rs DTLS) | — |
-| H.264 / Opus / G.711 RTP de-packetize | ✅ (webrtc-rs RTP + a decoder crate) | — |
+| DTLS-SRTP handshake + SRTP | ❌ NOT used by SCD921 for live A/V (mbedTLS DTLS-SRTP is present in the native lib but the device streams over `imm`/KCP instead — Superseded 2026-06-28, v0.1.0-live-stream) | — |
+| H.264 frame decode | ❌ no SRTP RTP path on this device | **H.264 arrives over `imm`/KCP (conv=1), AES-128-CBC-decrypted; reassemble + decode with an `openh264`/`ffmpeg` crate (NOT webrtc-rs RTP) — Superseded 2026-06-28, v0.1.0-live-stream** |
 | **Signaling transport** | ❌ | **MQTT 302 `{header,msg,token}` envelope (§2), via rumqttc** |
 | **`connect_v2`/`set_remote_online` control JSON** | ❌ | **emit the cmd JSON (§1) — but only if talking to the device's native SDK; if peering directly via SDP it's the offer that matters** |
 | **`m=application` + `a=aes-key` + `imm` codec** (§3c) | ❌ | **parse/emit the application m-section; apply the SDP-carried AES key to the imm media** |
-| **KCP/ARQ reliability on the imm data path** (§3d) | ❌ | **Tuya-custom; only needed if using the imm transport rather than SRTP tracks** |
+| **KCP/imm — THE ACTUAL MEDIA TRANSPORT** (§3d/§5b) | ❌ | **Tuya-custom; this IS the live media transport (Superseded 2026-06-28, v0.1.0-live-stream — promoted from "only if using imm"). KCP segmentation/ARQ + per-segment AES-128-CBC (inline IV, PKCS7) + per-datagram 20-byte HMAC-SHA1(`media_key16`); conv-multiplexed (0=auth, 1=video, 2=audio)** |
+| **conv=0 media authorization** (§5b) | ❌ | **`username="admin"` + `password = md5_hex_lower(camera_pw ++ "\|\|" ++ localKey)` 104-byte blob (`SendAuthorizationInfo @002c8028`) then VERSION + 3 cmd PDUs (`SendCommand @002c5e54`), all suite-3 sealed — the actual unblock (Added 2026-06-28, v0.1.0-live-stream)** |
 | 302 payload AES (localKey) | ❌ | **DONE — AES-128/ECB/PKCS5, key=localKey, no IV (recovered §2a; impl `mqtt_crypto::aes128_ecb_encrypt`, KAT vs openssl)** |
 | 302 `pv`→output-variant binding + outer MQTT framing | ❌ | **live-gated residual — which of hex/base64/raw a 302 publish uses + the envelope framing need a live 302 capture (`Error::MqttEnvelopePending`)** |
 

@@ -148,7 +148,7 @@ deviceHttpsPskUrl).
 |---|---|---|
 | `mobileApiUrl` | `https://a1.tuyaeu.com` | mobile-app atop API (the host already tried) |
 | `gwApiUrl` | `http://a.gw.tuyaeu.com/gw.json` | device gateway API |
-| `fusionUrl` | `https://apigw-eu.iotbing.com` | **iotbing "fusion" API gateway — UN-PROBED, rank-1 TASK-0048 target** |
+| `fusionUrl` | `https://apigw-eu.iotbing.com` | **iotbing "fusion" API gateway — at-the-time rank-1 TASK-0048 target** (SUPERSEDED 2026-06-28: not the cause of `ILLEGAL_CLIENT_ID`) |
 | `pxApiUrl` | `http://px.tuyaeu.com` | px API — UN-PROBED TASK-0048 target |
 | `deviceHttpsPskUrl` | `https://a3.tuyaeu.com` | device HTTPS-PSK (`a3.tuyaeu.com`) — UN-PROBED TASK-0048 target |
 | `aispeechHttpsUrl` | `https://aispeech.tuyaeu.com` | AI-speech HTTPS |
@@ -183,6 +183,18 @@ from the legacy `a1.tuyaeu.com` gateway is actually provisioned.
 
 ## FEED-FORWARD to TASK-0042 (the live re-attempt) (confidence: likely)
 
+> **SUPERSEDED 2026-06-28 (v0.1.0-live-stream).** `ILLEGAL_CLIENT_ID` is no longer
+> an open blocker: the full live path now works END-TO-END. The self-contained
+> Rust client logs in (MFA → session), discovers the REAL SCD921 via device
+> discovery, and decodes the live 1080p H.264 keyframe (VLC displayed it). It was
+> resolved by **client-side credential/signing corrections** — chKey-length, the
+> signer, and password-derivation (project memory: `illegal-client-id-wrong-signer`)
+> — on the ORIGINAL `a1.tuyaeu.com` atop path, NOT by changing the datacenter host.
+> Therefore the "wrong datacenter family" hypothesis below AND the TASK-0048
+> host-probing avenue did NOT turn out to be the cause. The static facts in PART 1
+> (clientId wire param) and PART 2 (regions/pins AES-256-CTR decrypt + host table)
+> remain accurate; only the live-blocker framing in this section is superseded.
+
 > **CORRECTED / SCOPED by TASK-0048 (host false-exhaustion).** The prior verdict
 > here said the host hypothesis was "REFUTED by ground truth" at `confirmed`.
 > That OVERTURNED claim rested on only the **`mobileApiUrl`** field of the EU
@@ -209,10 +221,14 @@ Evidence: the decrypted `decompiled/apktool/assets/thing_domains_v1/regions` EU 
 
 **Scoped verdict (confidence: likely): the "wrong datacenter host" hypothesis is
 refuted for `mobileApiUrl` only.** `ILLEGAL_CLIENT_ID` is NOT a clientId-param
-problem. The remaining live hypotheses (for the operator to weigh) are, in order:
+problem. The remaining live hypotheses (for the operator to weigh) are, in order
+(the original ranking at the time; see the SUPERSEDED 2026-06-28 banner above):
 - a **wrong datacenter family** — the appKey may be provisioned on the iotbing
   cloud (`apigw-eu.iotbing.com` / `a1-us.iotbing.com`), not the legacy
-  `a1.tuya*.com` gateway (TASK-0048 live probe);
+  `a1.tuya*.com` gateway (TASK-0048 live probe). *(SUPERSEDED 2026-06-28,
+  v0.1.0-live-stream: NOT the cause — `ILLEGAL_CLIENT_ID` was resolved by
+  client-side credential/signing fixes on the original `a1.tuyaeu.com` path; kept
+  here as a record of what was believed at the time.)*
 - a **provisioning / app-cert-pin gate**: the public gateway may bind this appKey to the
   packaged app's signing identity (an `Authorization`/channel header or server-side
   app-cert check) that a standalone client cannot reproduce (the CAVEAT in TASK-0043);
@@ -223,3 +239,10 @@ problem. The remaining live hypotheses (for the operator to weigh) are, in order
 Changing `mobileApiUrl` will not fix it — but the iotbing/px/a3 EU-family hosts
 were never tried, so the host avenue is NOT exhausted. TASK-0048 probes those
 un-tried hosts (one `token.get` each) before concluding the host avenue is dead.
+
+> **SUPERSEDED 2026-06-28 (v0.1.0-live-stream).** The host-probing avenue did NOT
+> turn out to be the fix. `ILLEGAL_CLIENT_ID` was solved on the ORIGINAL
+> `a1.tuyaeu.com` atop path via client-side credential/signing corrections
+> (chKey-length, signer, password-derivation; project memory
+> `illegal-client-id-wrong-signer`). The un-tried iotbing/px/a3 hosts were a
+> false lead; this paragraph is retained as a record of the reasoning at the time.

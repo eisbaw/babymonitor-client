@@ -66,7 +66,7 @@ config/theme constants.
 > **transport-agnostic**: PlayNetKit (and the IPC kit) only name the bridge
 > `connect`/`createMediaDevice` verbs whose param is `{deviceId}`-only (per
 > `TUNIIPCCameraManager.json`, the streaming section below) — no sdp/ice/mode
-> media-session fields. The real WebRTC SDP/ICE/DTLS-SRTP machinery is **native**,
+> media-session fields. The real WebRTC SDP/ICE **signaling** machinery is **native**,
 > in `libThingP2PSDK.so`: the signaling **strings** `a=ice-ufrag` / `invalid
 > signaling: type: candidate` live in the **`.so` binary** (recover with
 > `strings -n5 decompiled/nativelibs/libThingP2PSDK.so`), and the demangled
@@ -74,7 +74,18 @@ config/theme constants.
 > `imm_p2p_ice_session_create` — are in `re/symbols/libThingP2PSDK.dynsym.txt`.
 > (The dynsym is the symbol TABLE, not a string dump: it carries the `imm_p2p_ice_*`
 > exports, not the `a=ice-ufrag` text — so the strings are cited to the `.so`, the
-> symbols to the dynsym.) Surfaced in Java by
+> symbols to the dynsym.)
+> (Media-transport scope correction — superseded 2026-06-28, v0.1.0-live-stream: the
+> strings cited above — `a=ice-ufrag`, `invalid signaling: type: candidate` — are
+> **SDP/ICE signaling only**. An earlier draft also named "DTLS-SRTP" as the native
+> machinery; that token was uncited and is **NOT** the media path SCD921 actually
+> uses. The v0.1.0-live-stream milestone validated the SCD921 media as carried over
+> **KCP** and encrypted with **AES-128-CBC** (inline-IV, PKCS7) per segment + a
+> 20-byte **HMAC-SHA1** per datagram — explicitly not DTLS-SRTP. This doc keeps its
+> deferral to the streaming docs rather than re-asserting an encryption scheme here;
+> see `re/streaming_mode.md` and `re/media_decode_spec.md` for the validated
+> media-transport detail. confidence: confirmed — live-validated end-to-end keyframe
+> decode.) Surfaced in Java by
 > `P2PMQTTServiceManager.send302MessageThroughMqtt`
 > (`decompiled/jadx/sources/com/thingclips/smart/p2p/utils/P2PMQTTServiceManager.java`).
 > See `re/streaming_mode.md` for the full WebRTC-over-MQTT verdict and its own

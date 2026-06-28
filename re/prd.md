@@ -14,16 +14,33 @@ starting with the hardest and most valuable parts: the **live video/audio stream
 
 ## Methodology constraint
 
-- **Static analysis only.** No rooted device, emulator, or live packet capture is available.
-- Consequence: the live protocol must be reconstructed from decompiled Java/Kotlin **and**
+- **Static analysis was the PRIMARY method** (Superseded 2026-06-28, v0.1.0-live-stream). The
+  original constraint was "static analysis only — no rooted device, emulator, or live packet
+  capture is available." That no longer holds: a live emulator capture pipeline later became
+  available via the sibling **`android_emulator_re`** project (Frida/Magisk TLS-unpinning +
+  mitmproxy), yielding decrypted app flows (`emulator_captures/` cap0–cap4). These genuine
+  captures plus live runs against the **real SCD921** were used to *validate* the protocol: the
+  conv=0 auth and the full H.264 keyframe path are now live-validated end-to-end (milestone
+  v0.1.0-live-stream, commit fa930f0). *Note: the project `CLAUDE.md` still asserts "Static
+  analysis only. No live capture is available." — that statement now conflicts with reality and
+  should be reconciled separately; it is out of scope for this single-file edit.*
+- Consequence: the live protocol was first reconstructed from decompiled Java/Kotlin **and**
   native libraries (`.so`). For a consumer WiFi cam the stream/pairing logic is almost always
   in native code (often a third-party P2P SDK). Native-lib analysis (Ghidra/radare2) is therefore
-  first-class here, not optional.
-- **Honesty rule:** if the wire format cannot be determined from static analysis alone, say so
-  explicitly and document exactly what additional evidence (e.g. a single pcap) would unblock it.
-  Do not fabricate protocol details.
+  first-class here, not optional. The streaming protocol was ultimately confirmed/validated using
+  genuine captured app flows + live runs, not static analysis alone.
+- **Honesty rule:** if the wire format cannot be determined from the available evidence, say so
+  explicitly and document exactly what additional evidence would unblock it. Do not fabricate
+  protocol details. (For the streaming path, captures now exist, so claims there are backed by
+  real flows rather than blocked on a missing pcap; every claim still carries its confidence
+  level and cites its evidence.)
 
 ## Key unknowns to resolve (in priority order)
+
+> Status: these original research questions are now largely **resolved** (Superseded 2026-06-28,
+> v0.1.0-live-stream) — streaming stack, pairing, auth/encryption, and cloud-vs-local are answered;
+> see `re/review_gate_findings.md`, the streaming docs, and the "Streaming hypothesis" section below.
+> Retained here as the original framing.
 
 1. **Streaming stack** — what SDK/protocol carries audio+video?
    - Identify native libs and any third-party P2P/streaming SDK (TUTK/Kalay, PPCS, agora,
@@ -68,7 +85,27 @@ user's own account and device only.
 
 ## Streaming hypothesis (updated post-review)
 
-Two candidate transports — to be decided by triage before deep effort (see `re/review_gate_findings.md`):
+**RESOLVED (v0.1.0-live-stream)** — the transport is decided and proven end-to-end against the real
+SCD921. The validated path is a **HYBRID** (signaling over Tuya cloud MQTT; media over P2P/ICE UDP),
+closest to candidate 1 below but with **KCP** media framing rather than raw WebRTC media:
+
+- **WebRTC-style "302" signaling over Tuya MQTT** (payloads AES-ECB sealed with the device localKey)
+  → **ICE** (host-candidate trickle, no USE-CANDIDATE, tolerates ICMP ECONNREFUSED)
+  → **conv=0** media-start/auth → **conv=1** video over **KCP**.
+- Media is **per-segment AES-128-CBC (inline-IV, PKCS7)** + a **per-datagram 20-byte
+  HMAC-SHA1(media_key16)** → **H.264**. Explicitly **NOT DTLS-SRTP**.
+- conv ids: 0 = control, 1 = video, 2 = downstream audio (16 kHz mono S16LE, inferred).
+
+Confidence / honest caveat: **"live keyframe decodes + displays" is PROVEN** (the Rust client
+decoded the live 1080p H.264 keyframe and VLC displayed it). **"Smooth continuous live A/V" is NOT
+yet verified** — across live runs the camera's conv=1 video froze at ~12 segments (its initial KCP
+send window); root-caused to the single-threaded media pump starving the KCP ACK loop. Follow-ups:
+TASK-0085 (decouple the ACK loop from the blocking sink — the blocker), TASK-0086 (KCP WASK/WINS +
+flush cadence), TASK-0087 (A/V sink fixes), TASK-0088 (newtype the derived auth password),
+TASK-0089 (verify conv1/conv2 ACK byte-shape + sustained-A/V harness). TASK-0083 (live media
+transport) is DONE.
+
+Original candidate list (pre-triage history, see `re/review_gate_findings.md`):
 1. **WebRTC-over-MQTT** signaled via Tuya cloud (may bypass `libThingP2PSDK` entirely; cheaper if viable).
 2. **Tuya P2P** (`libThingP2PSDK`, TUTK/IOTC lineage); AV framing likely static-recoverable, per-session
    key exchange likely needs one live pcap.

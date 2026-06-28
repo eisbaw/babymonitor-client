@@ -7,6 +7,13 @@ post-decrypt by the Frida hook), plus the recovered derivation of the Tuya MQTT
 broker CONNECT credentials and the honest finding that they are **not statically
 recoverable**.
 
+> **Milestone — live stream reached (Superseded 2026-06-28, v0.1.0-live-stream,
+> commit fa930f0).** The self-contained Rust client now connects to the REAL SCD921
+> and decodes the live 1080p H.264 keyframe end-to-end. Several items flagged
+> "open / live-gated" below (§3 frame cipher, §5 broker connect + media engine) were
+> **closed** by this milestone (TASK-0083 DONE); the validated
+> 302/SDP/envelope/topics/cmd2 spec sections are unchanged.
+
 > **Method / citation convention.** Native + Java claims cite a decompiled path
 > (`decompiled/jadx/.../*.java:NN`, jadx-run-dependent line) or the cap3 capture.
 > cap3 is GROUND TRUTH (real bytes, post-decrypt) and counts as one independent
@@ -32,8 +39,10 @@ messages over both paths, and the camera returns one `answer` (SDP) over
 in `babymonitor-core::stream` (`tests/signaling_cap3.rs`). The MQTT broker CONNECT password — once thought a hard
 native block — is now **recovered + ported** (§4, TASK-0071): `doCommandNative(2)`
 is a nested MD5 over the master key `G` + `ecode`
-(`stream::mqtt_auth`). What remains live-gated is only the broker *connect* itself
-(no captured CONNECT exists to diff the output against).
+(`stream::mqtt_auth`). The broker *connect* and the full offer→trickle→answer 302
+exchange now run **live end-to-end** against the real SCD921 (Superseded 2026-06-28,
+v0.1.0-live-stream / TASK-0083 DONE); the only residual is that no captured CONNECT
+exists to byte-diff the credential output against.
 
 ---
 
@@ -185,8 +194,11 @@ a=ssrc:0 cname:<from>
 ```
 
 - The media AES **key** is the prize: `a=aes-key:<hex>` = the per-session key that
-  decrypts the RTP A/V (`re/webrtc_session.md` §3c; the frame cipher itself is a
-  separate open item, TASK-0034/0037).
+  feeds the `media_key16` decrypting the live A/V (`re/webrtc_session.md` §3c). The
+  frame cipher that consumes it is now **recovered + live-validated** end-to-end
+  (Superseded 2026-06-28, v0.1.0-live-stream): KCP + **AES-128-CBC** (inline IV,
+  PKCS7) + **HMAC-SHA1**, decoding the real 1080p H.264 keyframe (was: open
+  TASK-0034/0037).
 - The remote ICE creds (`a=ice-ufrag`/`a=ice-pwd`) and key are extracted from the
   **answer** by `stream::sdp::extract_ice_creds` + `extract_aes_key` and surfaced
   as `ParsedAnswer` for the media engine.
@@ -297,13 +309,29 @@ subscribe device 302 topic → negotiate). Nine offline tests exercise publish/p
 answer/timeout/disconnect through a fake in-memory transport with NO broker.
 
 **Open / live-gated:**
-- The actual **TLS:8883 broker connect + auth handshake** (AC#1/AC#3): the connect
-  orchestration is wired (above) but never executed here — no live broker/camera in
-  the sandbox, and `live-tls` (rumqttc rustls) is not in the local cargo cache, so the
-  real CONNECT/auth + answer round-trip are the **owner's live run** (`--features
-  live-tls`). The cmd2 CONNECT-credential derivation is **ported + offline-validated**
-  (§4, TASK-0071, `stream::mqtt_auth`); residual: there is no captured CONNECT to diff
-  the credential output against, and `G`'s `bmp_token` provenance caveat (§4) is shared
-  with the signer.
-- The RTP/SRTP **frame cipher** that consumes the SDP `a=aes-key` (TASK-0034/0037).
-- The WebRTC media engine (webrtc-rs) — a follow-up; not in this build.
+- The **TLS:8883 broker connect + MQTT-302 signaling round-trip** (AC#1/AC#3) is now
+  **executed live** against the real SCD921 (Superseded 2026-06-28,
+  v0.1.0-live-stream / TASK-0083 DONE): the connect orchestration ran end-to-end —
+  CONNECT/auth + the full offer→trickle→answer 302 exchange — over `--features
+  live-tls`. The cmd2 CONNECT-credential derivation is **ported + offline-validated**
+  (§4, TASK-0071, `stream::mqtt_auth`). Honest residual: the §4 cmd2 credential
+  **output** was still never byte-diffed against a captured CONNECT (the broker is
+  TLS:8883, off cap3's HTTP-only proxy), and `G`'s `bmp_token` provenance caveat (§4)
+  is shared with the signer — but the live connect succeeded, so the derivation is now
+  **live-validated by behavior**.
+
+**Resolved by the live-stream milestone (Superseded 2026-06-28, v0.1.0-live-stream /
+TASK-0083 DONE):**
+- The media **frame cipher** that consumes the SDP `a=aes-key` is now **recovered and
+  proven live** (was: open TASK-0034/0037): per-KCP-segment **AES-128-CBC** (inline
+  IV, PKCS7) plus a per-datagram 20-byte **HMAC-SHA1(media_key16)** over KCP (imm/tuya
+  transport) — explicitly **NOT** SRTP/DTLS.
+- The media path is this custom **KCP + AES-128-CBC + HMAC-SHA1** transport, **not** a
+  standard WebRTC/DTLS-SRTP/webrtc-rs engine (the earlier "webrtc-rs follow-up" note
+  is superseded). Remaining work is **sustained-streaming hardening**, not a media
+  engine: decouple the KCP ACK loop from the blocking output sink (TASK-0085, the
+  blocker), KCP WASK/WINS + a standalone flush cadence (TASK-0086), and the A/V sink
+  fixes (drop `-shortest` / free-port check / clean disconnect, TASK-0087; conv1/conv2
+  ACK byte-shape + a sustained-A/V harness, TASK-0089). Honest caveat: only the
+  **keyframe path** is proven live; smooth **continuous** A/V is **not yet verified**
+  (conv=1 video has frozen at ~12 segments — the camera's initial KCP send window).

@@ -24,6 +24,12 @@ named public references that change the implementation targets.
 - Ref: https://github.com/nalajcie/tuya-sign-hacking ; https://developer.tuya.com/en/docs/iot/new-singnature
 
 ### F2 — Streaming may be WebRTC-over-MQTT, bypassing libThingP2PSDK (confidence: speculative, triage first)
+- **Update — RESOLVED as of v0.1.0-live-stream (commit fa930f0):** confidence is now **confirmed**.
+  The transport IS WebRTC-style 302 signaling over Tuya MQTT, decoding a live SCD921 1080p H.264
+  keyframe end-to-end. Important correction to the `webrtc-rs` implication below: only the
+  signaling/ICE shape is WebRTC-like — the **media plane is NOT DTLS-SRTP**. It is custom **KCP +
+  AES-128-CBC (inline-IV, PKCS7) per segment + a per-datagram 20-byte HMAC-SHA1(media_key16)**, so
+  `webrtc-rs` does not cover the media path and proprietary AV framing still had to be reconstructed.
 - `seydx/tuya-ipc-terminal` streams modern Tuya cameras via **WebRTC**, signaled over **MQTT + Tuya
   cloud API**, then bridges to RTSP — explicitly NOT using Tuya's native P2P SDK. Newer Tuya IPC
   firmware commonly supports WebRTC.
@@ -33,6 +39,7 @@ named public references that change the implementation targets.
 - Consequence: NEW task — triage the streaming-mode decision (JS-first: `assets/mini_app_js`,
   `thing_uni_plugins`, MQTT/`webrtc`/`sdp`/`ice`/`stun` strings) BEFORE committing deep P2P effort.
   Task 10's verdict must choose which transport Wave 2 pursues.
+  (Resolved 2026-06-28, v0.1.0-live-stream: WebRTC-over-MQTT selected and shipped — no longer an open decision.)
 - Ref: https://github.com/seydx/tuya-ipc-terminal
 
 ### F3 — P2P static feasibility: framing likely recoverable, session key exchange likely the blocker (confidence: likely)
@@ -43,6 +50,8 @@ named public references that change the implementation targets.
   exactly what one pcap unblocks. Expected task-10 verdict: **`partially`**.
 - Refs: https://github.com/tuya/tuya-iotos-android-iot-p2p-demo ;
   https://kroo.github.io/wyzecam/reference/tutk/tutk/ ; https://github.com/miguelangel-nubla/videoP2Proxy
+- Note (2026-06-28, v0.1.0-live-stream): this TUTK/IOTC-PPCS P2P route is the road-not-taken — the
+  transport verdict (F2) selected the MQTT/KCP path. F3's substantive feasibility claims are unaffected.
 
 ### F4 — LAN port-6668 local protocol is datapoint-only (control/sensors), NOT AV (confidence: confirmed)
 - tinytuya/localtuya LAN protocol (TCP 6668, AES with per-device local key) carries **DPs** — on/off,

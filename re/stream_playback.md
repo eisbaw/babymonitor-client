@@ -18,6 +18,10 @@ ffplay http://127.0.0.1:8554/stream.ts
 `ffmpeg -listen 1` serves a single client; start the player after the subcommand
 prints `serving MPEG-TS at …`.
 
+> Note: the default http port **8554** collided with a local QEMU emulator during
+> live runs — pick a free `--port` if 8554 is taken (free-port selection tracked in
+> TASK-0087).
+
 ## Pipeline (what `stream` wires)
 
 ```
@@ -49,11 +53,29 @@ trailer)**, not the spec's earlier SHA-256 guess — corrected by cap4
 
 ## Honest status
 
-- **Live path** (no `--replay-annexb`): wired but **gated** — there is no
-  authenticated device session and no live Tuya broker/camera in the static-analysis
-  sandbox, so it stops at the first honest gate and returns `StreamPending` (never a
-  fabricated stream). The owner runs it for real after injecting a captured session
-  (README §6).
+- **Live path** (no `--replay-annexb`): the self-contained Rust client now connects
+  to the **real SCD921** and decodes the live **1080p H.264 keyframe end-to-end**
+  (Superseded 2026-06-28, v0.1.0-live-stream, commit fa930f0; earlier this bullet
+  said the path was gated and only returned `StreamPending`). Proven pipeline:
+  MQTT-302 signaling → ICE (client binds the media UDP socket early, trickles its own
+  host candidate, sends NO `USE-CANDIDATE`, tolerates ICMP `ECONNREFUSED`) → conv 0
+  auth + media-start → conv 1 video → KCP + AES-128-CBC + 20-byte HMAC-SHA1 → H.264 →
+  player. **[C] PROVEN**: live keyframe decodes + displays (VLC displayed it). If no
+  session/camera is reachable the path still falls back to `StreamPending` (never a
+  fabricated stream) — that is the fallback, not the steady-state outcome.
+  - **Honest caveat — sustained/continuous live A/V is NOT yet verified.** Across
+    live runs the camera's conv 1 video froze at **~12 segments** (its initial KCP
+    send window). Root cause: the single-threaded media pump
+    (`stream_live.rs` `pump_to_output`) does a **blocking** write into ffmpeg
+    (`stream.rs` `write_annexb`/`OutputSink`), starving the KCP ACK loop
+    (`mod.rs` `drain_media_acks`) so the camera's `snd_una` never advances. So
+    "live keyframe decodes + displays" is **[C] PROVEN**; "smooth continuous live A/V"
+    is **not** yet verified. Follow-ups: TASK-0085 (decouple the ACK loop from the
+    blocking sink — the blocker), TASK-0086 (KCP WASK/WINS + flush cadence),
+    TASK-0087 (A/V sink: drop `-shortest` / free-port check / clean disconnect),
+    TASK-0088 (newtype the derived auth password), TASK-0089 (verify conv1/conv2 ACK
+    byte-shape vs cap4 + sustained-A/V harness). TASK-0083 (live media transport) is
+    **DONE**.
 - **Replay path** (`--replay-annexb <file.264>` [`--replay-audio <file.s16le>`]):
   fully runnable **offline** — it exercises the real `rtp::parse_rtp` +
   `H264Depacketizer` + `AccessUnitAssembler` on a synthetic/captured Annex-B sample

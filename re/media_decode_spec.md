@@ -27,7 +27,7 @@ Wire framing of one UDP datagram on the imm/`AES/KCP` channel **[C]**:
 ```
 UDP payload = [ KCP header 24B | KCP segment payload ] (×N segments per datagram, KCP-coalesced)
               [ ...other segments... ]
-              [ HMAC-SHA256 tag 32B ]          ← present only when suite==3 (CBC)
+              [ HMAC-SHA1 tag 20B ]           ← present only when suite==3 (CBC)
 
 KCP segment payload (per PUSH segment, after KCP strips its 24B header) =
               [ IV 16B (cleartext) | AES-128-CBC ciphertext (PKCS#7-padded, 16B-aligned) ]
@@ -36,8 +36,8 @@ KCP segment payload (per PUSH segment, after KCP strips its 24B header) =
 **Receive order (do NOT reorder — HMAC is outer/whole-datagram, AES is inner/per-segment):**
 
 1. **Recv UDP datagram.** `FUN_0016e350` ingress demux; imm path taken when `session+0xe54 == 0` (`funcs/0016e350_FUN_0016e350.c:31`). **[C]**
-2. **HMAC strip + verify (suite 3 only).** `tag_len = mbedtls_md_get_size(md)` = **32** (SHA-256). Reject if `len < tag_len + 24`. Compute `HMAC-SHA256(key, datagram[0 .. len−32])`, `memcmp` vs trailing 32 bytes; mismatch → drop `"invalid md code"`. `FUN_0016e350.c:34, 66-79`. **[C]** Key = the 16 raw bytes at `session+0x84b0` (same key as AES). **[C]**  
-   *Note:* a prior note called this "truncated" — it is **full 32-byte HMAC-SHA256** (`md_get_size(SHA256)=32`). **[C]**
+2. **HMAC strip + verify (suite 3 only).** `tag_len` = **20** (SHA-1). Reject if `len < tag_len + 24` (i.e. `len < 20 + 24`). Compute `HMAC-SHA1(key, datagram[0 .. len−20])`, `memcmp` vs trailing 20 bytes; mismatch → drop `"invalid md code"`. `FUN_0016e350.c:34, 66-79`. **[C — live-validated, milestone v0.1.0-live-stream / commit fa930f0]** Key = the 16 raw bytes at `session+0x84b0` (same key as AES). **[C]**  
+   *Note (Superseded 2026-06-28, v0.1.0-live-stream):* a prior note claimed the static `mbedtls_md_get_size(md)` read pinned this at **32-byte HMAC-SHA256**. The live SCD921 negotiates a **20-byte HMAC-SHA1** tag — the end-to-end live keyframe decode validates SHA-1/20B per datagram. If the static decompile still literally shows `md_get_size`=32/SHA256, that read does not match the observed wire and is overruled by the live decode; the earlier "truncated / ~20-byte" intuition was closer than the SHA256 overrule. **[C — live]**
 3. **Demux to KCP channel by `conv`.** `conv = ikcp_getconv(first 4 bytes)`. Then `ikcp_input(channel.kcp, datagram, len−tag_len, now_ms)` — **the KCP header + IV + ciphertext are fed to KCP intact; only the HMAC tag is stripped here. No decrypt yet.** `FUN_0016e350.c:45-60, 94`. **[C]**
 4. **KCP parse + per-segment AES-decrypt.** `ikcp_input → ikcp_parse_data`; for each new PUSH segment, the process-packet hook `ctx_session_chan_process_pkt` runs:
    - `ct_len = seg_len − 0x10`; require `ct_len > 0 && (ct_len & 0xf) == 0` (block-aligned ⇒ block cipher). `0015e448:12-14`. **[C]**
@@ -46,13 +46,13 @@ KCP segment payload (per PUSH segment, after KCP strips its 24B header) =
    - Decrypted plaintext stored at `seg+0x54`, length `seg+0x2c`. **[C]**
 5. **KCP reassembly.** Segments ordered by `sn` in `rcv_buf`, in-order `frg`-complete runs moved to `rcv_queue`; app reads complete messages via `ikcp_recv_mbufwithdata` (`FUN_001636c4` → `imm_p2p_rtc_recv_data@16340c`). **[C]** Each delivered KCP *message* = one application media unit.
 6. **imm/RTP parse.** The delivered message is a standard **12-byte RTP header + payload** (`imm_p2p_rtp_decode_rtp2@173054:20-49`). **[C]** (Whether media messages carry an extra imm length-prefix wrapper before RTP is unproven — see §3 caveat. **[G]**)
-7. **Depacketize.** H.264 RFC-6184 STAP-A/FU-A → Annex-B NAL stream; audio = G.711 µ-law (PCMU). **[C for layout; depacketize derived by inversion — [I]]**
+7. **Depacketize.** H.264 RFC-6184 STAP-A/FU-A → Annex-B NAL stream; audio = G.711 µ-law (PCMU). **[C for layout; depacketize derived by inversion — [I]]** *(Audio codec contested: the live milestone v0.1.0-live-stream observed conv=2 downstream audio provisionally as **16 kHz mono S16LE (inferred)**, which conflicts with this static G.711 µ-law/PCMU read. Both remain uncertain; resolve via the conv=2 byte-shape verification — ground-truth TASK-0089.)*
 
 **ASCII summary:**
 ```
-UDP ─▶ HMAC-SHA256 verify+strip (whole datagram, suite3) ─▶ ikcp_input
+UDP ─▶ HMAC-SHA1 verify+strip (whole datagram, suite3) ─▶ ikcp_input
      ─▶ ikcp_parse_data ─▶ [per segment] strip 16B IV ─▶ AES-128-CBC decrypt ─▶ PKCS#7 unpad
-     ─▶ KCP frg reassembly (ikcp_recv) ─▶ RTP(12B) parse ─▶ H.264 STAP-A/FU-A | PCMU
+     ─▶ KCP frg reassembly (ikcp_recv) ─▶ RTP(12B) parse ─▶ H.264 STAP-A/FU-A | audio (PCMU vs 16k S16LE — contested, TASK-0089)
 ```
 
 ---
@@ -75,7 +75,7 @@ UDP ─▶ HMAC-SHA256 verify+strip (whole datagram, suite3) ─▶ ikcp_input
 |---|---|---|---|---|
 | 0,1 | 0x164a80 | 0x164a98 (no-op) | **plaintext stub** | none |
 | 2 | 0x164acc | 0x164d0c | **ChaCha20** (16B key duplicated→32B) | inline (mode-4-style) **[G]** |
-| **3** | **0x164db4** | **0x164ffc** | **AES-128-CBC** | **32B HMAC-SHA256 trailer** |
+| **3** | **0x164db4** | **0x164ffc** | **AES-128-CBC** | **20B HMAC-SHA1 trailer** (live-validated, v0.1.0-live-stream; supersedes the earlier 32B SHA256 static read) |
 | 4 | 0x165068 | 0x165284 | **AES-128-GCM** | 16B GCM tag inside segment (`ct_len−0x20`) |
 
 **Which suite is live is cloud-negotiated** (`security_level`, `session+0x3274`) and **not statically pinnable**. The `AES/KCP` SDP codec + cap3 observation gives **suite 3 (CBC) as the default/observed**. RECV+DECRYPT observed `0x3274 == 3`. **[C that suite3=CBC; G that the live session is always 3 vs 4]**
@@ -104,7 +104,8 @@ UDP ─▶ HMAC-SHA256 verify+strip (whole datagram, suite3) ─▶ ikcp_input
 
 **conv id source:** first 4 bytes of the datagram (`ikcp_getconv`). **[C]**
 - `conv == 0x010000f3` → **control/signaling channel** (records, not media; §below). **[C]**
-- else `conv = (active_handle << 16) | channel_id`; high half validated vs `session+0x3384`, `channel_id = conv & 0xffff` validated `≤ session+0x121c` (channel count). Channel structs: base `session+0xe08`, stride `0xa0`, KCP handle at `chan+0x20`. `FUN_0016e350.c:45-60`. **[C]** Exact numeric conv/channel-id values are per-session → **needs capture [G]**.
+- else `conv = (active_handle << 16) | channel_id`; high half validated vs `session+0x3384`, `channel_id = conv & 0xffff` validated `≤ session+0x121c` (channel count). Channel structs: base `session+0xe08`, stride `0xa0`, KCP handle at `chan+0x20`. `FUN_0016e350.c:45-60`. **[C]**
+  - **conv mapping resolved (2026-06-28, v0.1.0-live-stream):** the live SCD921 demuxes by simple conv ids **0=control, 1=video, 2=downstream audio** (no `(handle<<16)|channel_id` packing observed on the wire). **[C — live]** *Tension with the static model:* this lib's `FUN_0016e350` decompile models conv as `0x010000f3` (control) else `(active_handle<<16)|channel_id`, whereas the live device uses bare 0/1/2. The Rust client implements the **bare conv 0/1/2** demux that the live device actually sends; the `(handle<<16)|channel_id` packing is not exercised on the observed path.
 
 **KCP tuning (must match for interop)** — `funcs/00168f78_FUN_00168f78.c`: **[C]**
 - `ikcp_setmtu(kcp, 0x578)` → **MTU 1400**; `mss = mtu − 24 = 1376` (`funcs/0014eb64_ikcp_setmtu.c`).
@@ -136,7 +137,7 @@ Getters byte-swap BE→host (`imm_p2p_rtp_get_seq@17342c`, `imm_p2p_rtp_get_time
 
 Given one captured imm UDP datagram + the session `a=aes-key` (32 hex chars → 16 raw bytes) and security_level:
 
-**Step A — integrity gate (proves key + framing, before any decrypt):** if suite 3, compute `HMAC-SHA256(key16, datagram[0 .. len−32])` and compare to the trailing 32 bytes. **A match alone proves the 16-byte key and the datagram framing are correct.** (Mirrors `FUN_0016e350.c:66-79`.) **[C]**
+**Step A — integrity gate (proves key + framing, before any decrypt):** if suite 3, compute `HMAC-SHA1(key16, datagram[0 .. len−20])` and compare to the trailing 20 bytes. **A match alone proves the 16-byte key and the datagram framing are correct.** (Mirrors `FUN_0016e350.c:66-79`.) **[C — live-validated, v0.1.0-live-stream; supersedes earlier 32B SHA256]**
 
 **Step B — KCP parse:** parse the 24B header; confirm `conv` matches and `cmd ∈ {0x51..0x54}`, `len` ≤ remaining. PUSH (`0x51`) carries media. **[C]**
 
@@ -146,7 +147,7 @@ Given one captured imm UDP datagram + the session `a=aes-key` (32 hex chars → 
 - Unpadded plaintext byte0: `(b0 & 0xc0) == 0x80` (RTP V=2). **[C]**
 - Payload (after 12B RTP header) first byte `& 0x1f` = NAL type ∈ `{1..23 single, 24 STAP-A, 28 FU-A}`. **[C]**
 - For a keyframe datagram: expect NAL types **7 (SPS), 8 (PPS), 5 (IDR)**; emitting `00 00 00 01` + NAL to a file and feeding `ffprobe`/`openh264`/`ffplay` should decode a frame. **[I]**
-- Audio: RTP `PT == 0` (PCMU); payload is G.711 µ-law (8 kHz); `pts = rtp_ts >> 3` ms (`imm_p2p_rtc_recv_frame.c:91-99`). G.711 has no sync word — validate by decoding µ-law→PCM and checking sane amplitude envelope. **[C for PT/ts; I for audio plausibility]**
+- Audio: RTP `PT == 0` (PCMU); payload is G.711 µ-law (8 kHz); `pts = rtp_ts >> 3` ms (`imm_p2p_rtc_recv_frame.c:91-99`). G.711 has no sync word — validate by decoding µ-law→PCM and checking sane amplitude envelope. **[C for PT/ts; I for audio plausibility]** *(Contested 2026-06-28: the live milestone v0.1.0-live-stream observed conv=2 downstream audio provisionally as **16 kHz mono S16LE (inferred)**, not 8 kHz µ-law. Static PCMU read kept but flagged pending conv=2 byte-shape verification — TASK-0089.)*
 
 **Best single ground-truth check:** Step A (HMAC) + Step C (PKCS#7 valid) + Step D (RTP V=2 + NAL type in range) all passing on one datagram is conclusive that key, suite, IV placement, and framing are all correct.
 
@@ -157,14 +158,14 @@ Given one captured imm UDP datagram + the session `a=aes-key` (32 hex chars → 
 **Crates:**
 
 - **KCP:** `kcp` (zonyitoo, skywind3000 port). **Constraint [C/I]:** stock `kcp` exposes only `input()/recv()` — it has **no per-segment process-packet hook**, and you **cannot** decrypt after `recv()` because each segment carries its own IV + PKCS#7 and KCP concatenates segment *plaintexts*, not ciphertexts. ⇒ **You must decrypt per segment.** Two viable approaches: (a) **vendor/fork** the `kcp` crate and add a per-segment decrypt callback at the `parse_data` equivalent (mirrors `ctx_session_chan_process_pkt`); or (b) hand-roll a minimal ikcp RX (header parse + `rcv_buf`/`frg` reassembly is ~200 lines) with the decrypt inline. (a) is lower-risk for ARQ/window correctness. Configure `nodelay(false,10,20,true)`, `mtu 1400`, `wndsize = budget/1600`. **[C params]**
-- **HMAC:** `hmac` + `sha2` → `Hmac<Sha256>`, 32-byte tag, key = 16 raw bytes. **[C]**
+- **HMAC:** `hmac` + `sha1` → `Hmac<Sha1>`, 20-byte tag, key = 16 raw bytes. **[C — live-validated, v0.1.0-live-stream; supersedes earlier `sha2`/`Hmac<Sha256>`/32B]**
 - **AES-CBC (suite 3):** `aes` + `cbc` → `cbc::Decryptor<aes::Aes128>`, `block-padding = Pkcs7`, IV = inline 16B. **[C]**
 - **AES-GCM (suite 4, if live):** `aes-gcm` (`Aes128Gcm`), 16B inline IV/nonce + 16B trailing tag. **[C mechanics; G whether needed]**
 - **ChaCha20 (suite 2, unlikely):** `chacha20`/`chacha20poly1305`; key = 16B duplicated to 32B. **[G]**
 - **RTP parse:** `rtp` (webrtc-rs) or hand-roll the 12B header (trivial, BE). **[C]**
 - **H.264 depacketize:** `webrtc` / `rtp`'s `codecs::h264::H264Packet` (RFC-6184 STAP-A/FU-A), or hand-roll the inversion below. **[I]**
 - **H.264 decode/render:** `openh264` (Cisco) for in-process decode, or write Annex-B to a pipe and use `ffplay`/`ffmpeg-next`. **[I]**
-- **Audio:** G.711 µ-law decode is a 256-entry LUT (no crate needed). Opus via `opus` crate **only if** a capture shows Opus RTP — **not confirmed in this lib's RX path [G]**.
+- **Audio:** G.711 µ-law decode is a 256-entry LUT (no crate needed). Opus via `opus` crate **only if** a capture shows Opus RTP — **not confirmed in this lib's RX path [G]**. *(Contested: the live milestone v0.1.0-live-stream saw conv=2 downstream audio as 16 kHz mono S16LE (inferred) — possibly raw PCM rather than µ-law — so the conv=2 byte shape must be verified before committing to a µ-law LUT path. TASK-0089.)*
 
 **H.264 depacketizer (derived by inverting the confirmed send packetizer — `imm_p2p_h264_packetize` STAP-A@`15026c:42-46`, FU-A@`150100:53-56`, threshold `0x4a7`=1191) [I]:**
 ```
@@ -182,13 +183,14 @@ Access-unit boundary = RTP M-bit (byte1 bit7). Keyframe = NAL type 5 (IDR), prec
 | Item | Status |
 |---|---|
 | KCP wire format, header, cmd set, MTU/MSS/nodelay/wnd | **[C]** |
-| Datagram HMAC-SHA256 (suite 3), 32B tag, key=16B `session+0x84b0` | **[C]** |
+| Datagram HMAC-SHA1 (suite 3), 20B tag, key=16B `session+0x84b0` | **[C — live-validated, v0.1.0-live-stream; supersedes 32B SHA256]** |
 | Per-segment AES-128-CBC, inline 16B IV, PKCS#7 | **[C]** |
 | Key acquisition: SDP `a=aes-key` = 32 hex chars → hex-decode → 16 raw bytes at `session+0x84b0`; writers `FUN_00167bd0:162-174` (offerer) / `FUN_0016a004:75` (answerer `imm_p2p_rtc_sdp_get_aes_key`) | **[C]** (resolves the KCP-trace "open writer" item) |
-| 12B RTP header layout; PT0=PCMU; ts/seq BE | **[C]** |
+| 12B RTP header layout; ts/seq BE | **[C]** |
+| Audio codec: static PT0=PCMU (8 kHz µ-law) vs live conv=2 = 16 kHz mono S16LE (inferred) | **contested [C static / I live]** — TASK-0089 |
 | H.264 STAP-A/FU-A layout (send side) | **[C]**; RX depacketize **[I]** |
 | **Live suite: CBC (3) vs GCM (4)** | **[G]** — one 302 offer/answer or one `mbedtls_aes_crypt_cbc`/`gcm` Frida hook |
-| **Numeric conv ids / channel ids per channel** | **[G]** — capture |
+| **Numeric conv ids / channel ids per channel** | **resolved [C — live, v0.1.0-live-stream]:** conv 0=control, 1=video, 2=downstream audio (bare conv ids; not the static `(handle<<16)|channel_id` packing) |
 | **Media RTP: bare vs imm length-prefixed inside KCP message** | **[G]** — capture |
 | **PATH A video depacketize/assemble residence** (this lib vs `libThingCameraSDK`) | **[G]** — capture or `libThingCameraSDK` dive |
 | **Opus presence on RX** | **[G]** — capture |
@@ -203,4 +205,4 @@ Access-unit boundary = RTP M-bit (byte1 bit7). Keyframe = NAL type 5 (IDR), prec
 `re/ghidra/`: `imm_p2p_rtc_sdp_{get,set}_aes_key.c`, `imm_p2p_rtc_recv_frame.c`, `imm_p2p_rtc_recv_data.c`, `imm_p2p_h264_packetize.c`.
 Cipher vtable: vaddr `0x157df8` (Ghidra `0x257df8`), reloc-verified via `readelf -r decompiled/nativelibs/libThingP2PSDK.so`.
 
-**Doc correction to apply:** `re/webrtc_session.md` §2a/§3c/§3d/§4/§7 describe cap3 media as DTLS-SRTP — that is **PATH B** (`session+0x395`/`+0xe54 != 0`, return-audio only). **cap3 `AES/KCP` (PT 6001) is PATH A: AES-128-CBC + HMAC-SHA256 over KCP, keyed directly by the SDP `a=aes-key`, no DTLS exporter.** `aes_decrypt_with_raw_key@1f2c7c` (libsrtp) has zero callers on this path — do not model the imm decrypt on it.
+**Doc correction to apply:** `re/webrtc_session.md` §2a/§3c/§3d/§4/§7 describe cap3 media as DTLS-SRTP — that is **PATH B** (`session+0x395`/`+0xe54 != 0`, return-audio only). **cap3 `AES/KCP` (PT 6001) is PATH A: AES-128-CBC + HMAC-SHA1 over KCP, keyed directly by the SDP `a=aes-key`, no DTLS exporter.** (HMAC corrected 2026-06-28 to SHA-1/20B per the live milestone v0.1.0-live-stream; earlier SHA256/32B static read superseded.) `aes_decrypt_with_raw_key@1f2c7c` (libsrtp) has zero callers on this path — do not model the imm decrypt on it.

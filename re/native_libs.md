@@ -31,7 +31,10 @@ path `/Users/xucs/Desktop/sdk-develop/ipc-tymedia-sdk/third_party/webrtc/...` in
 Tuya MQTT**, with a legacy **PPCS (TUTK/IOTC-lineage) P2P** path also present —
 both inside `libThingP2PSDK.so`. Cross-checked against Tuya's public
 `github.com/tuya/tuya-rtc-camera-sdk-android` (WebRTC + MQTT signaling, <300ms),
-which matches the recovered strings.
+which matches the recovered strings. (Forward pointer, v0.1.0-live-stream: the
+signaling half holds — WebRTC-style 302 over Tuya MQTT — but the SCD921 **media**
+transport resolved to Tuya IMM-P2P = KCP + AES-128-CBC + HMAC-SHA1, NOT DTLS-SRTP;
+see the resolved Streaming-transport section below.)
 
 ## Full lib table (confidence: confirmed for size/SONAME; role per cited string)
 
@@ -92,11 +95,17 @@ which matches the recovered strings.
 - **OpenSSL 1.1.1w** — `libcrypto.1.1.so` / `libssl.1.1.so` (app TLS, cloud HTTPS).
   `libThingCloudStorageSignatureTools.so` statically bundles its own OpenSSL+curl
   for cloud-storage signing (RSA/SCT/EC symbols present).
-- **mbedTLS (bundled, static)** inside `libThingP2PSDK.so` — used for the
-  **DTLS-SRTP** WebRTC media path (`mbedtls_ssl_conf_dtls_srtp_protection_profiles`,
-  `mbedtls_ctr_drbg_seed`; build path `/Users/Pan/GitHub/mbedtls/library/ssl_tls.c`).
-  The P2P SDK's `NEEDED` list does NOT include libssl/libcrypto → its TLS is
-  self-contained mbedTLS, separate from the app's OpenSSL.
+- **mbedTLS (bundled, static)** inside `libThingP2PSDK.so` — DTLS-SRTP symbols are
+  present (`mbedtls_ssl_conf_dtls_srtp_protection_profiles`, `mbedtls_ctr_drbg_seed`;
+  build path `/Users/Pan/GitHub/mbedtls/library/ssl_tls.c`). The P2P SDK's `NEEDED`
+  list does NOT include libssl/libcrypto → its TLS is self-contained mbedTLS,
+  separate from the app's OpenSSL. The static symbol observation stands.
+  **SUPERSEDED (2026-06-28, v0.1.0-live-stream):** the SCD921 does NOT negotiate the
+  DTLS-SRTP media path. The live-validated media transport is **Tuya IMM-P2P = KCP +
+  AES-128-CBC (inline IV, PKCS7) + 20-byte HMAC-SHA1(media_key16)** (key material
+  referenced only via `secrets/`, never inlined here). The DTLS-SRTP code path in
+  this lib is unused for this device; the inference that these mbedTLS symbols are
+  THE media crypto for the SCD921 is withdrawn.
 - **Tuya crypto** — `libthing_security.so` carries the full symmetric table:
   AES-128/192/256 in CBC/GCM/CTR/CCM/CCM*-NO-TAG/CFB128/ECB/OFB/XTS/KW/KWP, plus
   SHA/HMAC/RSA. `libthing_security_algorithm.so` + `libthingnetsec.so` are the
@@ -118,15 +127,28 @@ version *mismatch* recorded; the SDK identity is unambiguous, but Tuya does not
 publish per-build semver for the prebuilt `.so`, so the `3.10.0`/`1.2.x` tokens
 are the internal build versions, not a Maven-pinnable release tag.
 
-## Streaming-transport implication (forward to task 10) (confidence: likely)
-The decisive evidence — WebRTC SDP/ICE/DTLS-SRTP + MQTT signaling **inside**
-`libThingP2PSDK.so`, plus Tuya's public WebRTC camera SDK — strongly supports the
-review-gate **F2** hypothesis: the SCD921 stream is **WebRTC, signaled over Tuya
-MQTT**, NOT (primarily) the proprietary PPCS AV framing. A Rust client over
-`webrtc-rs` + an MQTT signaling client is therefore the likely cheaper path than
-reconstructing PPCS AV framing. PPCS remains as a fallback/legacy path. The
-task-10 triage should confirm which the SCD921 firmware negotiates (the `skill`
-field in `connect_v2` likely encodes capability).
+## Streaming-transport implication (RESOLVED 2026-06-28, v0.1.0-live-stream)
+The static evidence — WebRTC SDP/ICE/DTLS-SRTP + MQTT signaling **inside**
+`libThingP2PSDK.so`, plus Tuya's public WebRTC camera SDK — supported the
+review-gate **F2** hypothesis. Live ground truth (milestone tag
+`v0.1.0-live-stream`) now resolves it, and only partly the way the static read
+predicted:
+- **Signaling: confirmed over Tuya MQTT.** The SCD921 negotiates a WebRTC-style
+  **302 signaling** exchange carried over Tuya MQTT (AES-ECB / `localKey`). This
+  matches the MQTT-signaling half of the hypothesis.
+- **Media: NOT standard WebRTC DTLS-SRTP, and NOT PPCS.** The media path resolved
+  to **Tuya IMM-P2P** — a custom stack of **KCP + AES-128-CBC (inline IV, PKCS7) +
+  20-byte HMAC-SHA1(media_key16)** over UDP, validated end-to-end (live 1080p H.264
+  keyframe decoded and displayed).
+
+Recommendation update (supersedes the earlier `webrtc-rs` suggestion): the working
+Rust client does **not** use `webrtc-rs`/DTLS-SRTP and does **not** reconstruct PPCS
+AV framing. It implements a custom **KCP + AES-128-CBC + HMAC-SHA1** media transport
+plus an MQTT-302 signaling client. The earlier open question — "the task-10 triage
+should confirm which the SCD921 firmware negotiates" — is **answered**: the firmware
+negotiates the Tuya IMM-P2P / KCP media path. See the live-stream milestone
+(`v0.1.0-live-stream`) for the validated pipeline; sustained continuous A/V is a
+separate, not-yet-verified follow-up.
 
 ## Limitations (confidence: confirmed — these are scoping caveats, not claims)
 These caveats are grounded in two independent committed artifacts: the dynamic

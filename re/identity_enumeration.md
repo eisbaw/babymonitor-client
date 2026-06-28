@@ -17,6 +17,12 @@ name).
 > therefore UNRELIABLE for literal enumeration — the smali was used for every
 > value-bearing claim below.
 
+> **STATUS (2026-06-28, v0.1.0-live-stream, confidence: confirmed):**
+> `ILLEGAL_CLIENT_ID` is now SOLVED — full cloud login works. The §0/§6 framing of it
+> below as an open server-side blocker is SUPERSEDED: it was a CLIENT-side chKey
+> LENGTH bug (plus signer + password fixes), not a server provisioning/app-cert gate
+> (`re/live_login.md`).
+
 ---
 
 ## 0. Verdict — the "wrong sample-key" hypothesis is REFUTED (confidence: confirmed)
@@ -47,9 +53,13 @@ Gradle namespace Philips' white-label fork kept for its app module.
 
 **Consequence:** `ILLEGAL_CLIENT_ID` is NOT a wrong-appKey-extraction problem. The
 chKey derived from this appId is therefore also derived from the CORRECT appId
-(`re/chkey_static.md`). The remaining `ILLEGAL_CLIENT_ID` hypotheses are
-provisioning/app-cert-attestation gates, not a mis-extracted key (`re/live_login.md`,
-`re/regions_decrypt.md` PART "FEED-FORWARD").
+(`re/chkey_static.md`). `ILLEGAL_CLIENT_ID` was SUBSEQUENTLY RESOLVED (Superseded
+2026-06-28, v0.1.0-live-stream; root-caused 2026-06-26, confidence: confirmed) as a
+CLIENT-side chKey LENGTH bug — the client emitted the 16-char `[8..24]` slice whereas
+the real chKey is the 8-char hex slice `[8..16]` of `hex(HMAC-SHA256(...))`, rejected
+before sign-verification (`re/live_login.md` SOLVED section). This REINFORCES (does
+not contradict) the wrong-key refutation: the identity was correct; the defect was the
+chKey derivation LENGTH, not a mis-extracted or provisioning/app-cert key.
 
 ---
 
@@ -208,10 +218,11 @@ derivation (`re/bmp_token_whitebox.md`), not an alternate appKey.
 ## 6. Honest limitations (confidence: likely — scoping)
 
 - The rank-1 appKey/sign identity is `confirmed` as the IN-USE one (R8 inline +
-  init chain), but it being in-use does NOT explain `ILLEGAL_CLIENT_ID` — that gate
-  is server-opaque (`re/live_login.md`). This enumeration's job was to RULE OUT the
-  wrong-key hypothesis, which it does; it does not by itself produce a working
-  login.
+  init chain), but it being in-use does NOT explain `ILLEGAL_CLIENT_ID` —
+  `ILLEGAL_CLIENT_ID` was later RESOLVED client-side (Superseded 2026-06-28,
+  v0.1.0-live-stream): a chKey LENGTH fix, plus signer and password corrections
+  (`re/live_login.md`). This enumeration's job was to RULE OUT the wrong-key
+  hypothesis, which it does; it does not by itself produce a working login.
 - The §2a ttid-value resolution (`philips…owl` vs a `sdk_…@appKey` rewrite) is
   now RESOLVED statically (`confirmed`, TASK-0047/0048): wire `ttid =
   sdk_international@<appKey>` via the full `AppInitializer.d`→`j`→`ThingSdk.init`

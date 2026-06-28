@@ -96,6 +96,13 @@ Exported, deep-link-capable activities (confidence: confirmed):
   online/offline, DP updates, and — per the review-gate F2 hypothesis — the
   likely WebRTC signaling transport). **Highest-interest entry point for the
   streaming-mode triage (forward to task 10).**
+  - CONFIRMED (live-stream milestone v0.1.0-live-stream): `MqttService` is the
+    WebRTC-STYLE 302 signaling transport — see the streaming/signaling doc.
+    Control plane = MQTT-302 -> ICE -> conv=0 media-start -> KCP + AES-128-CBC
+    media. The media transport is custom KCP + AES-128-CBC + HMAC-SHA1 (NOT
+    DTLS-SRTP), so this is WebRTC-style signaling, not standards-WebRTC media.
+    Evidence: the live milestone (end-to-end keyframe decode against the real
+    SCD921), which upgrades the former F2 hypothesis to confirmed.
 
 ### Push / notifications (cry, motion, doorbell alerts)
 - `com.thingclips.smart.fcmpush.service.ThingFcmListenerService` — `:153`
@@ -169,7 +176,8 @@ These are interpretations of the manifest evidence above (each underlying
 component citation is `confirmed`; the streaming-role inferences are `likely`).
 
 1. The cloud control plane is **Tuya MQTT** (`MqttService`, `:252`) — model this
-   as the event/control channel and the prime WebRTC-signaling candidate.
+   as the event/control channel and the confirmed WebRTC-style 302 signaling
+   transport (validated by the live-stream milestone v0.1.0-live-stream).
 2. LAN discovery exists (`GwBroadcastMonitorService` UDP, `:872`) — a local
    fast-path / local-key control path is plausible (review-gate F4).
 3. The live camera UI is a React-Native IPC panel
@@ -181,7 +189,11 @@ component citation is `confirmed`; the streaming-role inferences are `likely`).
 
 ## Limitations
 - apktool does not give per-claim semantic confidence beyond the manifest text;
-  service *behavior* (e.g. whether `MqttService` carries WebRTC signaling) is a
-  hypothesis to be confirmed in the JS/native layers, flagged accordingly above.
+  service *behavior* (e.g. whether `MqttService` carries WebRTC signaling) is now
+  confirmed (live-stream milestone v0.1.0-live-stream — `MqttService` carries the
+  WebRTC-style 302 signaling, validated by a live run, not by JS/native static
+  analysis). Genuinely-open caveat: sustained continuous A/V is not yet verified
+  (live keyframe decodes + displays is PROVEN; smooth continuous live A/V is not
+  — see TASK-0085/TASK-0089).
 - Activity count includes many SDK internal activities never user-reachable;
   only the exported/deep-link ones are externally relevant.

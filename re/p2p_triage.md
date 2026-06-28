@@ -146,7 +146,9 @@ Two recovered struct/enum names worth noting for TASK-0010: `imm_p2p_rtc_frame_t
 `re/symbols/libThingP2PSDK.dynsym.txt`), cross-checked against the SDP attribute
 strings string-grepped from the same `decompiled/nativelibs/libThingP2PSDK.so`
 plus the public WebRTC ref `tuya/tuya-rtc-camera-sdk-android` (github reference).
-This is the full offer/answer + trickle-ICE + DTLS-SRTP toolkit:
+This is the full offer/answer + trickle-ICE + DTLS-SRTP toolkit (symbol presence
+confirmed; but see the note below — the DTLS-SRTP exports are NOT on the SCD921
+live media path):
 
 | Subsystem | Key exported symbols |
 |---|---|
@@ -156,6 +158,13 @@ This is the full offer/answer + trickle-ICE + DTLS-SRTP toolkit:
 | **AV frame / ARQ reliability** | `imm_p2p_rtc_frame_list_create/destroy/close`, `…_arq_find_packet`, `…_arq_set_packet`, `…_check_limit`, `…_get_status`, `…_get_current_frame` |
 | **Signaling transport** | `imm_p2p_rtc_set_signaling`, `imm_p2p_rtc_set_remote_online`, `imm_p2p_rtc_set_http_result(_v2)` |
 | **DTLS-SRTP (bundled mbedTLS)** | `mbedtls_ssl_conf_dtls_srtp_protection_profiles`, `imm_p2p_misc_generate_cert`, `imm_p2p_misc_calculate_cert_fingerprint`, `imm_p2p_misc_generate_pkey` (the P2P SDK links its **own static mbedTLS**, not the app's OpenSSL — see `re/native_libs.md`) |
+
+> **NOTE (Superseded 2026-06-28, v0.1.0-live-stream):** the DTLS-SRTP / mbedTLS
+> exports above are genuinely **present** in the lib (inventory above is accurate,
+> confidence: confirmed for symbol presence) but are **NOT on the SCD921 live media
+> path**. The live media transport is **AES-128-CBC (inline IV, PKCS7) per KCP
+> segment + a 20-byte HMAC-SHA1(media_key16) per datagram over KCP**, not DTLS-SRTP.
+> See `re/streaming_mode.md` / the v0.1.0-live-stream milestone.
 
 ### 1d. Crypto/util helpers (shared)
 
@@ -253,7 +262,7 @@ ref; two distinct sources per row).
 
 | Our entry points | Public reference | What it tells us | Confidence |
 |---|---|---|---|
-| `imm_p2p_rtc_connect_v2/v3`, `imm_p2p_rtc_sdp_*`, `imm_p2p_ice_*`, `SendMessageThroughMQTT`, 302 envelope `{header,msg,token}` | `tuya/tuya-rtc-camera-sdk-android` ; `tuya/webrtc-demo-go` ; `tuya/tuya-webrtc-android-demo` ; `seydx/tuya-ipc-terminal` | Confirms the **WebRTC-over-MQTT** architecture (SDP offer/answer + trickle-ICE + DTLS-SRTP, signaled as message code 302 over Tuya MQTT). `seydx/tuya-ipc-terminal` gives the wire shape: `header.type` = `offer`/`answer`/`candidate`/`disconnect`, `mode:"webrtc"`, IPC topics `/av/moto/<moto_id>/u/<device_id>`. **A field-for-field match** with our recovered strings → the Rust client can model signaling directly from this ref. | confirmed (native strings in `libThingP2PSDK.so` + the named public refs = 2 independent sources) |
+| `imm_p2p_rtc_connect_v2/v3`, `imm_p2p_rtc_sdp_*`, `imm_p2p_ice_*`, `SendMessageThroughMQTT`, 302 envelope `{header,msg,token}` | `tuya/tuya-rtc-camera-sdk-android` ; `tuya/webrtc-demo-go` ; `tuya/tuya-webrtc-android-demo` ; `seydx/tuya-ipc-terminal` | Confirms the **WebRTC-over-MQTT** architecture (SDP offer/answer + trickle-ICE, signaled as message code 302 over Tuya MQTT). `seydx/tuya-ipc-terminal` gives the wire shape: `header.type` = `offer`/`answer`/`candidate`/`disconnect`, `mode:"webrtc"`, IPC topics `/av/moto/<moto_id>/u/<device_id>`. **A field-for-field match** with our recovered strings → the Rust client can model signaling directly from this ref. **SUPERSEDED for SCD921 (v0.1.0-live-stream):** the public-ref DTLS-SRTP inference does NOT hold — the live media plane is AES-128-CBC (inline IV, PKCS7) + 20-byte HMAC-SHA1(media_key16) per datagram over KCP, NOT DTLS-SRTP. See `re/streaming_mode.md`. | confirmed (native strings in `libThingP2PSDK.so` + the named public refs = 2 independent sources) |
 | `ThingCameraNative_connect4ppcs`, `ERROR_PPCS_*`, `PPCS_Write`/`PPCS_Read`/`PPCS_Connect`, IOTC session model | `tuya/tuya-iotos-android-iot-p2p-demo` (P2P **channel API surface**) ; WyzeCam `tutk.py`/`tutk_ioctl_mux.py` (IOTC/TUTK **AV framing**) ; `miguelangel-nubla/videoP2Proxy` | The PPCS path is the **TUTK/IOTC PPCS lineage**. WyzeCam `tutk.py` is a full Python reimpl of the IOTC session + AV framing → if the SCD921 ever returns `p2pType=2`, this ref is the template for the AV de-framer. The Tuya P2P demo documents the channel/connect API surface that `connect4ppcs` wraps. | confirmed (PPCS strings in `libThingCameraSDK.so` + named public refs = 2 independent sources) |
 
 Refs: `tuya/tuya-rtc-camera-sdk-android`, `tuya/webrtc-demo-go`,
@@ -286,15 +295,21 @@ verdict); the targets themselves are confirmed-present exports of
    the offer/answer construction. Confirm codec list (OpenH264 H.264 + the `imm`
    codec) and the trickle-ICE candidate flow vs `webrtc-rs` defaults.
 3. **`imm_p2p_rtc_sdp_get_aes_key` / `_set_aes_key`** and the
-   `imm_p2p_hmac_sha1` / `aes_decrypt_with_raw_key` helpers — the **media/session
-   key derivation** (review-gate F3's expected hard blocker; the part typically NOT
-   statically recoverable — verify whether it is here or needs a live DTLS capture).
+   `imm_p2p_hmac_sha1` / `aes_decrypt_with_raw_key` helpers — confirm the
+   **AES-key-in-SDP + the AES-CBC / HMAC-SHA1-over-KCP media crypto** (review-gate F3's
+   expected hard blocker). The **"live DTLS capture" branch is ruled out**
+   (Superseded 2026-06-28, v0.1.0-live-stream): the media key rides the SDP
+   `a=aes-key` (already RESOLVED at §1d above) and the media transport is
+   AES-128-CBC + HMAC-SHA1 over KCP, so no DTLS handshake/exporter is on the media
+   path — these helpers are the media-segment crypto, not a key-exchange blocker.
 4. **`ThingSmartP2PSDK::set_signaling` / `SendMessageThroughMQTT` + the 302
    envelope** — pin the exact `{header,msg,token}` byte shape vs the parser in
    `P2PMQTTServiceManager.handleMqttAnswer` and the `seydx/tuya-ipc-terminal` ref.
 5. **`imm_p2p_rtc_frame_t` + `thing_p2p_rtc_recv_frame` + `imm_p2p_rtc_frame_list_*`
    (ARQ)** — the AV frame container + reliability layer the Rust depacketizer reads
-   after SRTP. `imm_p2p_h264_packetize_nal_fua`/`_stapa` give the RTP/H.264 framing.
+   after KCP reassembly + per-segment AES-128-CBC decrypt + per-datagram HMAC-SHA1
+   verify (NOT SRTP — superseded by the v0.1.0-live-stream milestone /
+   `re/streaming_mode.md`). `imm_p2p_h264_packetize_nal_fua`/`_stapa` give the RTP/H.264 framing.
 6. **`Initialize` callback contract** (`on_msg` / `on_https` / `on_state` +
    `rtc_state`/`rtc_active_state_e`) — the state machine the Rust client must drive.
 

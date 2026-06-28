@@ -33,7 +33,22 @@ the cheaper path: the signaling is JSON over the device's existing MQTT channel
 mature Rust crates (`webrtc` a.k.a. webrtc-rs + `rumqttc`/`paho-mqtt`). Legacy
 PPCS would instead require reconstructing Tuya's proprietary AV framing over the
 TUTK IOTC session — strictly more work. See *Recommendation* for the crate map
-and the live-device caveats.
+and the live-device caveats. (Note — the `webrtc-rs` / "DTLS-SRTP WebRTC session"
+phrasing here applies ONLY to the signaling + ICE *shape*, not to the media
+transport: media uses the custom KCP + AES-128-CBC + HMAC-SHA1 framing, see the
+correction note below.)
+
+> **CORRECTION (Superseded 2026-06-28, v0.1.0-live-stream, commit fa930f0).** The
+> live milestone VALIDATED the 302-over-MQTT JSON signaling + ICE path end-to-end
+> against the real SCD921, but SUPERSEDED the *media-transport* assumption above:
+> the SCD921 media path is **NOT** DTLS-SRTP / SRTP. Media = Tuya's `imm`/`tuya`
+> KCP reliability layer carrying AES-128-CBC (inline-IV, PKCS7) per segment + a
+> 20-byte HMAC-SHA1(media_key16) tag per datagram, transporting H.264. Only the
+> 302/MQTT signaling and the ICE concepts carried over from the WebRTC mapping.
+> The mbedTLS DTLS-SRTP strings on the *Source A* line below ARE genuinely in the
+> lib, but they are NOT the SCD921 media path. Evidence: `re/media_decode_spec.md`,
+> `re/media_start_handshake.md`, `re/live_stream_run.md`. (confidence: confirmed —
+> live-validated keyframe decode.)
 
 ---
 
@@ -225,13 +240,21 @@ Why it is the cheaper path:
 - Signaling is plain JSON over an MQTT channel we already must implement for the
   control plane (`TUNIMQTTManager`, `re/js_bundle_map.md`); the only addition is
   the 302 message code + the `header.type` offer/answer/candidate envelope.
-- The media session is standard WebRTC (SDP, trickle-ICE, DTLS-SRTP, SRTP) — a
-  solved problem in Rust. PPCS would instead require reverse-engineering Tuya's
-  proprietary AV framing on top of the TUTK IOTC session (the harder, less
-  documented path; see TASK-0009/0010).
+- Signaling and ICE are WebRTC-shaped (SDP offer/answer + trickle-ICE), but the
+  media session is **not** standard WebRTC — corrected/confirmed-live
+  (Superseded 2026-06-28, v0.1.0-live-stream): the SCD921 media is Tuya's
+  `imm`/`tuya` transport — a KCP reliability layer with AES-128-CBC + HMAC-SHA1
+  per datagram, NOT SRTP / DTLS-SRTP. PPCS would instead require
+  reverse-engineering Tuya's proprietary AV framing on top of the TUTK IOTC
+  session (the harder, less documented path; see TASK-0009/0010).
 
 Rust crate map:
-- `webrtc` (webrtc-rs) — peer connection, SDP, ICE, DTLS-SRTP, SRTP depacketize.
+- `webrtc` (webrtc-rs) — covers the SDP / ICE *concepts* (offer/answer,
+  trickle-ICE) only; its DTLS-SRTP / SRTP-depacketize stack does NOT handle the
+  SCD921 media path (Superseded 2026-06-28, v0.1.0-live-stream). The real media
+  client implements a custom KCP layer + AES-128-CBC (inline-IV, PKCS7) +
+  HMAC-SHA1 verify + H.264 decode (as built in `stream_live.rs` / `kcp.rs` /
+  control), not SRTP depacketize.
 - `rumqttc` (or `paho-mqtt`) — the Tuya MQTT signaling client (publish/subscribe,
   message code 302, localKey-AES payload, `pv` protocol version).
 - H.264/H.265 decode: `openh264`/`ffmpeg`-backed crate (matches the device's
@@ -251,13 +274,19 @@ native signaling strings behind `re/symbols/libThingP2PSDK.dynsym.txt` and the
 device-config Java (the demo `CameraInfoBean` parsed in class `qpppdqb`,
 `decompiled/jadx/sources/com/thingclips/smart/camera/middleware/p2p/qpppdqb.java` ~:423).
 
+> **RESOLVED (2026-06-28, v0.1.0-live-stream, commit fa930f0).** The live milestone
+> answered this scope list end-to-end against the real SCD921 (keyframe decoded +
+> displayed). See `re/live_stream_run.md`, `re/media_start_handshake.md`,
+> `re/media_decode_spec.md`. Per-item status is annotated inline below.
+
 1. **Whether THIS firmware advertises `webrtc` in its `skill`.** The `p2pType`
    enum and `skill.webrtc` field are confirmed in code, but the only populated
    bean we can read statically is the SDK's hard-coded demo. The real SCD921
    cloud record's `p2pType`/`skill.webrtc`/`p2pPolicy` values must come from a
    live device-list/`obtainCameraConfig` call. (If the SCD921 returns
    `p2pType=2`, the recommendation flips to PPCS — this is the one hypothesis that
-   can be wrong.)
+   can be wrong.) (RESOLVED 2026-06-28, v0.1.0-live-stream: the live SCD921 returns
+   `p2pType=4` (THING/WebRTC), so the recommendation did NOT flip to PPCS.)
 2. **The exact 302 envelope on the wire** — field names confirmed from the
    parser, but the full offer/answer/candidate JSON and the `token` derivation
    need a capture to lock byte-exact.
@@ -265,9 +294,15 @@ device-config Java (the demo `CameraInfoBean` parsed in class `qpppdqb`,
    per-session by the cloud; not a static constant.
 4. **STUN/TURN server addresses** — fetched at runtime (the lib has the ICE
    machinery but the relay endpoints come from a cloud config call, not a static
-   string).
-5. **DTLS-SRTP cert/fingerprint exchange timing** — confirm the mbedTLS DTLS
-   handshake interleaves with signaling as expected.
+   string). (RESOLVED 2026-06-28, v0.1.0-live-stream: for the keyframe path the
+   client early-binds the media UDP socket and trickles its own host candidate —
+   no relay was required to reach the camera.)
+5. **Media encryption / transport framing** — RESOLVED differently than this item
+   originally assumed (Superseded 2026-06-28, v0.1.0-live-stream). The SCD921 media
+   path does **NOT** use DTLS-SRTP at all; media is AES-128-CBC (inline-IV, PKCS7)
+   per segment + a 20-byte HMAC-SHA1(media_key16) per datagram, carried over KCP.
+   The mbedTLS DTLS-SRTP strings in the lib are not the SCD921 media path. See
+   `re/media_decode_spec.md` / `re/media_start_handshake.md`.
 
 ---
 

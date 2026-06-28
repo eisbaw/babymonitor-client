@@ -115,7 +115,17 @@ pinned {confirmed|likely|speculative} set (no meaning change):
 - Cloud-brokered P2P streaming: **confidence: likely** — single architectural
   source (standard Tuya IPC pattern; `libThingP2PSDK.so` + MQTT signaling, see
   re/native_libs.md); to be cross-confirmed by JS + native analysis. (was "high".)
+  *Forward-pointer (v0.1.0-live-stream / TASK-0083):* the "to be cross-confirmed by
+  JS + native analysis" step has since been satisfied — a working self-contained live
+  client cross-confirms the cloud-brokered MQTT-302 signaling + ICE media path by
+  connecting to the real SCD921 and streaming. (Historical "likely (was high)" label
+  preserved; sustained continuous A/V is still unverified — see next bullet.)
 - Exact P2P wire format decodability from static analysis alone: **confidence:
   speculative** — not yet evidenced statically; the P2P feasibility verdict is
   deferred to the dedicated task (see re/review_gate_findings.md F3). (was
   "uncertain".)
+  *Forward-pointer (v0.1.0-live-stream / TASK-0083):* this "speculative / deferred"
+  verdict is now RESOLVED — the live Rust client decodes a real SCD921 1080p H.264
+  keyframe end-to-end (MQTT-302 -> ICE -> KCP + AES-128-CBC + HMAC-SHA1 -> H.264,
+  displayed in VLC). Keyframe path proven; sustained continuous A/V still unverified
+  (TASK-0085..0089).

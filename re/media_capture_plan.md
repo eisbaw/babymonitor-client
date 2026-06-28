@@ -8,6 +8,10 @@ decoder needs to be validated against:
    native stack produces, plus the AES cipher/mode that produced them.
 2. **Media ciphertext + transport** — the raw UDP/KCP datagrams of the media
    socket, to confirm the on-wire framing (DTLS-SRTP vs imm/AES).
+   *(RESOLVED 2026-06-28, v0.1.0-live-stream: this framing question is settled — the
+   A/V rides the **imm/AES/KCP** channel, AES-128-CBC with an inline 16-byte IV plus a
+   per-datagram HMAC trailer; **DTLS-SRTP is ruled out** for the media path. Original
+   text kept as historical context.)*
 
 This is the missing half of cap3: cap3 captured the WebRTC **signaling** plaintext
 + the per-session media key (`a=aes-key`); it did NOT capture the **media itself**
@@ -26,6 +30,23 @@ and `DECRYPT.md` §3.
 > runtime** from the SDP (reusing the cap3 B3/B5 signaling hooks) and uses it only
 > as an in-process filter. Keep all `cap4/` byte dumps under `secrets/` discipline
 > until reviewed; `just secret-scan` must stay green over tracked files.
+
+---
+
+> **RESOLVED — read this first (2026-06-28, milestone `v0.1.0-live-stream`, commit
+> `fa930f0`).** The media protocol this plan set out to determine is now **pinned and
+> live-validated** against the cap4 bytes by the self-contained Rust client. Ground
+> truth: media = **KCP** (conv `0`=control/auth, `1`=video, `2`=downstream audio) +
+> **AES-128-CBC** (cleartext **inline 16-byte IV**, PKCS#7) per KCP segment + a
+> **per-datagram HMAC trailer** over each media UDP datagram. It is the
+> **imm/`a=aes-key`** channel, **NOT DTLS-SRTP** — the DTLS-SRTP path is ruled out for
+> the A/V media. This plan is **retained as the capture methodology that produced
+> cap4**; its "cipher mode unknown / DTLS-SRTP vs imm/AES" framing below is now
+> **historical context**, kept for provenance. For the resolved, current spec see
+> `re/media_decode_spec.md` (cipher/HMAC suite) and `re/live_stream_run.md` (live
+> end-to-end run). Confidence on the resolution: **live-validated [confirmed]** for
+> the keyframe path; sustained/continuous A/V is **not yet verified** (see follow-up
+> tasks TASK-0085..0089).
 
 ---
 
@@ -49,6 +70,10 @@ even if one misses we still get ground truth:
   pair to KAT the Rust impl. This is the artifact that says "AES-128-CTR with this
   IV derivation" vs "ECB", which static RE could not pin (`re/webrtc_session.md`
   §9, residual #1/#5).
+  *(SUPERSEDED 2026-06-28, v0.1.0-live-stream: the mode is now pinned —
+  **AES-128-CBC** with a **cleartext inline 16-byte IV** (first 16 bytes of each KCP
+  segment payload) and **PKCS#7** padding; it is **not CTR and not ECB**. See
+  `re/media_decode_spec.md` §AES — live-validated three independent ways **[confirmed]**.)*
 - **C3 — ciphertext + transport.** A UDP pcap (tcpdump on the AVD) **and/or** a
   Frida `recvfrom`/`sendto` hook on the media fd, to capture the raw KCP/UDP
   datagrams, confirm DTLS-presence/absence, and tie the flow to the ICE candidate
@@ -75,7 +100,7 @@ of these **exported** routines (addresses are file offsets from the dynsym dump)
 | mbedTLS GCM | `mbedtls_gcm_auth_decrypt` / `mbedtls_gcm_update` | `0xb8110` / `0xb788c` | mode = GCM (tag + AAD) |
 | mbedTLS generic | `mbedtls_cipher_update` (+ `mbedtls_cipher_setkey`) | `0xa9eac` | catch-all if it routes via the generic cipher API |
 | key-set seams | `mbedtls_aes_setkey_enc` / `mbedtls_aes_setkey_dec` | `0x9e30c` / `0x9e8cc` | mbedTLS crypt fns take a *context*, not a raw key — hook setkey to learn **which ctx holds the SDP key**, then filter the crypt fns by ctx |
-| **libsrtp** | `srtp_cipher_decrypt` / `srtp_aes_decrypt` | `0xf327c` / `0xf5600` | the **standard SRTP tracks** — keyed by the **DTLS exporter, NOT the SDP key**. If the real A/V shows up here (and the SDP-key filter never fires on the imm path), that itself is the finding: media is on SRTP, not the imm channel. |
+| **libsrtp** | `srtp_cipher_decrypt` / `srtp_aes_decrypt` | `0xf327c` / `0xf5600` | the **standard SRTP tracks** — keyed by the **DTLS exporter, NOT the SDP key**. If the real A/V shows up here (and the SDP-key filter never fires on the imm path), that itself is the finding: media is on SRTP, not the imm channel. *(RESOLVED 2026-06-28, v0.1.0-live-stream: the answer is the **imm/AES/KCP** channel, so these SRTP hooks are **expected NOT to fire on the A/V path**. Kept as belt-and-suspenders.)* |
 
 `libThingCameraSDK.so` additionally bundles **full OpenSSL** (`EVP_DecryptInit_ex`,
 `EVP_DecryptUpdate`, `EVP_aes_128_{ecb,cbc,ctr,gcm}`, `AES_cbc_encrypt`,
@@ -294,8 +319,9 @@ function hookNative() {
   attach(P2P, 'mbedtls_gcm_update',    dumpCrypt('gcm', 0, 3, 4,  2, -1));   // gcm_update(ctx,len,in,out)/variant — verify arg order in re/ghidra if it fires
 
   /* ---- C2: libsrtp (standard SRTP tracks; DTLS-keyed, won't match SDP key) ---- */
-  // If THIS fires for the A/V and the SDP-key hooks never do, the media is on SRTP,
-  // not the imm/AES channel — that is itself the answer. Log boundaries only.
+  // RESOLVED (2026-06-28, v0.1.0-live-stream): the A/V is on the imm/AES/KCP channel,
+  // so this hook is EXPECTED NOT to fire on the A/V path. Kept as belt-and-suspenders;
+  // a fire here would be a surprise worth investigating, not the media path. Boundaries only.
   attach(P2P, 'srtp_cipher_decrypt', { onEnter() { emit('SRTP', '{"fired":1}'); } });
 
   /* ---- C2: OpenSSL EVP in libThingCameraSDK (belt-and-suspenders) ---- */
@@ -323,8 +349,10 @@ function hookNative() {
 
   /* ---- C3: media socket ciphertext (fallback to tcpdump) ---- */
   // Hook recvfrom/sendto; dump UDP datagrams. Tie to the flow by peer addr (the
-  // ICE candidate IPs from the live SDP; in cap3 these were host 10.0.2.15 and
-  // relay 135.125.246.223 — confirm from THIS session's SIG-in/out SDP candidates).
+  // ICE candidate IPs from the live SDP; in cap3 these were host 10.0.2.15 (the
+  // generic emulator NAT IP) and relay <TURN relay IP> — confirm from THIS session's
+  // SIG-in/out SDP candidates. ICE candidate addresses are session-sensitive; do not
+  // commit the real relay IP).
   ['recvfrom', 'sendto'].forEach((nm) => attach('libc.so', nm, {
     onEnter(a) { this.buf = a[1]; this.dir = nm; },
     onLeave(ret) { try { const n = ret.toInt32(); if (n <= 0 || n > 2000) return;
@@ -455,11 +483,26 @@ adb -s emulator-5554 shell "su -c 'rm -f /sdcard/cap4_media.pcap /data/data/com.
    recur. That `mode` + `ivPresent` is the recipe the Rust `media_decrypt` must
    implement. Validate offline: take an `AES` record's `(inOff,len)` ciphertext and
    `(outOff,len)` plaintext from `aes_pairs.bin` and confirm
-   `openssl enc -d -aes-128-<mode> -K <sdp_key_hex> [-iv <iv>] -nopad` reproduces the
-   plaintext. (Run this against the gitignored key under `secrets/`, never commit it.)
-   If **only `SRTP` fires** and the SDP-key AES hooks never match, the conclusion is:
-   the live A/V rides the **standard DTLS-SRTP tracks** (DTLS-exporter keyed), not the
-   imm/`a=aes-key` channel — update `re/webrtc_session.md` §9 residual #1 accordingly.
+   `openssl enc -d -aes-128-cbc -K <sdp_key_hex> -iv <inline_iv_hex> -nopad` reproduces
+   the plaintext, where `<inline_iv_hex>` is the **first 16 bytes of the KCP segment
+   payload** (the IV is transmitted inline, not derived). (Run this against the
+   gitignored key under `secrets/`, never commit it.)
+   *(RESOLVED 2026-06-28, v0.1.0-live-stream — known outcome: the mode is
+   **AES-128-CBC over KCP**, inline 16-byte IV + PKCS#7, on the imm/`a=aes-key`
+   channel; example shown above as `cbc` accordingly. The "only `SRTP` fires ⇒ media
+   on DTLS-SRTP" branch below is the **DISPROVEN** branch, retained for completeness.)*
+   **Caveat — this KAT validates only the inner cipher, not the datagram MAC.** Each
+   media UDP datagram carries a **per-datagram HMAC trailer** over the whole datagram
+   (ground truth: **20-byte HMAC-SHA1(`media_key16`)**, live-validated; note the static
+   spec in `re/media_decode_spec.md` describes a **32-byte HMAC-SHA256** trailer for
+   suite 3 — this byte-shape mismatch is an **open discrepancy to verify**, kept honest
+   here). The `openssl` AES check reproduces the plaintext but says **nothing** about
+   the HMAC; verify the trailer separately against the raw datagram bytes.
+   The (DISPROVEN) SRTP branch, for the record: if **only `SRTP` fired** and the
+   SDP-key AES hooks never matched, the conclusion would have been that the live A/V
+   rides the **standard DTLS-SRTP tracks** (DTLS-exporter keyed), not the
+   imm/`a=aes-key` channel — that branch did **not** hold (imm/AES confirmed); see
+   `re/webrtc_session.md` §9 residual #1.
 4. **Ciphertext + transport (C3).** `media.pcap` should show a high-rate UDP flow to
    one of the SDP ICE candidate IPs (host-LAN or the TURN relay). Confirm DTLS
    presence/absence:
@@ -468,6 +511,9 @@ adb -s emulator-5554 shell "su -c 'rm -f /sdcard/cap4_media.pcap /data/data/com.
    tshark -r emulator_captures/cap4/media.pcap -Y 'dtls'          # DTLS handshake? -> SRTP path
    ```
    No DTLS on the busy flow + a match in C2 ⇒ imm/AES media. DTLS present ⇒ SRTP.
+   *(RESOLVED 2026-06-28, v0.1.0-live-stream — known outcome: there is **no DTLS** on
+   the media flow; it is **imm/AES-128-CBC over KCP** (+ per-datagram HMAC trailer).
+   The "DTLS present ⇒ SRTP" arm is the **DISPROVEN** branch, retained for completeness.)*
 5. **End-to-end cross-validation (the whole point).** Pick one timestamp window:
    the C3 ciphertext datagram, decrypted with the K key under the C2 mode, must equal
    the C1 plaintext frame for the same `pts`. That triple agreement is the
@@ -482,6 +528,18 @@ adb -s emulator-5554 shell "su -c 'rm -f /sdcard/cap4_media.pcap /data/data/com.
   payload by construction — so you still get cleartext frames to validate the
   decoder. C2/C3 are what let you reimplement the *decrypt* rather than just
   observe the *result*.
+- **Transport: per-datagram HMAC trailer + inline-IV per-segment AES (RESOLVED
+  2026-06-28, v0.1.0-live-stream).** Each media UDP datagram carries a **per-datagram
+  HMAC trailer computed over the whole datagram** — ground truth from the live run is
+  a **20-byte HMAC-SHA1(`media_key16`)** trailer **[confirmed]**, while the static spec
+  in `re/media_decode_spec.md` describes a **32-byte HMAC-SHA256** trailer for suite 3;
+  that byte-shape mismatch is an **open discrepancy to verify** (keeping honesty
+  discipline — do not assume one over the other). AES is applied **per KCP segment**
+  with the **IV transmitted inline** (the first 16 bytes of each segment payload),
+  PKCS#7-padded. Consequence for this plan: the C2/C3 hooks and the `openssl` AES KAT
+  in success-check #3 capture/verify the **inner cipher only** — they say nothing about
+  the **datagram MAC**, so verify the HMAC trailer separately against the raw C3
+  datagram bytes or you will miss it entirely.
 - **The key rotates per connect.** Capture C1/C2/C3 in **one** continuous session;
   do not reconnect between starting the pcap and opening live view, or the
   `a=aes-key` in `media.pcap`'s session won't match the one the agent armed.

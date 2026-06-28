@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@myself'
 created_date: '2026-06-28 12:03'
-updated_date: '2026-06-28 15:38'
+updated_date: '2026-06-28 17:09'
 labels:
   - stream
   - media
@@ -112,4 +112,28 @@ LIVE A/B (the MEDIA_START_SN/UNA flip), with the inbound diag:
 CONCLUSION: the TX/KCP mechanism is correct (camera accepts our conv=0 PUSHes, una advances 0->3). The remaining gap is the CONTENT of the initial sn=0,1,2 PDUs. cap4's captured 28-byte PDUs (f253/254/255) are the sn=3,4,5 CONTINUATION; the true initial handshake (sn 0,1,2) is outside cap4's window and likely includes the imm auth step (SendAuthorizationInfo @ decompiled/ghidra_p2p/.../00147608: 104-byte, magic 0x12345678, code@4, username@8, password@0x28). We send the wrong (continuation) content as sn=0,1,2.
 
 NEXT (decision): (a) cap7 = capture a FRESH live-view from connection #1 (gets conv=0 sn=0,1,2 + the auth), or (b) RE the imm conv=0 control sender from the decompile to synthesize sn=0,1,2 (auth creds source = ?). Baseline set to config B (sn=0 = the live-correct sequencing).
+
+## Ghidra+smali RE: the auth PDU (sn=0) is FULLY GROUNDED — password source pinned
+
+decompile RE workflow (Ghidra over libThingP2PSDK, 4643 funcs) + smali of the jadx-undecompiled binder:
+- SendAuthorizationInfo @ ghidra_p2p/funcs/00147608: 104-byte PDU = magic 0x12345678 @0 | code(i32) @4 | username[31] @8 | password[63] @0x28; sealed suite-3 (AES-128-CBC + inline IV + 20B HMAC-SHA1) over conv=0 KCP, same path as the 28-byte PDUs (imm_p2p_rtc_send_data @00162da0 -> FUN_0016304c).
+- Java call site: com/thingclips/smart/p2p/pbbppqb.i():815 = sendAuthorizationInfo(handle, 0, 0, "admin", str, timeout). username="admin", code=0 CONFIRMED.
+- The password binder pbbppqb.j() FAILED jadx decompile; SMALI (smali_classes14/.../p2p/pbbppqb.smali:7212) reveals it does JSONObject.getString("password") on the camera-info bean (also reads "p2pConfig","skill"), then connectV3.
+- => auth password = camera-info "password" field = OUR rtc.config result.password (CONFIRMED present in secrets/tuya_rtc_config.json alongside p2pId/auth/skill). We HAVE every value.
+
+So sn=0 auth PDU is implementable with HIGH confidence: magic 0x12345678 | code=0 | "admin" | rtc.config.result.password.
+
+REMAINING GAP: conv=0 sn=1,2 (the 2 setup PDUs between auth and the cap4 28-byte PDUs at sn=3,4,5) - content still not pinned (native connectV3 internals / not in cap4). Next live experiment: send auth(sn=0) + the 3 known 28-byte PDUs at sn=1,2,3 (contiguous, no KCP gap) and see if the camera opens video; if it stalls, sn=1,2 needs the connectV3 conv=0 RE or cap7.
+
+## Live test WITH auth PDU: camera goes SILENT (auth value/sn=1,2 still needs cap7)
+
+open_media_start now emits 4 segments: auth(sn=0, 104B, magic 0x12345678 + "admin" + rtc.config.result.password) + the 3 28-byte PDUs(sn=1,2,3). All gates green (374 tests).
+
+LIVE RESULT: "media-start: sent 4 KCP control segments" -> ICE summary media_ok=0, NO inbound conv=0 from the camera at all (vs config B without auth = camera ACK'd una=3). So adding the sn=0 auth made the camera STOP responding entirely. Since the only change is sn=0 (28-byte PDU -> 104-byte auth), the camera rejected our auth and dropped the conv=0 channel.
+
+Most likely: the auth PASSWORD VALUE is wrong. The smali pinned the FIELD name (getString("password") on the camera-info bean) and we used rtc.config result.password, but the camera-info bean in the app comes from requestCameraInfo (a possibly-different API than rtc.config.get); the password may differ. Secondary: the real sequence needs the sn=1,2 SETUP PDUs (inside native connectV3, not in cap4), and our compressed auth+PDUs is malformed.
+
+STATIC RE IS EXHAUSTED for the final piece. We have (grounded): full signaling, ICE, the media-start KCP mechanism (camera accepts our sequencing), the auth PDU LAYOUT + username="admin" + the password FIELD name. NOT statically resolvable: the exact auth password VALUE binding (which JSON object) + the sn=1,2 setup content (native connectV3 internals).
+
+=> cap7 is now the surest unblock: capture a FRESH live-view from connection #1; decrypt conv=0 sn=0 (auth) with the session media key -> read the EXACT password value (compare to rtc.config.password to confirm/correct the source) AND read sn=1,2 setup. Then the replay is exact.
 <!-- SECTION:NOTES:END -->

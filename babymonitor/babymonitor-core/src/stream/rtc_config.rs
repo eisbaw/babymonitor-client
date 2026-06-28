@@ -80,6 +80,12 @@ pub struct RtcConfig {
     /// `result.skill` — the camera capability JSON **string** (e.g.
     /// `{"webrtc":3,…}`); fed to `connect_v2 skill`. `"{}"` if absent.
     pub skill: String,
+    /// `result.password` — the camera-info auth password the conv=0 media-start
+    /// AUTH PDU carries (`SendAuthorizationInfo`, username "admin";
+    /// `ghidra_p2p/funcs/00147608`, `re/media_start_handshake.md`). **SECRET** —
+    /// never logged (redacted from [`Debug`]). May be empty on a config that
+    /// returned none.
+    pub password: String,
     /// `p2pConfig.transmission` — the reliable-transport tag (`"kcp"` on the
     /// SCD921). Advisory; the media engine already pins KCP.
     pub transmission: String,
@@ -110,6 +116,9 @@ struct RawResult {
     /// `skill` is a JSON **string** on the wire.
     #[serde(default)]
     skill: String,
+    /// `result.password` — the camera-info auth password (top-level only).
+    #[serde(default)]
+    password: String,
     #[serde(rename = "p2pConfig", default)]
     p2p_config: Option<RawP2pConfig>,
 }
@@ -242,6 +251,7 @@ impl RtcConfig {
             } else {
                 raw.skill
             },
+            password: raw.password,
             transmission: p2p.transmission,
             tcp_relay_json,
             log_json,
@@ -274,6 +284,7 @@ impl std::fmt::Debug for RtcConfig {
             .field("ices_len", &self.ices_json.len())
             .field("session_present", &(self.session_json != "{}"))
             .field("has_auth", &!self.auth.is_empty())
+            .field("has_password", &!self.password.is_empty())
             .field("has_moto_id", &!self.moto_id.is_empty())
             .field("has_tcp_relay", &!self.tcp_relay_json.is_empty())
             .field("has_log", &!self.log_json.is_empty())
@@ -295,6 +306,7 @@ mod tests {
             "motoId": "signaling00000",
             "p2pType": 4,
             "auth": "U1lOVEhfQVVUSF9CNjQ=",
+            "password": "SYNTHpw0", // secret-scan:allow (synthetic test password)
             "skill": "{\"webrtc\":3,\"video_num\":3}",
             "p2pConfig": {
                 "ices": [
@@ -344,8 +356,10 @@ mod tests {
         assert_eq!(rc.moto_id, "signaling00000");
         assert_eq!(rc.transmission, "kcp");
         assert!(!rc.auth.is_empty());
-        // ices re-serialized to a compact JSON array that the signaling IceServer
-        // list can parse.
+        // result.password is surfaced verbatim (the conv=0 media-start AUTH pwd).
+        assert_eq!(rc.password, "SYNTHpw0"); // secret-scan:allow (synthetic test password)
+                                             // ices re-serialized to a compact JSON array that the signaling IceServer
+                                             // list can parse.
         let ices: Vec<crate::stream::signaling::IceServer> =
             serde_json::from_str(&rc.ices_json).unwrap();
         assert_eq!(ices.len(), 2);
@@ -431,5 +445,11 @@ mod tests {
             !dbg.contains("00112233445566778899aabbccddeeff"),
             "aesKey must be redacted"
         );
+        // The auth password value must never appear in Debug (only a presence flag).
+        assert!(
+            !dbg.contains("SYNTHpw0"), // secret-scan:allow (synthetic test password)
+            "password must be redacted"
+        );
+        assert!(dbg.contains("has_password: true"));
     }
 }

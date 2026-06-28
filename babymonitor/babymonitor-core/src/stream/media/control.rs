@@ -84,6 +84,77 @@ pub const PDU_F255: [u8; MEDIA_START_PDU_LEN] = [
 /// [`MEDIA_START_CONV`]. **Ground truth** (`re/media_start_handshake.md`).
 pub const MEDIA_START_PDUS: [[u8; MEDIA_START_PDU_LEN]; 3] = [PDU_F253, PDU_F254, PDU_F255];
 
+// ── The conv=0 media-start AUTH PDU (`SendAuthorizationInfo`, sn=0) ──────────
+//
+// The 104-byte `imm` authorization control message the app sends FIRST on conv=0
+// (KCP sn=0), before the three [`MEDIA_START_PDUS`] continuation PDUs. Ground
+// truth: `ThingSmartP2PSDK::SendAuthorizationInfo`
+// (`decompiled/ghidra_p2p/funcs/00147608_SendAuthorizationInfo.c`) builds a
+// 0x68 (=104)-byte little-endian struct and hands it to `imm_p2p_rtc_send_data`:
+//
+// ```text
+// @0    u32  magic    = 0x12345678   (local_c0)
+// @4    i32  code     = param_3      (iStack_bc; 0 on the media-start path)
+// @8    char[31]      = username     (strncpy(local_b8, param_4, 0x1f), NUL-padded)
+// @0x27 u8            = 0            (the NUL separator after the 31-byte username)
+// @0x28 char[63]      = password     (strncpy(local_b8+0x20, param_5, 0x3f), NUL-padded)
+// ```
+//
+// (`re/media_start_handshake.md`; smali `pbbppqb.j()` → `getString("password")`.)
+// `username` is the hardcoded constant `"admin"`; `password` is the camera-info
+// `password` field (`rtc.config result.password`). It is sealed identically to the
+// 28-byte PDUs (PKCS#7-pad 104→112 → AES-128-CBC seal → conv=0 KCP PUSH + HMAC).
+
+/// The constant `imm` marker at AUTH PDU offset 0 (little-endian `u32`; same value
+/// as the 28-byte control PDUs' [`MEDIA_START_MAGIC`]).
+pub const MEDIA_START_AUTH_MAGIC: u32 = 0x1234_5678;
+
+/// The `code` field (@4) of the AUTH PDU on the media-start path. `SendAuthorizationInfo`'s
+/// `param_3`; `0` for the media-start authorization.
+pub const MEDIA_START_AUTH_CODE: i32 = 0;
+
+/// The hardcoded `username` (@8) of the AUTH PDU (`SendAuthorizationInfo` `param_4`).
+pub const MEDIA_START_AUTH_USERNAME: &str = "admin";
+
+/// Length of the AUTH PDU, in bytes (`0x68` — the `imm_p2p_rtc_send_data` length arg).
+pub const MEDIA_START_AUTH_PDU_LEN: usize = 104;
+
+/// Byte offset of the `username` field within the AUTH PDU.
+const AUTH_USERNAME_OFF: usize = 8;
+/// Max `username` length (the `strncpy(.., 0x1f)` cap; one byte short of the
+/// 32-byte slot so the @0x27 NUL separator is always present).
+const AUTH_USERNAME_MAX: usize = 0x1f;
+/// Byte offset of the `password` field within the AUTH PDU (`local_b8 + 0x20`).
+const AUTH_PASSWORD_OFF: usize = 0x28;
+/// Max `password` length (the `strncpy(.., 0x3f)` cap).
+const AUTH_PASSWORD_MAX: usize = 0x3f;
+
+/// Build the 104-byte conv=0 media-start AUTH PDU (`SendAuthorizationInfo`).
+///
+/// Zero-fills the 104-byte buffer (so every unused byte — including the @0x27
+/// username/password separator and all NUL padding — is `0`, matching the native
+/// `local_b8[..] = '\0'` clears), then writes: the `0x12345678` magic LE @0, `code`
+/// LE @4, up to 31 `username` bytes @8 (`strncpy(.., 0x1f)`), and up to 63
+/// `password` bytes @0x28 (`strncpy(.., 0x3f)`). `username`/`password` longer than
+/// their slots are truncated exactly as `strncpy` truncates (no NUL terminator is
+/// then written, but the next field's offset is fixed, so this matches the native
+/// struct layout).
+#[must_use]
+pub fn build_auth_pdu(code: i32, username: &str, password: &str) -> [u8; MEDIA_START_AUTH_PDU_LEN] {
+    let mut p = [0u8; MEDIA_START_AUTH_PDU_LEN];
+    p[0..4].copy_from_slice(&MEDIA_START_AUTH_MAGIC.to_le_bytes());
+    p[4..8].copy_from_slice(&code.to_le_bytes());
+
+    let u = username.as_bytes();
+    let un = u.len().min(AUTH_USERNAME_MAX);
+    p[AUTH_USERNAME_OFF..AUTH_USERNAME_OFF + un].copy_from_slice(&u[..un]);
+
+    let pw = password.as_bytes();
+    let pn = pw.len().min(AUTH_PASSWORD_MAX);
+    p[AUTH_PASSWORD_OFF..AUTH_PASSWORD_OFF + pn].copy_from_slice(&pw[..pn]);
+    p
+}
+
 /// Build one `imm` control PDU from its three per-message fields (`@4`, `@12`,
 /// `@24`), with the constant `@0` magic / `@16` = 8 / `@8` = `@20` = 0 (the field
 /// layout documented in the module header). This only **documents** the structure
@@ -147,5 +218,69 @@ mod tests {
         assert_eq!(build_media_start_pdu(0x0001_0004, 9, 4), PDU_F253);
         assert_eq!(build_media_start_pdu(0x0001_0003, 6, 0), PDU_F254);
         assert_eq!(build_media_start_pdu(0x0001_0005, 0x0004_0006, 4), PDU_F255);
+    }
+
+    // ── The conv=0 media-start AUTH PDU (SendAuthorizationInfo) ──────────────
+    // The 104-byte struct: magic@0, code@4, username@8 (NUL-padded, NUL sep @0x27),
+    // password@0x28 (NUL-padded). Ground truth: ghidra_p2p/funcs/00147608.
+    #[test]
+    fn auth_pdu_has_magic_len_and_fields_at_the_right_offsets() {
+        // SYNTHETIC username/password (never a real credential — CLAUDE.md).
+        let pwd = "SynthAuthPwd"; // secret-scan:allow (synthetic test password)
+        let pdu = build_auth_pdu(MEDIA_START_AUTH_CODE, MEDIA_START_AUTH_USERNAME, pwd);
+
+        // Length is exactly 0x68 (the imm_p2p_rtc_send_data length arg).
+        assert_eq!(pdu.len(), MEDIA_START_AUTH_PDU_LEN);
+        assert_eq!(MEDIA_START_AUTH_PDU_LEN, 104);
+
+        // @0 magic 0x12345678 (little-endian).
+        assert_eq!(
+            u32::from_le_bytes([pdu[0], pdu[1], pdu[2], pdu[3]]),
+            MEDIA_START_AUTH_MAGIC
+        );
+        assert_eq!(MEDIA_START_AUTH_MAGIC, 0x1234_5678);
+
+        // @4 code (little-endian i32).
+        assert_eq!(
+            i32::from_le_bytes([pdu[4], pdu[5], pdu[6], pdu[7]]),
+            MEDIA_START_AUTH_CODE
+        );
+
+        // @8 username round-trips (NUL-terminated within its 31-byte slot), and the
+        // @0x27 separator is the NUL that bounds it.
+        assert_eq!(&pdu[8..8 + MEDIA_START_AUTH_USERNAME.len()], b"admin");
+        assert_eq!(pdu[8 + MEDIA_START_AUTH_USERNAME.len()], 0);
+        assert_eq!(pdu[0x27], 0, "the username/password separator is NUL");
+
+        // @0x28 password round-trips.
+        assert_eq!(&pdu[0x28..0x28 + pwd.len()], pwd.as_bytes());
+        assert_eq!(pdu[0x28 + pwd.len()], 0, "password is NUL-padded");
+
+        // Every byte not covered by a written field is zero (the native clears).
+        for (i, &b) in pdu.iter().enumerate() {
+            let in_magic = i < 4;
+            let in_code = (4..8).contains(&i);
+            let in_user = (8..8 + MEDIA_START_AUTH_USERNAME.len()).contains(&i);
+            let in_pass = (0x28..0x28 + pwd.len()).contains(&i);
+            if !(in_magic || in_code || in_user || in_pass) {
+                assert_eq!(b, 0, "byte @{i:#x} must be zero-filled");
+            }
+        }
+    }
+
+    // strncpy truncation: an over-long username (>31) / password (>63) is cut to its
+    // slot, never overrunning into the next field or past the 104-byte struct.
+    #[test]
+    fn auth_pdu_truncates_overlong_fields_to_their_slots() {
+        let long_user = "u".repeat(40); // > 0x1f
+        let long_pass = "p".repeat(80); // > 0x3f  // secret-scan:allow (synthetic)
+        let pdu = build_auth_pdu(0, &long_user, &long_pass);
+        // Username is capped at its 31-byte slot (offsets 8..8+0x1f); the @0x27
+        // separator and the password field (0x28..0x28+0x3f) are never overrun.
+        assert_eq!(&pdu[8..8 + 0x1f], &b"u".repeat(0x1f)[..]);
+        assert_eq!(pdu[0x27], 0, "username truncation leaves the NUL separator");
+        assert_eq!(&pdu[0x28..0x28 + 0x3f], &b"p".repeat(0x3f)[..]);
+        // The struct is still exactly 104 bytes (no overrun).
+        assert_eq!(pdu.len(), 104);
     }
 }

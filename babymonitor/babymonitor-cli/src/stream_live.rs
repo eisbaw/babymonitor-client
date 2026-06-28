@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 
 use babymonitor_core::session::{Session, SessionStore};
 use babymonitor_core::stream::media::audio;
+use babymonitor_core::stream::media::control::MEDIA_START_AUTH_USERNAME;
 use babymonitor_core::stream::media::h264::H264Depacketizer;
 use babymonitor_core::stream::media::stun::{self, IceRole};
 use babymonitor_core::stream::media::transport::{
@@ -168,6 +169,11 @@ struct CameraInputs {
     /// `msg.log`. Empty/absent ⇒ the offer omits it. (TASK-0080)
     #[serde(default)]
     log: String,
+    /// `rtc.config result.password` — the conv=0 media-start AUTH password
+    /// (`SendAuthorizationInfo`, username "admin"). Empty/absent ⇒ no auth PDU is
+    /// sent. **SECRET** — never logged.
+    #[serde(default)]
+    media_auth_password: String,
 }
 
 #[derive(Deserialize)]
@@ -320,6 +326,26 @@ pub fn run_live_stream(args: &StreamArgs) -> Result<(), Error> {
     // Suite 3 (AES-128-CBC + 20B HMAC-SHA1) is the cap3/cap4-observed default; the
     // negotiated security_level rides the answer header (cap4 == 3).
     let mut engine = MediaEngine::from_security_level(3, answer.media_key.clone())?;
+    // The conv=0 media-start AUTH PDU (`SendAuthorizationInfo`, KCP sn=0): username
+    // is the constant "admin", password is the camera-info `password`
+    // (rtc.config result.password). Set it ONLY when present — a config without it
+    // falls back to the legacy 3-PDU media-start rather than sending an
+    // empty-password AUTH. The password is SECRET and never logged.
+    if creds.media_auth_password.is_empty() {
+        eprintln!(
+            "stream (live): no camera-info password (rtc.config result.password) — sending the \
+             media-start WITHOUT the conv=0 AUTH PDU (legacy 3-PDU path)."
+        );
+    } else {
+        engine.set_media_auth(
+            MEDIA_START_AUTH_USERNAME.to_string(),
+            creds.media_auth_password.clone(),
+        );
+        eprintln!(
+            "stream (live): conv=0 media-start AUTH armed (username=\"{MEDIA_START_AUTH_USERNAME}\", \
+             password redacted)."
+        );
+    }
     // The consent/keepalive + nomination context: retransmit our nominating check
     // (RFC 5389 backoff) until validated, refresh consent ~every 5 s, and answer the
     // camera's inbound checks so neither side's consent-to-send expires mid-stream.
@@ -457,6 +483,7 @@ fn build_stream_credentials(runtime: &StreamRuntime) -> StreamCredentials {
         log: runtime.camera.log.clone(),
         local_key: runtime.device.local_key.clone(),
         pv: runtime.device.pv.clone(),
+        media_auth_password: runtime.camera.media_auth_password.clone(),
     }
 }
 
@@ -954,10 +981,11 @@ impl MediaStartState {
 }
 
 /// Emit the client-initiated media-start handshake on the connected media socket:
-/// mint three fresh inline IVs + a KCP millisecond timestamp, frame the cap4 conv=0
-/// control PDUs ([`MediaEngine::open_media_start`]), and `try_send` each. Returns
-/// the count sent (3) for the log line. `try_send` tolerates the transient ICE
-/// `ConnectionRefused`/`WouldBlock` exactly as the nomination path does.
+/// mint four fresh inline IVs + a KCP millisecond timestamp, frame the conv=0
+/// control PDUs ([`MediaEngine::open_media_start`]) — the AUTH PDU (sn=0) when
+/// armed plus the three cap4 continuation PDUs — and `try_send` each. Returns the
+/// count sent (4 with auth, 3 without) for the log line. `try_send` tolerates the
+/// transient ICE `ConnectionRefused`/`WouldBlock` exactly as the nomination path does.
 ///
 /// # Errors
 /// - [`Error`] from the random source or [`MediaEngine::open_media_start`]
@@ -966,7 +994,10 @@ fn send_media_start(
     engine: &mut MediaEngine,
     transport: &mtransport::UdpMediaTransport,
 ) -> Result<usize, Error> {
-    let mut ivs = [[0u8; 16]; 3];
+    // Four fresh inline IVs: one for the optional AUTH PDU (sn=0) + three for the
+    // continuation PDUs. `open_media_start` consumes only as many as it emits
+    // (4 with auth, 3 without).
+    let mut ivs = [[0u8; 16]; 4];
     for iv in &mut ivs {
         OsRandom.fill(iv)?;
     }
@@ -1340,6 +1371,7 @@ fn assemble_runtime(
             skill: rtc.skill.clone(),
             tcp_relay: rtc.tcp_relay_json.clone(),
             log: rtc.log_json.clone(),
+            media_auth_password: rtc.password.clone(),
         },
         mqtt: MqttInputs {
             token: session.sid.clone(), // MqttConnectConfig.token = User.sid
@@ -1650,6 +1682,7 @@ mod tests {
             "motoId": "signaling00000",
             "p2pType": 4,
             "auth": "U1lOVEhfQVVUSF9CNjQ9",
+            "password": "SYNTHpw1", // secret-scan:allow (synthetic test password)
             "skill": "{\"webrtc\":3}",
             "p2pConfig": {
                 "ices": [{"urls": "stun:1.2.3.4:3478"}],
@@ -1706,6 +1739,9 @@ mod tests {
         assert_eq!(rt.camera.p2p_id, "eu0000000000000synth");
         assert_eq!(rt.camera.token, "U1lOVEhfQVVUSF9CNjQ9");
         assert!(rt.camera.p2p_key.is_empty());
+        // The rtc.config result.password is threaded into the camera bundle (the
+        // conv=0 media-start AUTH password).
+        assert_eq!(rt.camera.media_auth_password, "SYNTHpw1"); // secret-scan:allow (synthetic)
         let ices: Vec<babymonitor_core::stream::signaling::IceServer> =
             serde_json::from_str(&rt.camera.ices).unwrap();
         assert_eq!(ices.len(), 1);
@@ -1715,9 +1751,11 @@ mod tests {
         assert_eq!(rt.mqtt.app_id, "synthAppKey");
         assert_eq!(rt.mqtt.ch_key, "0a1b2c3d");
 
-        // The assembled bundle is a valid set of stream credentials.
+        // The assembled bundle is a valid set of stream credentials, and the auth
+        // password flows on into the StreamCredentials field.
         let creds = build_stream_credentials(&rt);
         assert!(creds.validate().is_ok());
+        assert_eq!(creds.media_auth_password, "SYNTHpw1"); // secret-scan:allow (synthetic)
     }
 
     #[test]

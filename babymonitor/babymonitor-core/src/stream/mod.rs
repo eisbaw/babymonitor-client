@@ -135,6 +135,11 @@ pub struct StreamCredentials {
     pub local_key: String,
     /// Protocol version (`DeviceBean.pv`) — the `pv` arg of the MQTT publish.
     pub pv: String,
+    /// The camera-info `password` (`rtc.config result.password`) — the password
+    /// field of the conv=0 media-start AUTH PDU (`SendAuthorizationInfo`, username
+    /// `"admin"`). `""` if the cloud returned none (then no auth PDU is sent).
+    /// **SECRET** — never logged.
+    pub media_auth_password: String,
 }
 
 impl StreamCredentials {
@@ -177,6 +182,10 @@ impl std::fmt::Debug for StreamCredentials {
             .field("log", &dbg_secret(&self.log))
             .field("local_key", &dbg_secret(&self.local_key))
             .field("pv", &self.pv)
+            .field(
+                "media_auth_password",
+                &dbg_secret(&self.media_auth_password),
+            )
             .finish()
     }
 }
@@ -201,6 +210,7 @@ pub(crate) mod test_support {
             // 16 bytes of synthetic key material (AES-128 sized).
             local_key: "0123456789abcdef".into(), // secret-scan:allow (synthetic test value)
             pv: "2.2".into(),
+            media_auth_password: "SynthAuthPwd".into(), // secret-scan:allow (synthetic test pwd)
         }
     }
 }
@@ -237,6 +247,10 @@ mod tests {
         assert!(!dbg.contains("SYNTH_TOKEN_0000"));
         assert!(!dbg.contains("SYNTH_P2PKEY_0000"));
         assert!(!dbg.contains("0123456789abcdef"));
+        assert!(
+            !dbg.contains("SynthAuthPwd"),
+            "auth password must be redacted"
+        );
         // Non-secret fields (skill JSON, pv) are fine to show.
         assert!(dbg.contains("pv"));
     }

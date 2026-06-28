@@ -175,6 +175,7 @@ fn live_webrtc_session_renders_first_frame() {
         log: String::new(),
         local_key: "0123456789abcdef".into(), // secret-scan:allow (synthetic test value)
         pv: "2.2".into(),
+        media_auth_password: "SYNTH_AUTH_PWD".into(), // secret-scan:allow (synthetic test pwd)
     };
 
     let mut transport = UnreachableTransport;

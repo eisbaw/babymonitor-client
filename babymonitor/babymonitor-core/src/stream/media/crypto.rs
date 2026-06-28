@@ -51,6 +51,58 @@ pub const MEDIA_KEY_LEN: usize = 16;
 
 /// AES-128-CBC decryptor type alias (RustCrypto `cbc` over `aes`).
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
+/// AES-128-CBC encryptor type alias (the TX direction, inverse of the RX decrypt).
+type Aes128CbcEnc = cbc::Encryptor<Aes128>;
+
+/// TX (suite 3): PKCS#7-pad `plaintext`, AES-128-CBC-encrypt under `key16`+`iv`,
+/// and return the KCP segment payload `[IV 16B | ciphertext]` — the **exact inverse
+/// of [`decrypt_segment_cbc`]** (round-trip KAT'd). This is what a client-initiated
+/// KCP PUSH carries on the conv=0 control channel (cap4 frames 253–255).
+///
+/// # Errors
+/// [`Error::Transport`] if `key16` is not [`MEDIA_KEY_LEN`] bytes.
+pub fn seal_segment_cbc(
+    plaintext: &[u8],
+    key16: &[u8],
+    iv: &[u8; IV_LEN],
+) -> Result<Vec<u8>, Error> {
+    use aes::cipher::BlockEncryptMut;
+    let pad = AES_BLOCK - (plaintext.len() % AES_BLOCK);
+    let mut buf = Vec::with_capacity(plaintext.len() + pad);
+    buf.extend_from_slice(plaintext);
+    buf.extend(std::iter::repeat(pad as u8).take(pad));
+    let mut enc = Aes128CbcEnc::new_from_slices(key16, iv).map_err(|_| {
+        Error::Transport(format!(
+            "AES-128-CBC init failed: key is {} bytes (expected {MEDIA_KEY_LEN})",
+            key16.len()
+        ))
+    })?;
+    for block in buf.chunks_mut(AES_BLOCK) {
+        enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
+    }
+    let mut out = Vec::with_capacity(IV_LEN + buf.len());
+    out.extend_from_slice(iv);
+    out.extend_from_slice(&buf);
+    Ok(out)
+}
+
+/// TX (suite 3): append the trailing 20-byte `HMAC-SHA1(key16, body)` datagram tag
+/// — the inverse of [`verify_and_strip_hmac`]. `body` = the framed KCP datagram
+/// (header + segment payload); the result is the on-wire UDP payload.
+///
+/// # Errors
+/// [`Error::Transport`] if `key16` is rejected by HMAC init (any length is accepted
+/// by HMAC, so this effectively never errors, but the signature stays uniform).
+pub fn append_datagram_hmac(body: &[u8], key16: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(key16)
+        .map_err(|e| Error::Transport(format!("HMAC-SHA1 init: {e}")))?;
+    mac.update(body);
+    let tag = mac.finalize().into_bytes();
+    let mut out = Vec::with_capacity(body.len() + HMAC_TAG_LEN);
+    out.extend_from_slice(body);
+    out.extend_from_slice(&tag);
+    Ok(out)
+}
 
 /// Verify and strip the trailing 20-byte `HMAC-SHA1` tag from a suite-3 media
 /// datagram, returning the integrity-checked body (KCP header + IV + ciphertext)
@@ -356,6 +408,25 @@ mod tests {
             matches!(r, Err(Error::Transport(_))),
             "wrong key must fail, got {r:?}"
         );
+    }
+
+    // TASK-0083 §S6b: the PUBLIC `seal_segment_cbc` (the TX inverse used by the
+    // media-start path) round-trips a 28-byte imm control PDU through
+    // `decrypt_segment_cbc`. 28 bytes → 4 bytes PKCS#7 pad → 32B ciphertext, so the
+    // sealed segment is IV(16) + 32 = 48 bytes (the on-wire media-start payload len).
+    #[test]
+    fn seal_segment_cbc_is_exact_inverse_for_a_28b_pdu() {
+        // Shape-only stand-in for an imm control PDU (28 bytes); the round-trip is
+        // key/IV-agnostic, so a synthetic pattern suffices.
+        let pdu: Vec<u8> = (0..28u8).collect();
+        let seg = seal_segment_cbc(&pdu, KEY, IV).unwrap();
+        assert_eq!(
+            seg.len(),
+            IV_LEN + 32,
+            "16B IV + 32B CBC of the padded 28B PDU"
+        );
+        assert_eq!(&seg[..IV_LEN], IV, "the inline IV is the cleartext prefix");
+        assert_eq!(decrypt_segment_cbc(&seg, KEY).unwrap(), pdu);
     }
 
     // NEGATIVE: a non-block-aligned ciphertext is rejected (the `&0xf` guard).

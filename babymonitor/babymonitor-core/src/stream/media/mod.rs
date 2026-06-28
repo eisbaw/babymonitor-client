@@ -42,6 +42,7 @@
 //!   20-byte HMAC-SHA1 trailer that corrected the spec's 32-byte HMAC-SHA256).
 
 pub mod audio;
+pub mod control;
 pub mod crypto;
 pub mod frame;
 pub mod g711;
@@ -53,8 +54,22 @@ pub mod transport;
 
 use std::collections::HashMap;
 
-use crate::stream::media::kcp::{KcpReceiver, SegmentDecryptor};
+use crate::stream::media::kcp::{KcpReceiver, KcpSender, SegmentDecryptor};
 use crate::Error;
+
+/// The first `sn` our conv=0 control **send** stream assigns. **Live-pinned to `0`**:
+/// a fresh single-path session starts KCP at 0, and the camera confirmed it — with
+/// `0` the camera's conv=0 ACK advanced `una` to 3 (it received our sn=0,1,2),
+/// whereas with `3` (cap4's continuation value) the camera replied `una = 0` and
+/// buffered our out-of-order PUSHes forever. (cap4's app starts at `sn = 3` because
+/// its sn=0,1,2 were exchanged on an earlier path outside the capture window — see
+/// `re/media_start_handshake.md`.) Named so the A/B is a one-line flip.
+pub const MEDIA_START_SN: u32 = 0;
+
+/// The `una` our conv=0 control PUSHes advertise (= our `rcv_nxt` for the camera's
+/// conv=0 send stream at open). Coupled to [`MEDIA_START_SN`]: **live-pinned to `0`**
+/// (fresh session — we have received none of the camera's conv=0 segments yet).
+pub const MEDIA_START_UNA: u32 = 0;
 
 /// The negotiated media cipher suite — selected by `security_level`
 /// (`session+0x3274`; `re/media_decode_spec.md` §2). The cap3 default is
@@ -187,6 +202,23 @@ pub struct MediaEngine {
     media_key: Vec<u8>,
     channels: HashMap<u32, KcpReceiver>,
     rcv_wnd: u32,
+    /// The conv=0 control **send** stream (the client-initiated media-start, §S4 /
+    /// `re/media_start_handshake.md`): assigns ascending `sn` from
+    /// [`MEDIA_START_SN`], holds the sealed wire datagrams for retransmit, and
+    /// prunes them when the camera's `una` advances.
+    media_start_sender: KcpSender,
+    /// Our `rcv_nxt` for the camera's conv=0 **send** stream — seeded to
+    /// [`MEDIA_START_UNA`] (the `una` we advertise at open), advanced as we receive
+    /// the camera's conv=0 PUSH segments. Out-of-order conv=0 PUSHes are held in
+    /// [`conv0_rcv_buf`](Self::conv0_rcv_buf) until contiguous.
+    conv0_rcv_nxt: u32,
+    /// Out-of-order camera conv=0 PUSH `sn`s awaiting a contiguous predecessor.
+    conv0_rcv_buf: Vec<u32>,
+    /// The most recent camera conv=0 `una` observed in
+    /// [`push_datagram`](Self::push_datagram), surfaced to the pump (which feeds it
+    /// to [`on_peer_una_conv0`](Self::on_peer_una_conv0) to prune our sender).
+    /// `None` once taken.
+    conv0_peer_una: Option<u32>,
 }
 
 impl std::fmt::Debug for MediaEngine {
@@ -226,6 +258,10 @@ impl MediaEngine {
             media_key,
             channels: HashMap::new(),
             rcv_wnd: kcp::DEFAULT_RCV_WND,
+            media_start_sender: KcpSender::new(control::MEDIA_START_CONV, MEDIA_START_SN),
+            conv0_rcv_nxt: MEDIA_START_UNA,
+            conv0_rcv_buf: Vec::new(),
+            conv0_peer_una: None,
         })
     }
 
@@ -309,6 +345,18 @@ impl MediaEngine {
         if conv == kcp::CONTROL_CONV {
             return Ok(Vec::new());
         }
+        // conv=0 is the imm media-start control channel (TASK-0083), a SUITE-3
+        // concept (cap4). It carries no RTP media — yield no MediaUnit — but observe
+        // the camera's ACK cursor + PUSH `sn` so the engine can prune our media-start
+        // sender and advance our conv=0 `rcv_nxt`. Decryption of the control PDU
+        // plaintext is NOT needed for the TX/ACK path, so we only peek the KCP
+        // headers (the datagram-level HMAC already authenticated this body). Scoped
+        // to suite 3 so RX behavior is unchanged for every other suite (e.g. a
+        // non-suite-3 conv=0 datagram still reaches the suite dispatch below).
+        if conv == control::MEDIA_START_CONV && self.suite == CipherSuite::AesCbcHmac {
+            self.observe_conv0(body);
+            return Ok(Vec::new());
+        }
 
         // 3/4. Feed KCP with the per-segment decrypt hook for this suite.
         let rcv_wnd = self.rcv_wnd;
@@ -340,6 +388,184 @@ impl MediaEngine {
             }
         }
         Ok(units)
+    }
+
+    /// **TX (TASK-0083): open the client-initiated media-start handshake.** Seal
+    /// the three cap4 [`control::MEDIA_START_PDUS`] under this session's suite-3
+    /// key and frame each as a conv=0 KCP PUSH, returning the three on-wire UDP
+    /// datagrams to send (in order). Each is recorded for retransmit
+    /// ([`media_start_retransmits`](Self::media_start_retransmits)) until the
+    /// camera acks it.
+    ///
+    /// Each datagram is `append_datagram_hmac( encode_segment(conv=0, PUSH, frg=0,
+    /// wnd=SND_WND, ts, sn, una, seal_segment_cbc(PDU, key, iv)) )`, where `sn`
+    /// ascends from [`MEDIA_START_SN`] and `una` is our conv=0 `rcv_nxt`
+    /// ([`MEDIA_START_UNA`] at open). On-wire size per datagram: `24` (KCP header)
+    /// `+ 48` (16B inline IV + 32B CBC of the 28B PDU) `+ 20` (HMAC-SHA1) = **92**.
+    ///
+    /// `ivs` are the three per-segment inline IVs (caller-supplied so the bytes are
+    /// reproducible in tests; production passes fresh OS entropy). `ts` is the KCP
+    /// millisecond timestamp (caller-owned clock — keeps this offline-testable).
+    ///
+    /// # Errors
+    /// - [`Error::Transport`] if this engine is not suite 3 ([`CipherSuite::AesCbcHmac`]):
+    ///   the media-start handshake is only cap4-proven for suite 3 (AES-128-CBC +
+    ///   20B HMAC-SHA1); we refuse to fabricate it for another suite.
+    /// - Propagated [`crypto::seal_segment_cbc`] / [`crypto::append_datagram_hmac`]
+    ///   errors (e.g. a wrong-length key — already rejected at construction).
+    pub fn open_media_start(
+        &mut self,
+        ivs: &[[u8; crypto::IV_LEN]; 3],
+        ts: u32,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        if self.suite != CipherSuite::AesCbcHmac {
+            return Err(Error::Transport(format!(
+                "media-start handshake is only implemented for suite 3 (AES-128-CBC + HMAC-SHA1, \
+                 the cap4-proven default); this engine is {:?}. A non-suite-3 control framing is \
+                 unconfirmed [G] and not fabricated.",
+                self.suite
+            )));
+        }
+        let key = self.media_key.clone();
+        let una = self.conv0_rcv_nxt;
+        let mut out = Vec::with_capacity(control::MEDIA_START_PDUS.len());
+        for (pdu, iv) in control::MEDIA_START_PDUS.iter().zip(ivs.iter()) {
+            let seg_payload = crypto::seal_segment_cbc(pdu, &key, iv)?;
+            let sn = self.media_start_sender.take_sn();
+            let seg = kcp::encode_segment(
+                control::MEDIA_START_CONV,
+                kcp::IKCP_CMD_PUSH,
+                0, // frg: each 28B PDU is one un-fragmented message
+                kcp::SND_WND,
+                ts,
+                sn,
+                una,
+                &seg_payload,
+            );
+            let wire = crypto::append_datagram_hmac(&seg, &key)?;
+            self.media_start_sender.record_unacked(sn, wire.clone());
+            out.push(wire);
+        }
+        Ok(out)
+    }
+
+    /// **TX: prune the media-start sender** for everything the camera has cumulatively
+    /// acknowledged (`sn < una`) — the camera's conv=0 `una` advancing past our
+    /// `sn = 3,4,5` (cap4 frame 256: `una = 6`) means the handshake landed.
+    pub fn on_peer_una_conv0(&mut self, una: u32) {
+        self.media_start_sender.ack_through(una);
+    }
+
+    /// **TX: the still-unacknowledged media-start datagrams** to retransmit (a clone
+    /// of the sender's unacked wire bytes; the originals stay recorded so a later
+    /// `una` still prunes them). Empty once the camera acks all three.
+    #[must_use]
+    pub fn media_start_retransmits(&self) -> Vec<Vec<u8>> {
+        self.media_start_sender
+            .unacked()
+            .map(<[u8]>::to_vec)
+            .collect()
+    }
+
+    /// Whether every media-start PUSH has been acknowledged by the camera.
+    #[must_use]
+    pub fn media_start_acked(&self) -> bool {
+        self.media_start_sender.is_drained()
+    }
+
+    /// **TX: drain pending KCP ACKs for the camera's received media segments** and
+    /// frame them as wire ACK datagrams (`cmd=0x52`, `sn`=acked, `ts` echoed,
+    /// `una`=our `rcv_nxt`, `len=0`, + 20B HMAC-SHA1). The camera's KCP send window
+    /// only advances on these — without ACKs it streams its initial window then
+    /// stalls (cap4: the app sends ~785 packets back, mostly ACKs). The pump sends
+    /// these after every received datagram. Suite-3 only (the cap4-proven framing).
+    ///
+    /// # Errors
+    /// [`Error::Transport`] if the HMAC framing fails.
+    pub fn drain_media_acks(&mut self) -> Result<Vec<Vec<u8>>, Error> {
+        if self.suite != CipherSuite::AesCbcHmac {
+            return Ok(Vec::new());
+        }
+        let key = self.media_key.clone();
+        let mut out = Vec::new();
+        for (&conv, chan) in &mut self.channels {
+            let una = chan.rcv_nxt();
+            for (sn, ts) in chan.drain_acks() {
+                let seg =
+                    kcp::encode_segment(conv, kcp::IKCP_CMD_ACK, 0, kcp::SND_WND, ts, sn, una, &[]);
+                out.push(crypto::append_datagram_hmac(&seg, &key)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Take + clear the most recent camera conv=0 `una` observed in
+    /// [`push_datagram`](Self::push_datagram). The pump calls this after each
+    /// datagram and, on `Some`, feeds it to
+    /// [`on_peer_una_conv0`](Self::on_peer_una_conv0) to prune the sender. Pure RX
+    /// surfacing — it does not itself mutate the TX sender.
+    pub fn take_conv0_peer_una(&mut self) -> Option<u32> {
+        self.conv0_peer_una.take()
+    }
+
+    /// Our current conv=0 `rcv_nxt` (the `una` we advertise on media-start PUSHes) —
+    /// exposed for tests / diagnostics.
+    #[must_use]
+    pub fn conv0_rcv_nxt(&self) -> u32 {
+        self.conv0_rcv_nxt
+    }
+
+    /// Observe a camera conv=0 datagram body (KCP header(s), HMAC already stripped):
+    /// record its max `una` (surfaced via [`take_conv0_peer_una`](Self::take_conv0_peer_una))
+    /// and advance our conv=0 `rcv_nxt` over its contiguous PUSH `sn`s. Header-only
+    /// peek — the control PDU plaintext is not needed here. Tolerant of a malformed
+    /// trailing header (stops scanning) since the body is already HMAC-authenticated.
+    fn observe_conv0(&mut self, body: &[u8]) {
+        let mut max_una: Option<u32> = None;
+        let mut rest = body;
+        while rest.len() >= kcp::IKCP_OVERHEAD {
+            let cmd = rest[4];
+            let sn = u32::from_le_bytes([rest[12], rest[13], rest[14], rest[15]]);
+            let una = u32::from_le_bytes([rest[16], rest[17], rest[18], rest[19]]);
+            let len = u32::from_le_bytes([rest[20], rest[21], rest[22], rest[23]]) as usize;
+            max_una = Some(max_una.map_or(una, |m| m.max(una)));
+            if cmd == kcp::IKCP_CMD_PUSH {
+                self.advance_conv0_rcv(sn);
+            }
+            let next = kcp::IKCP_OVERHEAD + len;
+            if rest.len() < next {
+                break; // malformed trailing header (post-HMAC: shouldn't happen)
+            }
+            rest = &rest[next..];
+        }
+        if let Some(u) = max_una {
+            // `una` is cumulative (monotonic); keep the max across not-yet-taken
+            // datagrams so an older retransmit cannot regress the surfaced value.
+            self.conv0_peer_una = Some(self.conv0_peer_una.map_or(u, |p| p.max(u)));
+        }
+    }
+
+    /// Advance our conv=0 `rcv_nxt` over a received camera PUSH `sn`, buffering any
+    /// out-of-order `sn` until its predecessors arrive (mirrors KCP `rcv_nxt`).
+    fn advance_conv0_rcv(&mut self, sn: u32) {
+        // Drop stale / out-of-window sn (the wrapping fold matches KcpReceiver).
+        if sn.wrapping_sub(self.conv0_rcv_nxt) >= kcp::DEFAULT_RCV_WND {
+            return;
+        }
+        if sn == self.conv0_rcv_nxt {
+            self.conv0_rcv_nxt = self.conv0_rcv_nxt.wrapping_add(1);
+            // Drain any now-contiguous buffered sn.
+            while let Some(pos) = self
+                .conv0_rcv_buf
+                .iter()
+                .position(|&s| s == self.conv0_rcv_nxt)
+            {
+                self.conv0_rcv_buf.swap_remove(pos);
+                self.conv0_rcv_nxt = self.conv0_rcv_nxt.wrapping_add(1);
+            }
+        } else if !self.conv0_rcv_buf.contains(&sn) {
+            self.conv0_rcv_buf.push(sn);
+        }
     }
 }
 
@@ -689,5 +915,114 @@ mod tests {
         let udbg = format!("{u:?}");
         assert!(udbg.contains("payload_len"));
         assert!(!udbg.contains("DEAD") && !udbg.contains("dead"));
+    }
+
+    // ── TASK-0083 §S6d: client-initiated media-start TX (conv=0) ────────────
+    // open_media_start frames the three cap4 PDUs as conv=0 KCP PUSH datagrams.
+    // Each is 24(hdr)+48(IV16+CBC32 of the 28B PDU)+20(HMAC) = 92 bytes, conv=0,
+    // cmd=PUSH, sn=3,4,5, una=2, wnd=512, len=48. We parse the HEADERS only (no
+    // decrypt with a real key — a SYNTHETIC key keeps the bytes reproducible).
+    #[test]
+    fn open_media_start_frames_three_conv0_push_datagrams() {
+        let mut engine = MediaEngine::from_security_level(3, KEY.to_vec()).unwrap();
+        assert_eq!(
+            engine.conv0_rcv_nxt(),
+            MEDIA_START_UNA,
+            "rcv_nxt seeded to the open una"
+        );
+        let ivs = [[0xA0u8; 16], [0xA1u8; 16], [0xA2u8; 16]];
+        let dgs = engine.open_media_start(&ivs, 0x1111_2222).unwrap();
+        assert_eq!(dgs.len(), 3);
+        for (i, dg) in dgs.iter().enumerate() {
+            assert_eq!(dg.len(), 92, "datagram {i}: 24 hdr + 48 payload + 20 HMAC");
+            let conv = u32::from_le_bytes([dg[0], dg[1], dg[2], dg[3]]);
+            assert_eq!(conv, control::MEDIA_START_CONV, "conv=0");
+            assert_eq!(dg[4], kcp::IKCP_CMD_PUSH, "cmd=PUSH");
+            assert_eq!(dg[5], 0, "frg=0");
+            assert_eq!(u16::from_le_bytes([dg[6], dg[7]]), kcp::SND_WND, "wnd=512");
+            let sn = u32::from_le_bytes([dg[12], dg[13], dg[14], dg[15]]);
+            assert_eq!(sn, MEDIA_START_SN + i as u32, "sn ascends 3,4,5");
+            let una = u32::from_le_bytes([dg[16], dg[17], dg[18], dg[19]]);
+            assert_eq!(una, MEDIA_START_UNA, "una=2 (cap4)");
+            let len = u32::from_le_bytes([dg[20], dg[21], dg[22], dg[23]]) as usize;
+            assert_eq!(len, crypto::IV_LEN + 32, "payload len = 16B IV + 32B CBC");
+            // The datagram is a well-formed suite-3 datagram: its HMAC validates and
+            // the inner segment decrypts back to the exact PDU under the same key.
+            let body = crypto::verify_and_strip_hmac(dg, KEY).unwrap();
+            let seg_payload = &body[kcp::IKCP_OVERHEAD..kcp::IKCP_OVERHEAD + len];
+            let pdu = crypto::decrypt_segment_cbc(seg_payload, KEY).unwrap();
+            assert_eq!(
+                pdu,
+                control::MEDIA_START_PDUS[i],
+                "decrypts to the cap4 PDU"
+            );
+        }
+        // All three are held for retransmit until the camera acks them.
+        assert_eq!(engine.media_start_retransmits().len(), 3);
+        assert!(!engine.media_start_acked());
+        // The camera's cumulative una=6 (cap4 frame 256) drains the sender.
+        engine.on_peer_una_conv0(6);
+        assert!(engine.media_start_acked());
+        assert!(engine.media_start_retransmits().is_empty());
+    }
+
+    // A non-suite-3 engine refuses the media-start (no fabricated framing).
+    #[test]
+    fn open_media_start_rejects_non_suite3() {
+        let mut engine = MediaEngine::from_security_level(4, KEY.to_vec()).unwrap();
+        let ivs = [[0u8; 16]; 3];
+        assert!(matches!(
+            engine.open_media_start(&ivs, 0),
+            Err(Error::Transport(_))
+        ));
+    }
+
+    // push_datagram surfaces the camera's conv=0 una (to prune our sender) and
+    // advances our conv=0 rcv_nxt over the camera's PUSH sn — while yielding NO
+    // media units (unchanged RX behavior for the control channel).
+    #[test]
+    fn push_datagram_observes_camera_conv0_acks() {
+        let mut engine = MediaEngine::from_security_level(3, KEY.to_vec()).unwrap();
+        // We have media-start PUSHes outstanding.
+        engine
+            .open_media_start(&[[1u8; 16], [2u8; 16], [3u8; 16]], 0)
+            .unwrap();
+        assert!(!engine.media_start_acked());
+
+        // Synthetic camera conv=0 PUSH at the sn we next expect (= our rcv_nxt
+        // start = MEDIA_START_UNA), una acks our 3 PUSHes (= MEDIA_START_SN + 3).
+        // observe_conv0 reads HEADERS only, so the payload is opaque (not decrypted)
+        // — it just has to pass the datagram HMAC.
+        let cam_sn = MEDIA_START_UNA;
+        let cam_una = MEDIA_START_SN + 3;
+        let body = kcp::encode_segment(
+            control::MEDIA_START_CONV,
+            kcp::IKCP_CMD_PUSH,
+            0,
+            kcp::SND_WND,
+            0,
+            cam_sn,
+            cam_una,
+            b"opaque conv0 control payload (header-only peek on the TX/ACK path)",
+        );
+        let dg = append_hmac(&body, KEY);
+
+        let units = engine.push_datagram(&dg).unwrap();
+        assert!(units.is_empty(), "conv=0 control yields no media units");
+        assert_eq!(
+            engine.conv0_rcv_nxt(),
+            MEDIA_START_UNA + 1,
+            "advanced over the camera's next conv=0 sn"
+        );
+        assert_eq!(
+            engine.take_conv0_peer_una(),
+            Some(cam_una),
+            "camera una surfaced"
+        );
+        assert_eq!(engine.take_conv0_peer_una(), None, "taken exactly once");
+
+        // Feeding that una to the sender prunes our outstanding media-start PUSHes.
+        engine.on_peer_una_conv0(cam_una);
+        assert!(engine.media_start_acked());
     }
 }

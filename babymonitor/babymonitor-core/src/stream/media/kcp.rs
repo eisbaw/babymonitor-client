@@ -91,6 +91,11 @@ pub struct KcpReceiver {
     rcv_buf: Vec<KcpSegment>,
     /// In-order, ready-to-deliver segments (a contiguous prefix from `rcv_nxt`).
     rcv_queue: Vec<KcpSegment>,
+    /// Pending `(sn, ts)` to ACK back to the sender: every in-window PUSH (incl.
+    /// duplicates, so a lost ACK is re-sent). The peer's KCP send window only
+    /// advances on these — without ACKs the camera streams its initial window then
+    /// stalls. Drained by [`drain_acks`](KcpReceiver::drain_acks).
+    acklist: Vec<(u32, u32)>,
 }
 
 impl KcpReceiver {
@@ -109,7 +114,20 @@ impl KcpReceiver {
             rcv_wnd: rcv_wnd.max(1),
             rcv_buf: Vec::new(),
             rcv_queue: Vec::new(),
+            acklist: Vec::new(),
         }
+    }
+
+    /// The next sequence number expected (the cumulative `una` to advertise back).
+    #[must_use]
+    pub fn rcv_nxt(&self) -> u32 {
+        self.rcv_nxt
+    }
+
+    /// Take the pending `(sn, ts)` ACKs to send back (and clear them). The caller
+    /// frames each as a KCP ACK segment (`cmd=0x52`, `una = rcv_nxt`).
+    pub fn drain_acks(&mut self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut self.acklist)
     }
 
     /// The `conv` (channel id) this receiver demuxes.
@@ -157,7 +175,8 @@ impl KcpReceiver {
             }
             let cmd = rest[4];
             let frg = rest[5];
-            // wnd @6 (u16), ts @8 (u32) — not needed on the RX-decode path.
+            // wnd @6 (u16); ts @8 (u32) is echoed back in our ACK (RTT estimate).
+            let ts = u32::from_le_bytes([rest[8], rest[9], rest[10], rest[11]]);
             let sn = u32::from_le_bytes([rest[12], rest[13], rest[14], rest[15]]);
             // una @16 (u32) — send-side ack cursor; ignored on RX decode.
             let len = u32::from_le_bytes([rest[20], rest[21], rest[22], rest[23]]) as usize;
@@ -171,6 +190,12 @@ impl KcpReceiver {
             }
             match cmd {
                 IKCP_CMD_PUSH => {
+                    // ACK every in-window PUSH (incl. duplicates — a lost ACK makes
+                    // the camera retransmit, and it needs the re-ACK). Mirrors
+                    // ikcp_input's `ikcp_ack_push` before parse_data.
+                    if sn.wrapping_sub(self.rcv_nxt) < self.rcv_wnd {
+                        self.acklist.push((sn, ts));
+                    }
                     let seg_payload = &body[..len];
                     self.accept_push(sn, frg, seg_payload, decryptor)?;
                 }
@@ -281,6 +306,102 @@ pub fn get_conv(datagram: &[u8]) -> Option<u32> {
         datagram[2],
         datagram[3],
     ]))
+}
+
+/// Encode one KCP segment: the 24-byte little-endian header + `payload`
+/// (`conv cmd frg wnd ts sn una len(payload)`). The TX inverse of the RX header
+/// parse; `len` is set from `payload`. (cap4 wire: PUSH `cmd=0x51`, `wnd=512`.)
+///
+/// The seven header parameters are the **intrinsic ikcp wire fields** (`conv`,
+/// `cmd`, `frg`, `wnd`, `ts`, `sn`, `una`), so the arity is a property of the
+/// protocol, not an API-design smell — folding them into a struct would only
+/// relocate the same seven fields. Hence the targeted `too_many_arguments` allow.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_segment(
+    conv: u32,
+    cmd: u8,
+    frg: u8,
+    wnd: u16,
+    ts: u32,
+    sn: u32,
+    una: u32,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut s = Vec::with_capacity(IKCP_OVERHEAD + payload.len());
+    s.extend_from_slice(&conv.to_le_bytes()); // 0: conv
+    s.push(cmd); // 4: cmd
+    s.push(frg); // 5: frg
+    s.extend_from_slice(&wnd.to_le_bytes()); // 6: wnd
+    s.extend_from_slice(&ts.to_le_bytes()); // 8: ts
+    s.extend_from_slice(&sn.to_le_bytes()); // 12: sn
+    s.extend_from_slice(&una.to_le_bytes()); // 16: una
+    s.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // 20: len
+    s.extend_from_slice(payload); // 24: payload
+    s
+}
+
+/// The window we advertise on outbound segments (cap4: app `wnd = 0x0200 = 512`).
+pub const SND_WND: u16 = 512;
+
+/// A minimal **send-side** ikcp channel for one `conv`: assigns ascending `sn`,
+/// holds unacknowledged PUSH datagrams for retransmit, and prunes them when the
+/// peer's `una` advances. **Time-free** (no clock): the caller (the media pump)
+/// owns the RTO and decides when to resend [`unacked`](KcpSender::unacked) — so this
+/// is fully offline-testable against a [`KcpReceiver`].
+pub struct KcpSender {
+    conv: u32,
+    snd_nxt: u32,
+    /// `(sn, full-wire datagram)` for each sent-but-unacked PUSH, ascending by `sn`.
+    unacked: Vec<(u32, Vec<u8>)>,
+}
+
+impl KcpSender {
+    /// A new sender for `conv` whose first assigned `sn` is `start_sn` (cap4's app
+    /// conv=0 stream starts at `sn = 3`; a fresh KCP would start at `0`).
+    #[must_use]
+    pub fn new(conv: u32, start_sn: u32) -> Self {
+        Self {
+            conv,
+            snd_nxt: start_sn,
+            unacked: Vec::new(),
+        }
+    }
+
+    /// The `conv` this sender drives.
+    #[must_use]
+    pub fn conv(&self) -> u32 {
+        self.conv
+    }
+
+    /// Take the next `sn` to assign (and advance the counter).
+    pub fn take_sn(&mut self) -> u32 {
+        let sn = self.snd_nxt;
+        self.snd_nxt = self.snd_nxt.wrapping_add(1);
+        sn
+    }
+
+    /// Record a sent PUSH's full wire datagram for possible retransmit.
+    pub fn record_unacked(&mut self, sn: u32, wire: Vec<u8>) {
+        self.unacked.push((sn, wire));
+    }
+
+    /// Prune everything the peer has acknowledged: drop unacked PUSHes with
+    /// `sn < peer_una` (KCP cumulative ACK).
+    pub fn ack_through(&mut self, peer_una: u32) {
+        self.unacked.retain(|(sn, _)| *sn >= peer_una);
+    }
+
+    /// The still-unacknowledged PUSH wire datagrams, for the caller to retransmit.
+    pub fn unacked(&self) -> impl Iterator<Item = &[u8]> {
+        self.unacked.iter().map(|(_, w)| w.as_slice())
+    }
+
+    /// Whether every PUSH has been acknowledged by the peer.
+    #[must_use]
+    pub fn is_drained(&self) -> bool {
+        self.unacked.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -462,5 +583,54 @@ mod tests {
         let dg = kcp_push(0x0102_0304, 0, 0, b"z");
         assert_eq!(get_conv(&dg), Some(0x0102_0304));
         assert_eq!(get_conv(&[0x01, 0x02]), None);
+    }
+
+    // ── KcpSender ↔ KcpReceiver loopback (TASK-0083 §S6a) ───────────────────
+    // The media-start SEND side frames conv=0 PUSH sn=3,4,5 (cap4: conv=0 starts at
+    // sn=3); the receive side — pre-rolled to rcv_nxt=3 (both sides agree on the
+    // start, `re/media_start_handshake.md`) — delivers their payloads in order; and
+    // the camera's cumulative `una` advancing past them drains the sender.
+    #[test]
+    fn sender_receiver_media_start_loopback() {
+        const CONV0: u32 = 0; // the imm media-start conv
+        const START_SN: u32 = 3; // MEDIA_START_SN
+        let mut sender = KcpSender::new(CONV0, START_SN);
+        assert_eq!(sender.conv(), CONV0);
+        let mut rx = KcpReceiver::new(CONV0);
+
+        // Pre-roll the receiver to rcv_nxt=3 so the 3,4,5 PUSHes deliver in order
+        // (KcpReceiver starts at rcv_nxt=0; cap4's camera-side KCP starts conv=0 at 3).
+        for sn in 0..START_SN {
+            let pre = encode_segment(CONV0, IKCP_CMD_PUSH, 0, SND_WND, 0, sn, 0, b"preroll");
+            rx.input(&pre, &Identity).unwrap();
+            let _ = rx.recv(); // discard the pre-roll payload; only rcv_nxt matters
+        }
+
+        // The sender frames the three media-start PUSHes; the receiver consumes each.
+        let payloads: [&[u8]; 3] = [b"PDU-A", b"PDU-B", b"PDU-C"];
+        for p in payloads {
+            let sn = sender.take_sn();
+            let wire = encode_segment(CONV0, IKCP_CMD_PUSH, 0, SND_WND, 0, sn, 0, p);
+            // The sender holds the EXACT wire bytes for retransmit.
+            sender.record_unacked(sn, wire.clone());
+            rx.input(&wire, &Identity).unwrap();
+        }
+        assert_eq!(sender.take_sn(), START_SN + 3, "sn advanced past 3,4,5");
+
+        // Delivered in order, payloads intact.
+        assert_eq!(rx.recv().as_deref(), Some(b"PDU-A".as_slice()));
+        assert_eq!(rx.recv().as_deref(), Some(b"PDU-B".as_slice()));
+        assert_eq!(rx.recv().as_deref(), Some(b"PDU-C".as_slice()));
+        assert!(rx.recv().is_none());
+
+        // None acked yet → all three held; a partial ack prunes only the acked.
+        assert_eq!(sender.unacked().count(), 3);
+        assert!(!sender.is_drained());
+        sender.ack_through(4); // camera acked sn 3 (una=4 ⇒ next expected 4)
+        assert_eq!(sender.unacked().count(), 2);
+        // The cumulative ack past 3,4,5 (cap4 frame 256: una=6) drains the sender.
+        sender.ack_through(6);
+        assert!(sender.is_drained());
+        assert_eq!(sender.unacked().count(), 0);
     }
 }

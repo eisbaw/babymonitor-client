@@ -70,3 +70,24 @@ PDUs as sn=3,4,5 (mirror the app); (B) start at 0 and send them as sn=0,1,2.
 f217 (ACK shape), **f253 (primary: header + 48B seal + 28B PDU)**, f254/f255 (the
 burst + varying fields), f256 (camera's una-advance), f259 (conv=1 video starts only
 after the conv=0 handshake).
+
+## LIVE A/B RESULT (resolves the sn unknown — but exposes a content gap)
+Implemented the client TX (KCP sender + AES-CBC seal + HMAC + the 3 PDUs + KCP ACK
+of the camera's segments) and live-tested both hypotheses, reading the camera's
+conv=0 reply header (`conv cmd sn una`):
+- **`MEDIA_START_SN=3, una=2`** (cap4 mirror): camera replies `conv=0 cmd=0x52 sn=3
+  **una=0**` (repeated). `una=0` ⇒ the camera's rcv_nxt for OUR stream is 0; our
+  sn=3,4,5 are out-of-order, buffered, never delivered → stall. **Wrong.**
+- **`MEDIA_START_SN=0, una=0`** (fresh start): camera replies `conv=0 cmd=0x52 sn=2
+  **una=3**`. **`una=3` ⇒ the camera received + acked our sn=0,1,2.** Sequencing is
+  CORRECT. The TX/KCP mechanism works end-to-end (camera accepts our PUSHes, its
+  cumulative `una` advances 0→3, and we ACK its segments).
+
+**But the camera ACKs and stops — no conv=1 video.** So the sn=0,1,2 **content** is
+wrong: cap4's three 28-byte PDUs are the sn=3,4,5 *continuation*, not the *initial*
+handshake. The true sn=0,1,2 (likely the imm auth — `SendAuthorizationInfo`,
+104-byte magic-`0x12345678` with code/username/password, `decompiled/ghidra_p2p/.../00147608`)
+is **outside cap4's capture window**. ⇒ Baseline pinned to `MEDIA_START_SN/UNA = 0`
+(correct sequencing). Remaining unblock: **cap7** (capture a FRESH live-view from
+connection #1, getting conv=0 sn=0,1,2 + the auth) OR RE the imm conv=0 control
+sender to synthesize the initial PDUs (and find the auth-cred source).

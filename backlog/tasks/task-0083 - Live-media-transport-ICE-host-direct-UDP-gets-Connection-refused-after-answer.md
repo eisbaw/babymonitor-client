@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@myself'
 created_date: '2026-06-28 12:03'
-updated_date: '2026-06-28 14:12'
+updated_date: '2026-06-28 15:38'
 labels:
   - stream
   - media
@@ -89,4 +89,27 @@ Sequence: after ICE validates, send 3x KCP PUSH (the f253/254/255 PDUs sealed) -
 RESIDUAL UNKNOWN: the app's conv=0 send stream starts at sn=3 (all 132 conv=0 PUSH in cap4 have sn>=3; sn 0,1,2 never sent as PUSH). Either imm-KCP inits snd/rcv_nxt at 3, or sn 0,1,2 were on an earlier path outside cap4's window. Two live-testable hypotheses: start our conv=0 snd_nxt at 3 (mirror app) vs at 0.
 
 NEXT: implement the TX path (KCP sender + AES-CBC encrypt/HMAC + imm control PDU + MediaEngine TX + pump wiring), KAT vs cap4 f253-255, live-test. Workflow plan recorded.
+
+## MEDIA-START WORKS — camera streams! New blocker: KCP ACKs (flow control)
+
+Implemented the client-initiated KCP/imm media-start (workflow: control.rs PDUs, MediaEngine::open_media_start, pump wiring; S1/S2 crypto+kcp TX). LIVE config A (MEDIA_START_SN=3, MEDIA_START_UNA=2, mirroring cap4):
+  nomination VALIDATED -> "media-start: sent 3 KCP control segments (conv=0, sn>=3)" -> ICE summary media_ok=6 (!), stop reason changed from "no media within 60s" to "media idle for 20s" = THE CAMERA STREAMED.
+So sn=3/una=2 was correct; the media-start trigger works.
+
+NEW BLOCKER: the camera sent ~6 media datagrams (its initial send window) then STALLED -> we never ACK its segments, so the camera's KCP send window fills and it stops (cap4: the app sends ~785 packets back, mostly KCP ACKs, and the camera streams 16000+). 6 datagrams < a keyframe, so no decodable frame yet.
+FIX: on each received camera PUSH (conv=1 video, conv=2 audio, conv=0 control), send a KCP ACK (cmd=0x52, sn=acked, una=rcv_nxt, len=0, +HMAC) back so the camera's window advances and it keeps streaming.
+
+Also noted: machine moved networks (egress now 198.51.100.105, camera 192.0.2.184 different subnet) but ICE+media still traversed (NAT reverse path) — media_ok=6 proves it.
+
+## TX mechanism WORKS — camera accepts our control; missing = the INITIAL conv=0 handshake content
+
+Added KCP ACK emission (KcpReceiver.drain_acks + MediaEngine.drain_media_acks; pump ACKs every received segment) so the camera's send window advances. Added inbound-KCP-header diag (conv/cmd/sn/una).
+
+LIVE A/B (the MEDIA_START_SN/UNA flip), with the inbound diag:
+- Config A (sn=3, una=2, cap4-mirror): camera replies conv=0 cmd=0x52 sn=3 UNA=0 (x6). una=0 => the camera's rcv_nxt for OUR stream is 0; our sn=3,4,5 are out-of-order, buffered, never delivered -> stall.
+- Config B (sn=0, una=0, fresh start): camera replies conv=0 cmd=0x52 sn=2 UNA=3. una=3 => the camera RECEIVED our sn=0,1,2 and acknowledged them. Sequencing is CORRECT. But the camera ACKs and stops (media_ok=1, no conv=1 video).
+
+CONCLUSION: the TX/KCP mechanism is correct (camera accepts our conv=0 PUSHes, una advances 0->3). The remaining gap is the CONTENT of the initial sn=0,1,2 PDUs. cap4's captured 28-byte PDUs (f253/254/255) are the sn=3,4,5 CONTINUATION; the true initial handshake (sn 0,1,2) is outside cap4's window and likely includes the imm auth step (SendAuthorizationInfo @ decompiled/ghidra_p2p/.../00147608: 104-byte, magic 0x12345678, code@4, username@8, password@0x28). We send the wrong (continuation) content as sn=0,1,2.
+
+NEXT (decision): (a) cap7 = capture a FRESH live-view from connection #1 (gets conv=0 sn=0,1,2 + the auth), or (b) RE the imm conv=0 control sender from the decompile to synthesize sn=0,1,2 (auth creds source = ?). Baseline set to config B (sn=0 = the live-correct sequencing).
 <!-- SECTION:NOTES:END -->

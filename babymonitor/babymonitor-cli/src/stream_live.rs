@@ -43,7 +43,7 @@ use babymonitor_core::stream::media::stun::{self, IceRole};
 use babymonitor_core::stream::media::transport::{
     self as mtransport, IceCredentials, MediaTransport,
 };
-use babymonitor_core::stream::media::MediaEngine;
+use babymonitor_core::stream::media::{MediaEngine, MEDIA_START_SN};
 use babymonitor_core::stream::mqtt_auth::{derive_credentials, MqttAuthInputs};
 use babymonitor_core::stream::rtc_config::RtcConfig;
 use babymonitor_core::stream::sdp::{build_offer_sdp, OfferSdpParams};
@@ -907,6 +907,86 @@ impl PumpTimers {
     }
 }
 
+/// Drives the **client-initiated KCP/imm media-start handshake** (TASK-0083,
+/// `re/media_start_handshake.md`): after ICE validates, the SCD921 still will NOT
+/// stream until the client sends the three conv=0 control PUSHes first. We send
+/// them once the pair is first proven, then retransmit (RFC 5389-style backoff)
+/// until real media arrives. Pure given the injected clock — the send/retransmit
+/// gating is unit-testable without a socket.
+struct MediaStartState {
+    /// Whether the three media-start PUSHes have been emitted (sent exactly once).
+    sent: bool,
+    /// Set once real media (a video/audio unit) arrives — stops retransmitting.
+    receiving_media: bool,
+    /// When the next retransmit of the unacked PUSHes is due.
+    next_retransmit: Instant,
+    /// Current retransmit timeout, doubling per resend up to [`NOMINATE_RTO_MAX`].
+    rto: Duration,
+}
+
+impl MediaStartState {
+    fn new() -> Self {
+        Self {
+            sent: false,
+            receiving_media: false,
+            next_retransmit: Instant::now(),
+            rto: NOMINATE_RTO_INITIAL,
+        }
+    }
+
+    /// Whether a retransmit is due at `now`: the handshake was sent, real media has
+    /// not yet arrived, and the RTO has elapsed.
+    fn retransmit_due(&self, now: Instant) -> bool {
+        self.sent && !self.receiving_media && now >= self.next_retransmit
+    }
+
+    /// Record a retransmit at `now`: schedule the next one one RTO out and double
+    /// the RTO (capped at [`NOMINATE_RTO_MAX`]) — the same backoff as the nomination.
+    fn mark_retransmit(&mut self, now: Instant) {
+        self.next_retransmit = now + self.rto;
+        self.rto = (self.rto * 2).min(NOMINATE_RTO_MAX);
+    }
+
+    /// Mark real media flowing → stop retransmitting the media-start.
+    fn mark_media(&mut self) {
+        self.receiving_media = true;
+    }
+}
+
+/// Emit the client-initiated media-start handshake on the connected media socket:
+/// mint three fresh inline IVs + a KCP millisecond timestamp, frame the cap4 conv=0
+/// control PDUs ([`MediaEngine::open_media_start`]), and `try_send` each. Returns
+/// the count sent (3) for the log line. `try_send` tolerates the transient ICE
+/// `ConnectionRefused`/`WouldBlock` exactly as the nomination path does.
+///
+/// # Errors
+/// - [`Error`] from the random source or [`MediaEngine::open_media_start`]
+///   (non-suite-3 engine), or a non-transient socket send failure.
+fn send_media_start(
+    engine: &mut MediaEngine,
+    transport: &mtransport::UdpMediaTransport,
+) -> Result<usize, Error> {
+    let mut ivs = [[0u8; 16]; 3];
+    for iv in &mut ivs {
+        OsRandom.fill(iv)?;
+    }
+    let datagrams = engine.open_media_start(&ivs, kcp_ts_ms())?;
+    for dg in &datagrams {
+        transport.try_send(dg)?;
+    }
+    Ok(datagrams.len())
+}
+
+/// A KCP-style millisecond timestamp (wrapping `u32`) for outbound segments. The
+/// camera uses `ts` only for its own RTT/RTO estimate, so any monotonic-ish ms
+/// clock is fine; the wall clock keeps it simple and dependency-free.
+fn kcp_ts_ms() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u32)
+        .unwrap_or(0)
+}
+
 /// LIVE: the media receive loop — split STUN (consent) from media, route each
 /// decoded unit by conv (video → H.264 Annex-B; audio → S16LE), feed the MPEG-TS
 /// muxer, and keep the ICE path alive (send a consent refresh ~every 5 s, answer
@@ -925,6 +1005,7 @@ fn pump_to_output(
         args.port
     );
     let mut timers = PumpTimers::live();
+    let mut mstart = MediaStartState::new();
     let diag = babymonitor_core::stream::transport::diag_enabled();
     let (
         mut n_nom,
@@ -951,6 +1032,17 @@ fn pump_to_output(
             transport.try_send(&keep.refresh_check()?)?;
             timers.mark_consent();
         }
+        // TASK-0083: once the media-start handshake has been sent, retransmit the
+        // still-unacked conv=0 control PUSHes (RFC 5389-style backoff) until real
+        // media arrives. KCP is in-order, so the camera buffers them and begins
+        // streaming once it holds all three; `media_start_retransmits` empties as
+        // the camera's cumulative conv=0 ACK prunes them.
+        if mstart.retransmit_due(now) {
+            for dg in engine.media_start_retransmits() {
+                transport.try_send(&dg)?;
+            }
+            mstart.mark_retransmit(now);
+        }
         match transport.recv_datagram(&mut buf)? {
             Some(n) => {
                 let dg = &buf[..n];
@@ -974,6 +1066,17 @@ fn pump_to_output(
                         }
                         n_our_success += 1;
                         keep.mark_validated();
+                        // TASK-0083 ROOT-CAUSE FIX: the camera accepted our check but
+                        // will NOT stream until we send the conv=0 KCP/imm media-start
+                        // control PUSHes first. Send the three exactly once; the loop's
+                        // retransmit (above) covers loss until media flows.
+                        if !mstart.sent {
+                            let n = send_media_start(engine, transport)?;
+                            mstart.sent = true;
+                            eprintln!(
+                                "media-start: sent {n} KCP control segments (conv=0, sn>={MEDIA_START_SN})"
+                            );
+                        }
                     }
                     match keep.consent_reply(dg) {
                         Ok(Some(reply)) => {
@@ -984,6 +1087,16 @@ fn pump_to_output(
                         Err(e) => eprintln!("stream (live): ignoring malformed STUN packet: {e}"),
                     }
                 } else {
+                    if diag && (n_media_ok + n_media_drop) < 16 && dg.len() >= 24 {
+                        let conv = u32::from_le_bytes([dg[0], dg[1], dg[2], dg[3]]);
+                        let sn = u32::from_le_bytes([dg[12], dg[13], dg[14], dg[15]]);
+                        let una = u32::from_le_bytes([dg[16], dg[17], dg[18], dg[19]]);
+                        eprintln!(
+                            "media-diag: inbound conv={conv} cmd=0x{:02x} sn={sn} una={una} len={}",
+                            dg[4],
+                            dg.len()
+                        );
+                    }
                     match engine.push_datagram(dg) {
                         Ok(units) => {
                             n_media_ok += 1;
@@ -992,6 +1105,26 @@ fn pump_to_output(
                             // one did not complete a frame yet.
                             keep.mark_validated();
                             timers.mark_media();
+                            // TASK-0083: if this was a camera conv=0 control datagram,
+                            // the engine surfaced its cumulative ACK cursor — feed it
+                            // back to prune our media-start sender.
+                            if let Some(una) = engine.take_conv0_peer_una() {
+                                engine.on_peer_una_conv0(una);
+                            }
+                            // TASK-0083: ACK every received KCP segment so the
+                            // camera's send window advances and it keeps streaming
+                            // (without ACKs it sends its initial window then stalls
+                            // — cap4: the app sends ~785 packets back, mostly ACKs).
+                            for ack in engine.drain_media_acks()? {
+                                transport.try_send(&ack)?;
+                            }
+                            // Real media (a decoded video/audio unit) proves the
+                            // handshake landed — stop retransmitting the media-start.
+                            // (A conv=0 control datagram yields no units, so it does
+                            // not prematurely stop the retransmit.)
+                            if !units.is_empty() {
+                                mstart.mark_media();
+                            }
                             for u in &units {
                                 if u.is_video() {
                                     for nal in depay.push(&u.payload)? {
@@ -1986,6 +2119,38 @@ mod tests {
         t.mark_media();
         // Once media flowed, a zero steady-idle window expires immediately.
         assert!(t.idle_reason().is_some_and(|r| r.contains("idle")));
+    }
+
+    // ── TASK-0083: the media-start retransmit state machine ────────────────
+    // Not-due until sent; once sent, due after the RTO; backoff doubles 250ms →
+    // 500ms → 1s → 2s → capped at 3s; and real media stops it.
+    #[test]
+    fn media_start_state_gating_and_backoff() {
+        let mut m = MediaStartState::new();
+        let t0 = Instant::now();
+        // Not sent yet → never due, however far in the future.
+        assert!(!m.retransmit_due(t0 + Duration::from_secs(60)));
+        m.sent = true;
+        // Sent: the initial next_retransmit (≈ new() time) is already past at t0+1s.
+        assert!(m.retransmit_due(t0 + Duration::from_secs(1)));
+
+        let mut t = t0;
+        let mut gaps = Vec::new();
+        for _ in 0..6 {
+            m.mark_retransmit(t);
+            gaps.push(m.next_retransmit - t);
+            t = m.next_retransmit;
+        }
+        assert_eq!(gaps[0], Duration::from_millis(250));
+        assert_eq!(gaps[1], Duration::from_millis(500));
+        assert_eq!(gaps[2], Duration::from_secs(1));
+        assert_eq!(gaps[3], Duration::from_secs(2));
+        assert!(gaps.iter().all(|g| *g <= NOMINATE_RTO_MAX));
+        assert_eq!(gaps[5], NOMINATE_RTO_MAX);
+
+        // Real media flowing → no longer due, ever.
+        m.mark_media();
+        assert!(!m.retransmit_due(t + Duration::from_secs(600)));
     }
 
     #[test]

@@ -91,3 +91,39 @@ is **outside cap4's capture window**. ⇒ Baseline pinned to `MEDIA_START_SN/UNA
 (correct sequencing). Remaining unblock: **cap7** (capture a FRESH live-view from
 connection #1, getting conv=0 sn=0,1,2 + the auth) OR RE the imm conv=0 control
 sender to synthesize the initial PDUs (and find the auth-cred source).
+
+## conv=0 AUTH password derivation (jadx-confirmed)
+**Confidence: HIGH on structure; the lowercase-hex assumption is validated by the
+live test.** The conv=0 AUTH PDU (`SendAuthorizationInfo`, KCP sn=0) does **NOT**
+carry the raw 8-char camera password. The real app derives it before connecting:
+
+```
+auth_password = md5_hex_lower( utf8(password) ++ "||" ++ utf8(localKey) )   // 32 ASCII hex chars
+username      = "admin"   (constant)
+```
+
+- `password` = `rtc.config result.password` (the 8-char `CameraInfoBean.password`).
+- `localKey` = the device `localKey` (`DeviceBean.getLocalKey()`).
+- `||`       = the separator constant `com.thingclips.sdk.mqtt.pbbppqb.pbpdbqp`
+  (`decompiled/jadx/sources/com/thingclips/sdk/mqtt/pbbppqb.java:26`).
+- MD5 → lowercase 32-hex via `com.thingclips.smart.camera.utils.chaos.MD5Utils.b(s)
+  = HexUtil.a(MD5(s.getBytes()))` (Tuya `HexUtil` is lowercase across their SDKs).
+
+Citations
+(`decompiled/jadx/sources/com/thingclips/smart/camera/ipccamerasdk/IPCThingP2PCamera.java`):
+```
+6874: String password = this.mBean.getPassword();   // 8-char rtc.config password
+6875: this.mLocalkey = this.mBean.getLocalKey();     // device localKey
+6881: this.mPwd = MD5Utils.b(password + pbbppqb.pbpdbqp + this.mLocalkey);  // "||"
+6975: this.thingCamera.connect("admin", this.mPwd, ...);   // username "admin"
+```
+
+The C++ side `ThingNetProtocolManager::SendAuthorizationInfo` (@002c8028) `strncpy`s
+the username@8 (max `0x1f`) and password@0x28 (max `0x3f`) into the 104-byte
+magic-`0x12345678` blob, so the 32-char hex password fits without truncation.
+
+This **supersedes** the earlier raw-password attempt (§"The 28-byte imm control PDU"
+note that called the 104-byte `SendAuthorizationInfo` "a different, larger control
+message"): the AUTH PDU password is the derived md5, not the raw `password` field.
+Implemented in `babymonitor-core/src/stream/media/control.rs`
+(`derive_media_auth_password`) and wired in `babymonitor-cli/src/stream_live.rs`.

@@ -1,11 +1,11 @@
 ---
 id: TASK-0083
 title: 'Live media transport: ICE host-direct UDP gets Connection refused after answer'
-status: In Progress
+status: Done
 assignee:
   - '@myself'
 created_date: '2026-06-28 12:03'
-updated_date: '2026-06-28 17:09'
+updated_date: '2026-06-28 18:57'
 labels:
   - stream
   - media
@@ -22,8 +22,8 @@ Live signaling now fully works (camera returns Answer + 4 trickled ICE candidate
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 media UDP path to the camera is established (no Connection refused) and KCP segments are received
-- [ ] #2 at least one H.264 keyframe is decoded from the live camera and rendered/written to the TS
+- [x] #1 media UDP path to the camera is established (no Connection refused) and KCP segments are received
+- [x] #2 at least one H.264 keyframe is decoded from the live camera and rendered/written to the TS
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -136,4 +136,65 @@ Most likely: the auth PASSWORD VALUE is wrong. The smali pinned the FIELD name (
 STATIC RE IS EXHAUSTED for the final piece. We have (grounded): full signaling, ICE, the media-start KCP mechanism (camera accepts our sequencing), the auth PDU LAYOUT + username="admin" + the password FIELD name. NOT statically resolvable: the exact auth password VALUE binding (which JSON object) + the sn=1,2 setup content (native connectV3 internals).
 
 => cap7 is now the surest unblock: capture a FRESH live-view from connection #1; decrypt conv=0 sn=0 (auth) with the session media key -> read the EXACT password value (compare to rtc.config.password to confirm/correct the source) AND read sn=1,2 setup. Then the replay is exact.
+
+## "Look at all captures" paid off: full structure found; sn=1,2 plaintext locked (uncaptured key)
+
+Deep-mined cap4/media.pcap (all conv=0 segments any cmd, all sessions, all 5 aes-keys incl cap3's):
+1. FOUND the initial sequence STRUCTURE: a later cap4 connection attempt (t=342s) captured app conv=0 PUSH at sn=0 (len=128 = the 104B AUTH PDU), sn=1 (len=48), sn=2 (len=48). So the full conv=0 send = AUTH(sn=0) + FIVE 28-byte PDUs(sn=1,2,3,4,5) — NOT 3. (The successful t=53 session sent sn=0,1,2 on an earlier ICE candidate before the captured 5-tuple; that is why it starts at sn=3 with una=2.)
+2. CORRECTION: my live auth test was malformed — I placed the known sn=3,4,5 PDUs (f253/254/255) at sn=1,2,3. They belong at sn=3,4,5; sn=1,2 are DIFFERENT 28-byte PDUs.
+3. Decrypted the CAMERA's conv=0 control (key#0, working session): the 28-byte PDUs are a REQUEST/RESPONSE protocol. @4 = message type (0x10004,0x10003,0x10005 used at sn=3,4,5; camera mirrors the same types in its responses sn=2,3,4). @8 = direction byte (app=0 request, camera=1 response). So sn=1,2 are 2 more 28-byte type-messages with the FIRST two types.
+4. LOCKED: the app sn=0 (auth password) + sn=1,2 (the 2 missing 28-byte PDUs) plaintext — ALL the captured sn=0,1,2 frames belong to the t=342 session whose per-session media key was NOT captured (none of the 5 keys HMAC-match). The keyed sessions only captured sn=3,4,5.
+5. Auth password candidate = rtc.config result.password (present in the decrypted REST: smartlife.m.rtc.config.get + batch.invoke).
+
+So we now KNOW the exact shape (auth + 5 req/resp PDUs, @4=type/@8=dir) but cannot read sn=1,2's two types from cap4 (key gap). cap7 (fresh connection-#1 WITH the key) decrypts sn=0,1,2 directly. Alternatively: a speculative live experiment sending auth(sn=0) + best-guess sn=1,2 types + f253/254/255 at sn=3,4,5.
+
+## RE round: recover the imm control-type enum (the 2 sn=1,2 types) — workflow launched\nKnown: 28-byte conv=0 PDU @4 = 0x0001<low>; lows 4,3,5 used at sn=3,4,5 (app+camera mirror); @8=dir(0 app/1 cam). Need the 2 types at sn=1,2. Candidate senders (all ref magic 0x12345678): ghidra_p2p/funcs/00146b40_SendMessageThroughMQTT, 00146578_SendMessageThroughLAN, 00146874_OnSessionStateChanged, 00146e48_OnGetDeviceAddress, 00146fe4_HttpsRequestCallback, 00147608_SendAuthorizationInfo.
+
+## RE round 2 result: 28-byte PDU builder NOT in libThingP2PSDK\nWorkflow (4 Ghidra readers) confirmed: only SendAuthorizationInfo @00147608 carries magic 0x12345678 (the 104B auth); NO 28-byte builder anywhere in ghidra_p2p. The sn=1,2 @4 types are NOT statically determinable here (best-guess 0x10001/0x10002 = enum-gap inference, LOW; @12/@24 unevidenced). sn->type is non-positional. => the 28B control builder + type enum live in a DIFFERENT lib: libThingCameraSDK.so (present in decompiled/nativelibs, NOT yet ghidra-decompiled). Next: ghidra-headless libThingCameraSDK -> find the builder + enum -> recover sn=1,2 types. cap7 remains the certain fallback.
+
+## Found: the imm conv=0 control protocol is in libThingCameraSDK (NOT P2PSDK)\nCameraSDK symbols: ThingCameraSimple::StartPreview/StopPreview (the media-start trigger), ThingSmartIPC3CXX::ThingNetProtocolManager::SendAuthorizationInfo (C++ auth), ThingPreviewCallBack::onFirstFrameArrived/onResponse/onTimeout, ThingP2PInterface::thing_p2p_rtc_*, _Z11SendMessage / PPPP_Proto_Send_MGMLogControl. StartPreview -> the conv=0 control sequence (auth + typed 28B PDUs) -> opens video. Running ghidra-headless on libThingCameraSDK.so to read StartPreview + ThingNetProtocolManager -> the sn=1,2 types + the full send order.
+
+## libThingCameraSDK ghidra-decompiled OK (13480 functions) -> decompiled/ghidra_camera/funcs/funcs/\nKey targets present: ThingNetProtocolManager (00214240), SendAuthorizationInfo (00213de0/00214e50), ThingPreviewCallBack (00219870), OnResponse/onResponse* handlers, SendMessage/SendMessageLocal. Launching analysis workflow to find the 28B control PDU builder + the @4 type enum + the StartPreview send order -> recover the sn=1,2 types (Ghidra-grounded).
+
+## BREAKTHROUGH (libThingCameraSDK ghidra): the conv=0 handshake is mechanistically understood (5 of 6 msgs HIGH)
+
+PDU builder = SendCommand @ ghidra_camera/funcs/funcs/002c5e54: @0 magic 0x12345678 | @4 reqId | @8 dir(0=cmd/app,1=resp/cam) | @0xc=(low_cmd<<16)|high_cmd (the REAL command id) | @0x10 payload-len | @0x14 payload. (Corrects my earlier mislabel "@4=type".)
+
+Full conv=0 send order (StartPreview @0025f3a4 + Connect @0025f094 + SendAuthorizationInfo @002c8028):
+ sn=0 AUTH 104B (magic, reqId, "admin"@8 0x1f, password@0x28 0x3f). HIGH.
+ sn=1 VERSION 24B = SendCommand(0,10,0,{0x00010000}): bytes 78563412 00000000 00000000 0A000000 04000000 00000100. HIGH (002c8028:83-89).
+ sn=2 ONE unknown command (reqId counter 2, response-driven, not in any single fn). LOW.
+ sn=3 (9,0) = cap4 f253 (AsyncSendCommand(9,0,[chan=0,mode=4])). HIGH.
+ sn=4 (6,0) "open video" = cap4 f254. HIGH.
+ sn=5 (6,4) = cap4 f255 (conditional on dev flag this[0x300e7c]; cap4 had it set). HIGH.
+Camera responses = same @0xc cmd id with @8=1 (dir=resp), echoing reqId. AsyncSendCommand is non-blocking (no OnResponse gate between the burst) -> matches cap4's 12ms burst.
+
+WHY my prior live test failed: I sent the 3 commands (f253/254/255) at sn=1,2,3 and NEVER sent the auth or the version. Corrected plan: emit auth(sn=0)+version(sn=1)+f253(sn=2)+f254(sn=3)+f255(sn=4) CONTIGUOUSLY (sidestep the unknown sn=2 command -> no KCP gap). If it stalls, the unknown sn=2 command is needed (cap7).
+
+NEXT: implement+live-test workflow.
+
+ROOT CAUSE of camera-silent-on-auth FOUND (jadx, not a guess). The conv=0 AUTH PDU password is NOT the raw 8-char camera password.
+Evidence IPCThingP2PCamera.java: L6874 password=mBean.getPassword(); L6875 mLocalkey=mBean.getLocalKey(); L6881 mPwd=MD5Utils.b(password + pbbppqb.pbpdbqp + mLocalkey); L6975 thingCamera.connect("admin", mPwd, ...).
+Separator pbbppqb.pbpdbqp="||". MD5Utils=camera.utils.chaos: b(s)=HexUtil.a(MD5(s.getBytes())) = LOWERCASE 32-hex.
+=> auth_password = md5_hex_lower( password ++ "||" ++ localKey ); username "admin" was already correct.
+C++ ThingNetProtocolManager::SendAuthorizationInfo @002c8028 confirms 104B blob: magic@0=0x12345678, reqId@4, username@8 (strncpy 0x1f), password@0x28 (strncpy 0x3f), sent 0x68 via thing_p2p_rtc_send_data; then SendCommand(this,0,10,0,{0x10000}) = the VERSION PDU. Layout matches our build_auth_pdu exactly; only the password VALUE was wrong (raw vs md5).
+Prior live run with raw pwd: camera went TOTALLY silent at KCP (tore down on bad auth) vs ACKing without auth - consistent with auth being VALIDATED. Fix + live-test workflow running.
+
+LIVE SUCCESS — VIDEO FLOWING. With the auth fix (auth_password = md5_hex_lower(password || localKey), username "admin"), the camera flipped from total KCP silence to: conv=0 una advancing 0->5 (auth+control ACCEPTED) AND conv=1 pushing 12 video segments (full 1212B payloads). Live run wrote /tmp/live_md5.ts = 251732 bytes; ffprobe = two programs each h264 1920x1080 + aac, 19 video packets. Independently re-verified. The full live stack now works end-to-end: MQTT-302 signaling -> ICE (bidirectional, trickle, no USE-CANDIDATE) -> conv=0 media-start (AUTH md5 + VERSION + 3 commands, contiguous sn=0..4) -> conv=1 video -> KCP/AES-128-CBC/HMAC-SHA1 decrypt -> H.264 -> MPEG-TS.
+Post-impl review (mped-architect + qa-test-runner, both green): fixed set_media_auth doc (was re-arming the raw-password bug), added MEDIUM-confidence note + anomaly on the @4=reqId claim, reconciled offset vocabulary, de-circularized the lowercase-hex confidence note (HexUtil.a() not byte-verified; live-validated), and added a media_auth_args() seam + regression test asserting the DERIVED (not raw) password is armed. Gates: just e2e OK, 377 tests (--features live), clippy -D warnings clean, fmt clean, secret-scan OK.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Live SCD921 A/V stream works end-to-end in the Rust client: the camera now pushes real 1080p H.264 + AAC, decoded and muxed to MPEG-TS.
+
+What changed (the arc of this task):
+- Bidirectional ICE: bind the media UDP socket early, trickle our own host candidate to the camera (the app sends 429; we sent 0), RTO-backoff nomination retransmit with NO USE-CANDIDATE, tolerate transient ICMP ECONNREFUSED — the camera then opens and validates a path back to us.
+- conv=0 media-start handshake (Ghidra-grounded, libThingCameraSDK): emit AUTH(sn=0) + VERSION(sn=1) + the three cap4 command PDUs(sn=2,3,4) contiguously, each sealed suite-3 (AES-128-CBC + HMAC-SHA1 over KCP).
+- THE unblock — auth password derivation (jadx IPCThingP2PCamera:6881): the conv=0 AUTH password is md5_hex_lower(password ++ "||" ++ localKey), username "admin" — NOT the raw rtc.config password. Sending the raw value made the camera tear down the channel on AUTH (total KCP silence); the derived value makes it accept auth and stream video.
+
+Verification: live run produced a 251KB .ts = h264 1920x1080 + aac (independently ffprobe-confirmed). Offline gates: just e2e OK, 377 tests (--features live), clippy -D warnings clean, fmt clean, secret-scan OK. A media_auth_args() seam + regression test lock the derived-not-raw password against reintroduction.
+
+Residuals (separate tasks): single-egress-IP host candidate (multi-NIC needs a vendored if-addrs); srflx/TURN remote/NAT path still stubbed; the @4 reqId field is MEDIUM-confidence (non-monotonic captured values unexplained); HexUtil lowercase-hex inferred (live-validated, not byte-verified from decompile).
+<!-- SECTION:FINAL_SUMMARY:END -->

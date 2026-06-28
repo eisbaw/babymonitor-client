@@ -400,9 +400,18 @@ impl MediaEngine {
 
     /// Set the conv=0 media-start **AUTH** credentials (`SendAuthorizationInfo`).
     /// Once set, [`open_media_start`](Self::open_media_start) emits the 104-byte
-    /// AUTH PDU FIRST (KCP sn=0), then the three cap4 continuation PDUs (sn=1,2,3).
-    /// `username` is the hardcoded `"admin"`; `password` is the camera-info
-    /// `password` (`rtc.config result.password`). **SECRET** — never logged.
+    /// AUTH PDU FIRST (KCP sn=0), then the 24-byte VERSION PDU
+    /// ([`control::MEDIA_START_VERSION_PDU`], sn=1), then the three cap4
+    /// continuation PDUs (sn=2,3,4). `username` is the hardcoded `"admin"`.
+    ///
+    /// **`password` is NOT the raw `rtc.config result.password`.** The caller MUST
+    /// pass the *derived* wire password
+    /// [`control::derive_media_auth_password`]`(raw_password, local_key)` =
+    /// `md5_hex_lower(raw ++ "||" ++ localKey)`. Passing the raw camera-info password
+    /// here is exactly the bug that made the camera go silent on AUTH (it validates
+    /// the credential and tears the channel down) — this method takes a plain
+    /// `String` and cannot enforce the precondition, so it is the caller's contract.
+    /// **SECRET** — never logged.
     pub fn set_media_auth(&mut self, username: String, password: String) {
         self.media_auth = Some((username, password));
     }
@@ -414,26 +423,32 @@ impl MediaEngine {
     ///
     /// 1. the 104-byte conv=0 **AUTH** PDU ([`control::build_auth_pdu`]) at **sn=0**
     ///    (`SendAuthorizationInfo`: magic `0x12345678`, `code`, `username="admin"`,
-    ///    `password`), then
-    /// 2. the three cap4 [`control::MEDIA_START_PDUS`] at **sn=1,2,3**.
+    ///    `password`),
+    /// 2. the 24-byte **VERSION** PDU ([`control::MEDIA_START_VERSION_PDU`]) at
+    ///    **sn=1** (`SendCommand(0,10,0,{0x00010000})`, the tail of
+    ///    `SendAuthorizationInfo`), then
+    /// 3. the three cap4 [`control::MEDIA_START_PDUS`] at **sn=2,3,4**.
     ///
     /// With no auth set, only the three continuation PDUs are emitted (sn=0,1,2) —
-    /// the legacy behavior. So this returns **4** datagrams with auth, **3** without.
-    /// Each is recorded for retransmit
+    /// the legacy behavior. So this returns **5** datagrams with auth, **3** without.
+    /// (We deliberately skip the one response-driven command between the version
+    /// PDU and the continuation PDUs so the conv=0 `sn` stays CONTIGUOUS — a KCP gap
+    /// would stall the in-order stream; if the camera requires it that is a separate
+    /// cap7 item.) Each datagram is recorded for retransmit
     /// ([`media_start_retransmits`](Self::media_start_retransmits)) until the camera
     /// acks it.
     ///
     /// Each datagram is `append_datagram_hmac( encode_segment(conv=0, PUSH, frg=0,
     /// wnd=SND_WND, ts, sn, una, seal_segment_cbc(PDU, key, iv)) )`, where `sn`
     /// ascends from [`MEDIA_START_SN`] and `una` is our conv=0 `rcv_nxt`
-    /// ([`MEDIA_START_UNA`] at open). On-wire size: the three 28-byte PDUs are
-    /// `24` (KCP header) `+ 48` (16B IV + 32B CBC of the 28B PDU) `+ 20` (HMAC) =
-    /// **92** bytes each; the AUTH datagram is `24 + (16B IV + 112B CBC of the
-    /// PKCS#7-padded 104B PDU) + 20` = **172** bytes.
+    /// ([`MEDIA_START_UNA`] at open). On-wire size: the three 28-byte PDUs and the
+    /// 24-byte VERSION PDU are each `24` (KCP header) `+ 48` (16B IV + 32B CBC of the
+    /// PKCS#7-padded PDU) `+ 20` (HMAC) = **92** bytes; the AUTH datagram is
+    /// `24 + (16B IV + 112B CBC of the PKCS#7-padded 104B PDU) + 20` = **172** bytes.
     ///
-    /// `ivs` are the four per-segment inline IVs (caller-supplied so the bytes are
+    /// `ivs` are the five per-segment inline IVs (caller-supplied so the bytes are
     /// reproducible in tests; production passes fresh OS entropy). Only the first
-    /// `N` are consumed (`N` = number of datagrams emitted: 4 with auth, 3 without).
+    /// `N` are consumed (`N` = number of datagrams emitted: 5 with auth, 3 without).
     /// `ts` is the KCP millisecond timestamp (caller-owned clock — keeps this
     /// offline-testable).
     ///
@@ -445,7 +460,7 @@ impl MediaEngine {
     ///   errors (e.g. a wrong-length key — already rejected at construction).
     pub fn open_media_start(
         &mut self,
-        ivs: &[[u8; crypto::IV_LEN]; 4],
+        ivs: &[[u8; crypto::IV_LEN]; 5],
         ts: u32,
     ) -> Result<Vec<Vec<u8>>, Error> {
         if self.suite != CipherSuite::AesCbcHmac {
@@ -461,10 +476,22 @@ impl MediaEngine {
         let mut out = Vec::with_capacity(ivs.len());
         let mut next_iv = 0usize;
 
-        // FIRST (sn=0, if set): the 104-byte AUTH PDU (`SendAuthorizationInfo`).
+        // FIRST (sn=0, if set): the 104-byte AUTH PDU (`SendAuthorizationInfo`),
+        // then (sn=1) the 24-byte VERSION PDU (`SendCommand(0,10,0,{0x00010000})`,
+        // the tail of `SendAuthorizationInfo`).
         if let Some((username, password)) = self.media_auth.clone() {
             let pdu = control::build_auth_pdu(control::MEDIA_START_AUTH_CODE, &username, &password);
             let wire = self.frame_conv0_push(&pdu, &ivs[next_iv], ts, una, &key)?;
+            next_iv += 1;
+            out.push(wire);
+
+            let wire = self.frame_conv0_push(
+                &control::MEDIA_START_VERSION_PDU,
+                &ivs[next_iv],
+                ts,
+                una,
+                &key,
+            )?;
             next_iv += 1;
             out.push(wire);
         }
@@ -517,7 +544,7 @@ impl MediaEngine {
 
     /// **TX: the still-unacknowledged media-start datagrams** to retransmit (a clone
     /// of the sender's unacked wire bytes; the originals stay recorded so a later
-    /// `una` still prunes them). Empty once the camera acks all three.
+    /// `una` still prunes them). Empty once the camera acks all of them.
     #[must_use]
     pub fn media_start_retransmits(&self) -> Vec<Vec<u8>> {
         self.media_start_sender
@@ -989,8 +1016,14 @@ mod tests {
             MEDIA_START_UNA,
             "rcv_nxt seeded to the open una"
         );
-        // Four IVs are supplied even though only three are consumed (no auth set).
-        let ivs = [[0xA0u8; 16], [0xA1u8; 16], [0xA2u8; 16], [0xA3u8; 16]];
+        // Five IVs are supplied even though only three are consumed (no auth set).
+        let ivs = [
+            [0xA0u8; 16],
+            [0xA1u8; 16],
+            [0xA2u8; 16],
+            [0xA3u8; 16],
+            [0xA4u8; 16],
+        ];
         let dgs = engine.open_media_start(&ivs, 0x1111_2222).unwrap();
         assert_eq!(dgs.len(), 3, "no auth ⇒ the legacy 3 continuation PDUs");
         for (i, dg) in dgs.iter().enumerate() {
@@ -1026,12 +1059,14 @@ mod tests {
         assert!(engine.media_start_retransmits().is_empty());
     }
 
-    // ── media-start AUTH: the 104-byte SendAuthorizationInfo PDU at sn=0 ────
-    // With auth set, open_media_start emits FOUR conv=0 PUSH datagrams in sn order:
-    // sn=0 is the 104-byte AUTH PDU (magic/code/username/password), sn=1,2,3 are the
-    // three cap4 continuation PDUs. The AUTH datagram is 24+(16+112)+20 = 172 bytes.
+    // ── media-start AUTH: AUTH(sn=0) + VERSION(sn=1) + 3 PDUs(sn=2,3,4) ─────
+    // With auth set, open_media_start emits FIVE conv=0 PUSH datagrams in sn order:
+    // sn=0 is the 104-byte AUTH PDU (magic/code/username/password), sn=1 is the
+    // 24-byte VERSION PDU (SendCommand(0,10,0,{0x00010000})), sn=2,3,4 are the three
+    // cap4 continuation PDUs. The AUTH datagram is 24+(16+112)+20 = 172 bytes; the
+    // VERSION + continuation PDUs are each 24+(16+32)+20 = 92 bytes.
     #[test]
-    fn open_media_start_with_auth_frames_auth_then_three_pdus() {
+    fn open_media_start_with_auth_frames_auth_version_then_three_pdus() {
         // SYNTHETIC username/password (CLAUDE.md).
         let pwd = "SynthAuthPwd"; // secret-scan:allow (synthetic test password)
         let mut engine = MediaEngine::from_security_level(3, KEY.to_vec()).unwrap();
@@ -1040,26 +1075,32 @@ mod tests {
             pwd.to_string(),
         );
 
-        let ivs = [[0xB0u8; 16], [0xB1u8; 16], [0xB2u8; 16], [0xB3u8; 16]];
+        let ivs = [
+            [0xB0u8; 16],
+            [0xB1u8; 16],
+            [0xB2u8; 16],
+            [0xB3u8; 16],
+            [0xB4u8; 16],
+        ];
         let dgs = engine.open_media_start(&ivs, 0x3333_4444).unwrap();
         assert_eq!(
             dgs.len(),
-            4,
-            "auth PDU (sn=0) + 3 continuation PDUs (sn=1,2,3)"
+            5,
+            "AUTH (sn=0) + VERSION (sn=1) + 3 continuation PDUs (sn=2,3,4)"
         );
 
-        // Every datagram is a well-formed conv=0 suite-3 PUSH with ascending sn.
+        // Every datagram is a well-formed conv=0 suite-3 PUSH with ascending sn 0..4.
         for (i, dg) in dgs.iter().enumerate() {
             let conv = u32::from_le_bytes([dg[0], dg[1], dg[2], dg[3]]);
             assert_eq!(conv, control::MEDIA_START_CONV, "conv=0");
             assert_eq!(dg[4], kcp::IKCP_CMD_PUSH, "cmd=PUSH");
             assert_eq!(dg[5], 0, "frg=0");
             let sn = u32::from_le_bytes([dg[12], dg[13], dg[14], dg[15]]);
-            assert_eq!(sn, MEDIA_START_SN + i as u32, "sn ascends 0,1,2,3");
+            assert_eq!(sn, MEDIA_START_SN + i as u32, "sn ascends 0,1,2,3,4");
         }
 
         // sn=0: the AUTH PDU. 104B → PKCS#7 pad to 112 → IV(16)+112 = 128 payload →
-        // 24+128+20 = 172 on-wire bytes.
+        // 24+128+20 = 172 on-wire bytes (the 104->128 ciphertext+IV the task pins).
         let auth = &dgs[0];
         assert_eq!(
             auth.len(),
@@ -1070,7 +1111,7 @@ mod tests {
         assert_eq!(
             auth_len,
             crypto::IV_LEN + 112,
-            "AUTH payload = 16B IV + 112B CBC"
+            "AUTH payload = 16B IV + 112B CBC (104->128)"
         );
         let auth_body = crypto::verify_and_strip_hmac(auth, KEY).unwrap();
         let auth_seg = &auth_body[kcp::IKCP_OVERHEAD..kcp::IKCP_OVERHEAD + auth_len];
@@ -1093,10 +1134,43 @@ mod tests {
         assert_eq!(&auth_pdu[8..8 + 5], b"admin");
         assert_eq!(&auth_pdu[0x28..0x28 + pwd.len()], pwd.as_bytes());
 
-        // sn=1,2,3: the three cap4 continuation PDUs, decrypted in order.
-        for (j, dg) in dgs[1..].iter().enumerate() {
-            assert_eq!(dg.len(), 92, "continuation datagram {j}: 24 + 48 + 20");
+        // sn=1: the 24-byte VERSION PDU. 24B → PKCS#7 pad to 32 → IV(16)+32 = 48
+        // payload → 24+48+20 = 92 on-wire bytes (the 24->48 ciphertext+IV).
+        let ver = &dgs[1];
+        assert_eq!(
+            ver.len(),
+            92,
+            "VERSION datagram = 24 hdr + 48 payload + 20 HMAC"
+        );
+        let ver_len = u32::from_le_bytes([ver[20], ver[21], ver[22], ver[23]]) as usize;
+        assert_eq!(
+            ver_len,
+            crypto::IV_LEN + 32,
+            "VERSION payload = 16B IV + 32B CBC (24->48)"
+        );
+        let ver_body = crypto::verify_and_strip_hmac(ver, KEY).unwrap();
+        let ver_seg = &ver_body[kcp::IKCP_OVERHEAD..kcp::IKCP_OVERHEAD + ver_len];
+        let ver_pdu = crypto::decrypt_segment_cbc(ver_seg, KEY).unwrap();
+        assert_eq!(
+            ver_pdu,
+            control::MEDIA_START_VERSION_PDU.to_vec(),
+            "sn=1 decrypts to the 24-byte VERSION PDU"
+        );
+
+        // sn=2,3,4: the three cap4 continuation PDUs (28->48 ciphertext+IV),
+        // decrypted in order.
+        for (j, dg) in dgs[2..].iter().enumerate() {
+            assert_eq!(
+                dg.len(),
+                92,
+                "continuation datagram {j}: 24 + 48 + 20 (28->48)"
+            );
             let len = u32::from_le_bytes([dg[20], dg[21], dg[22], dg[23]]) as usize;
+            assert_eq!(
+                len,
+                crypto::IV_LEN + 32,
+                "continuation payload = 16B IV + 32B CBC"
+            );
             let body = crypto::verify_and_strip_hmac(dg, KEY).unwrap();
             let seg_payload = &body[kcp::IKCP_OVERHEAD..kcp::IKCP_OVERHEAD + len];
             let pdu = crypto::decrypt_segment_cbc(seg_payload, KEY).unwrap();
@@ -1107,10 +1181,10 @@ mod tests {
             );
         }
 
-        // All four are held for retransmit; the camera's cumulative una=4 drains them.
-        assert_eq!(engine.media_start_retransmits().len(), 4);
+        // All five are held for retransmit; the camera's cumulative una=5 drains them.
+        assert_eq!(engine.media_start_retransmits().len(), 5);
         assert!(!engine.media_start_acked());
-        engine.on_peer_una_conv0(4);
+        engine.on_peer_una_conv0(5);
         assert!(engine.media_start_acked());
         assert!(engine.media_start_retransmits().is_empty());
     }
@@ -1119,7 +1193,7 @@ mod tests {
     #[test]
     fn open_media_start_rejects_non_suite3() {
         let mut engine = MediaEngine::from_security_level(4, KEY.to_vec()).unwrap();
-        let ivs = [[0u8; 16]; 4];
+        let ivs = [[0u8; 16]; 5];
         assert!(matches!(
             engine.open_media_start(&ivs, 0),
             Err(Error::Transport(_))
@@ -1134,7 +1208,7 @@ mod tests {
         let mut engine = MediaEngine::from_security_level(3, KEY.to_vec()).unwrap();
         // We have media-start PUSHes outstanding (no auth ⇒ 3 PUSHes, sn 0,1,2).
         engine
-            .open_media_start(&[[1u8; 16], [2u8; 16], [3u8; 16], [4u8; 16]], 0)
+            .open_media_start(&[[1u8; 16], [2u8; 16], [3u8; 16], [4u8; 16], [5u8; 16]], 0)
             .unwrap();
         assert!(!engine.media_start_acked());
 

@@ -11,19 +11,41 @@
 //! 259). Our client did ICE then only *received* → camera-silent media. Replaying
 //! these PDUs is the fix.
 //!
-//! # The 28-byte `imm` control PDU
+//! # The `imm` control PDU (`SendCommand`)
 //! Little-endian, decrypted from cap4 (key#0, HMAC-confirmed —
-//! `re/media_start_handshake.md` §"The 28-byte imm control PDU"). Field layout:
+//! `re/media_start_handshake.md` §"The 28-byte imm control PDU"). Each conv=0
+//! control PDU is a `ThingNetProtocolManager::SendCommand(reqId, high_cmd,
+//! low_cmd, payload)` struct: a 20-byte header (`@0..@0x14`) followed by the
+//! payload. Field layout, **corrected** against the decompile
+//! (`decompiled/ghidra_camera/funcs/funcs/002c5e54_SendCommand.c:44-52`):
 //!
 //! ```text
-//! @0  magic = 0x12345678   (constant — the imm control marker)
-//! @4  u32   per-message:  f253=0x00010004  f254=0x00010003  f255=0x00010005
-//! @8  u32   = 0
-//! @12 u32   per-message:  f253=9          f254=6           f255=0x00040006
-//! @16 u32   = 8           (constant across the three)
-//! @20 u32   = 0
-//! @24 u32   per-message:  f253=4          f254=0           f255=4
+//! @0    u32   magic     = 0x12345678         (constant imm marker; line 45)
+//! @4    u32   reqId     = param_1            (request id; line 46 — see note)
+//! @8    u32   direction                      (0 = app→camera command,
+//!                                             1 = camera→app response — the low
+//!                                             word of the @0xe0 store; 0 here)
+//! @0xc  u32   command   = (low_cmd<<16)|high_cmd   (the real command id; line 52)
+//! @0x10 u32   payload length                 (= 8 for the three 28-byte PDUs; line 51)
+//! @0x14 u8[]  payload                         (`payload length` bytes)
 //! ```
+//!
+//! So the three 28-byte cap4 PDUs are the commands `command = 9` (hi9,lo0),
+//! `6` (hi6,lo0, "open video"), and `0x00040006` (hi6,lo4) — each with an
+//! 8-byte payload — and the 24-byte [`MEDIA_START_VERSION_PDU`] is
+//! `command = 0x0A` (hi10,lo0) with a 4-byte payload.
+//!
+//! **Confidence on `@4`: MEDIUM.** `SendCommand` (line 46) writes the monotonic
+//! `m_nCommandReqId++` counter here, so `@4` is the per-command request id — NOT
+//! the "type" the earlier doc called it (which also wrongly split the `@0xc`
+//! command into two unrelated `@12`/`@24` fields). Caveat we do not fully explain:
+//! the captured `@4` values are `0x00010004 / 0x00010003 / 0x00010005` — a constant
+//! high word `0x0001` with low words `4, 3, 5` in send order f253→f254→f255, i.e.
+//! **not** monotonically increasing (the counter base is `0x00010000`, but the 3→4→5
+//! ordering vs the 4,3,5 captured values is unexplained — possibly a separate
+//! response/request pairing the camera does not validate). We replay the captured
+//! values verbatim; the camera streamed video regardless (live-validated), so `@4`
+//! is not gating. The wire bytes below are the ground truth, not this field label.
 //!
 //! These are **protocol constants / small codes — NO session tokens, no creds**
 //! (`re/media_start_handshake.md` §"The 28-byte imm control PDU"), so they are
@@ -46,43 +68,62 @@ pub const MEDIA_START_PDU_LEN: usize = 28;
 /// PDU **A** — cap4 frame 253 (`78563412 04000100 00000000 09000000 08000000
 /// 00000000 04000000`), the verbatim decrypted plaintext.
 pub const PDU_F253: [u8; MEDIA_START_PDU_LEN] = [
-    0x78, 0x56, 0x34, 0x12, // @0  magic 0x12345678
-    0x04, 0x00, 0x01, 0x00, // @4  0x00010004
-    0x00, 0x00, 0x00, 0x00, // @8  0
-    0x09, 0x00, 0x00, 0x00, // @12 9
-    0x08, 0x00, 0x00, 0x00, // @16 8
-    0x00, 0x00, 0x00, 0x00, // @20 0
-    0x04, 0x00, 0x00, 0x00, // @24 4
+    0x78, 0x56, 0x34, 0x12, // @0    magic 0x12345678
+    0x04, 0x00, 0x01, 0x00, // @4    reqId 0x00010004
+    0x00, 0x00, 0x00, 0x00, // @8    direction 0
+    0x09, 0x00, 0x00, 0x00, // @0xc  command 9
+    0x08, 0x00, 0x00, 0x00, // @0x10 payload len 8
+    0x00, 0x00, 0x00, 0x00, // @0x14 payload[0..4]
+    0x04, 0x00, 0x00, 0x00, // @0x18 payload[4..8]
 ];
 
 /// PDU **B** — cap4 frame 254 (`78563412 03000100 00000000 06000000 08000000
 /// 00000000 00000000`), the verbatim decrypted plaintext.
 pub const PDU_F254: [u8; MEDIA_START_PDU_LEN] = [
-    0x78, 0x56, 0x34, 0x12, // @0  magic 0x12345678
-    0x03, 0x00, 0x01, 0x00, // @4  0x00010003
-    0x00, 0x00, 0x00, 0x00, // @8  0
-    0x06, 0x00, 0x00, 0x00, // @12 6
-    0x08, 0x00, 0x00, 0x00, // @16 8
-    0x00, 0x00, 0x00, 0x00, // @20 0
-    0x00, 0x00, 0x00, 0x00, // @24 0
+    0x78, 0x56, 0x34, 0x12, // @0    magic 0x12345678
+    0x03, 0x00, 0x01, 0x00, // @4    reqId 0x00010003
+    0x00, 0x00, 0x00, 0x00, // @8    direction 0
+    0x06, 0x00, 0x00, 0x00, // @0xc  command 6 ("open video")
+    0x08, 0x00, 0x00, 0x00, // @0x10 payload len 8
+    0x00, 0x00, 0x00, 0x00, // @0x14 payload[0..4]
+    0x00, 0x00, 0x00, 0x00, // @0x18 payload[4..8]
 ];
 
 /// PDU **C** — cap4 frame 255 (`78563412 05000100 00000000 06000400 08000000
 /// 00000000 04000000`), the verbatim decrypted plaintext.
 pub const PDU_F255: [u8; MEDIA_START_PDU_LEN] = [
-    0x78, 0x56, 0x34, 0x12, // @0  magic 0x12345678
-    0x05, 0x00, 0x01, 0x00, // @4  0x00010005
-    0x00, 0x00, 0x00, 0x00, // @8  0
-    0x06, 0x00, 0x04, 0x00, // @12 0x00040006
-    0x08, 0x00, 0x00, 0x00, // @16 8
-    0x00, 0x00, 0x00, 0x00, // @20 0
-    0x04, 0x00, 0x00, 0x00, // @24 4
+    0x78, 0x56, 0x34, 0x12, // @0    magic 0x12345678
+    0x05, 0x00, 0x01, 0x00, // @4    reqId 0x00010005
+    0x00, 0x00, 0x00, 0x00, // @8    direction 0
+    0x06, 0x00, 0x04, 0x00, // @0xc  command 0x00040006 (hi6,lo4)
+    0x08, 0x00, 0x00, 0x00, // @0x10 payload len 8
+    0x00, 0x00, 0x00, 0x00, // @0x14 payload[0..4]
+    0x04, 0x00, 0x00, 0x00, // @0x18 payload[4..8]
 ];
 
 /// The three media-start control PDUs, in the exact send order the cap4 app used
 /// (frames 253 → 254 → 255). Replayed verbatim as KCP PUSH payloads on
 /// [`MEDIA_START_CONV`]. **Ground truth** (`re/media_start_handshake.md`).
 pub const MEDIA_START_PDUS: [[u8; MEDIA_START_PDU_LEN]; 3] = [PDU_F253, PDU_F254, PDU_F255];
+
+/// The conv=0 **VERSION** control PDU — a 24-byte `SendCommand(reqId=0,
+/// high_cmd=10, low_cmd=0, payload=0x00010000)` the app emits at KCP **sn=1**,
+/// directly after the AUTH PDU. It is the tail of `SendAuthorizationInfo`, which
+/// allocates a 4-byte `0x00010000` payload vector and frames it as a command:
+/// `SendCommand(this,0,10,0,{0x00010000})`
+/// (`decompiled/ghidra_camera/funcs/funcs/002c8028_SendAuthorizationInfo.c:83-89`
+/// builds the payload; `…/002c5e54_SendCommand.c:44-52` builds the struct). A
+/// 20-byte header — magic / reqId=0 / direction=0 / command=0x0A=(low0<<16)|high10
+/// / payload-len=4 — plus the 4-byte little-endian payload `0x00010000`. Replayable
+/// verbatim (protocol constants only — NO session tokens, no creds).
+pub const MEDIA_START_VERSION_PDU: [u8; 24] = [
+    0x78, 0x56, 0x34, 0x12, // @0    magic 0x12345678
+    0x00, 0x00, 0x00, 0x00, // @4    reqId = 0
+    0x00, 0x00, 0x00, 0x00, // @8    direction = 0 (app→camera command)
+    0x0A, 0x00, 0x00, 0x00, // @0xc  command = 0x0A = (low0<<16)|high10
+    0x04, 0x00, 0x00, 0x00, // @0x10 payload length = 4
+    0x00, 0x00, 0x01, 0x00, // @0x14 payload = 0x00010000 (LE)
+];
 
 // ── The conv=0 media-start AUTH PDU (`SendAuthorizationInfo`, sn=0) ──────────
 //
@@ -155,9 +196,57 @@ pub fn build_auth_pdu(code: i32, username: &str, password: &str) -> [u8; MEDIA_S
     p
 }
 
-/// Build one `imm` control PDU from its three per-message fields (`@4`, `@12`,
-/// `@24`), with the constant `@0` magic / `@16` = 8 / `@8` = `@20` = 0 (the field
-/// layout documented in the module header). This only **documents** the structure
+/// Derive the conv=0 media-start AUTH **password** from the camera-info `password`
+/// and the device `localKey`.
+///
+/// The raw 8-char `rtc.config result.password` is **not** what the app puts in the
+/// AUTH PDU. The real client salts it with the device `localKey` and MD5-hashes the
+/// pair before connecting. jadx ground truth
+/// (`decompiled/jadx/sources/com/thingclips/smart/camera/ipccamerasdk/IPCThingP2PCamera.java`):
+///
+/// ```text
+/// 6874: String password = this.mBean.getPassword();   // 8-char rtc.config password
+/// 6875: this.mLocalkey = this.mBean.getLocalKey();     // device localKey
+/// 6881: this.mPwd = MD5Utils.b(password + com.thingclips.sdk.mqtt.pbbppqb.pbpdbqp + this.mLocalkey);
+/// 6975: this.thingCamera.connect("admin", this.mPwd, ...);   // username "admin", password = mPwd
+/// ```
+///
+/// - The separator constant `pbbppqb.pbpdbqp = "||"`
+///   (`com/thingclips/sdk/mqtt/pbbppqb.java:26`).
+/// - `MD5Utils` is `com.thingclips.smart.camera.utils.chaos.MD5Utils`:
+///   `b(s) = HexUtil.a(MD5(s.getBytes()))` → a **lowercase** 32-char hex string
+///   (Tuya's `HexUtil` emits lowercase across their SDKs).
+///
+/// So the wire password is:
+///
+/// ```text
+/// auth_password = md5_hex_lower( utf8(password) ++ "||" ++ utf8(localKey) )   // 32 ASCII hex chars
+/// ```
+///
+/// and the username stays the constant [`MEDIA_START_AUTH_USERNAME`] (`"admin"`).
+/// The resulting 32-char hex fits the C++ `password@0x28` slot (max `0x3f`) in
+/// [`build_auth_pdu`] without truncation.
+///
+/// # Confidence
+/// **HIGH** on the structure (the `password ++ "||" ++ localKey` MD5 is read directly
+/// from the decompiled `IPCThingP2PCamera.connect` path). The one residual assumption
+/// is hex **case**: `chaos::HexUtil.a()` was NOT byte-verified from the decompile (its
+/// body did not survive jadx/apktool — only the class shell remains), so lowercase is
+/// *inferred* from Tuya's conventional `HexUtil` output. It is not independently
+/// corroborated by [`crate::sign::md5_hex_lower`] (that is our own reimplementation,
+/// not a decompile of `HexUtil.a()`). The decisive evidence is the **live test**: this
+/// derivation made the SCD921 accept the conv=0 AUTH and push video end-to-end, which
+/// it would not have done with the wrong case.
+#[must_use]
+pub fn derive_media_auth_password(password: &str, local_key: &str) -> String {
+    crate::sign::md5_hex_lower(format!("{password}||{local_key}").as_bytes())
+}
+
+/// Build one 28-byte `imm` control PDU from its three per-message fields: `f4` =
+/// `@4` reqId, `f12` = `@0xc` command id, and `f24` = the **second** word of the
+/// 8-byte payload (`@0x18`). The constants are `@0` magic, `@0x10` payload-len = 8,
+/// and `@8` (direction) = `@0x14` (first payload word) = 0 — the `SendCommand`
+/// layout documented in the module header. This only **documents** the structure
 /// — [`MEDIA_START_PDUS`] is the on-wire ground truth; the builder is cross-checked
 /// against the literals in tests.
 #[must_use]
@@ -211,8 +300,40 @@ mod tests {
         }
     }
 
+    // The 24-byte VERSION PDU (SendCommand(0,10,0,{0x00010000})), sent at sn=1 after
+    // the AUTH PDU: 24 bytes, imm magic @0, command 0x0A @0xc, payload 0x00010000.
+    // Ground truth: ghidra_camera 002c8028:83-89 (payload) + 002c5e54 (struct).
+    #[test]
+    fn version_pdu_is_24b_sendcommand_0x0a() {
+        let v = MEDIA_START_VERSION_PDU;
+        assert_eq!(v.len(), 24, "20B SendCommand header + 4B payload");
+        assert_eq!(
+            u32::from_le_bytes([v[0], v[1], v[2], v[3]]),
+            0x1234_5678,
+            "@0 imm magic"
+        );
+        // @0xc command = (low_cmd<<16)|high_cmd = 0x0A (high=10, low=0).
+        assert_eq!(
+            u32::from_le_bytes([v[0xc], v[0xd], v[0xe], v[0xf]]),
+            0x0A,
+            "@0xc command id is 0x0A"
+        );
+        // @0x10 payload length = 4; @0x14 payload = 0x00010000 (little-endian).
+        assert_eq!(
+            u32::from_le_bytes([v[0x10], v[0x11], v[0x12], v[0x13]]),
+            4,
+            "@0x10 payload length = 4"
+        );
+        assert_eq!(
+            u32::from_le_bytes([v[0x14], v[0x15], v[0x16], v[0x17]]),
+            0x0001_0000,
+            "@0x14 payload = 0x00010000"
+        );
+    }
+
     // The builder reproduces each literal from its three per-message fields — this
-    // documents the @4 / @12 / @24 field semantics AND guards a typo in the literals.
+    // documents the @4 / @0xc / payload field semantics AND guards a typo in the
+    // literals.
     #[test]
     fn builder_reproduces_the_literals() {
         assert_eq!(build_media_start_pdu(0x0001_0004, 9, 4), PDU_F253);
@@ -282,5 +403,34 @@ mod tests {
         assert_eq!(&pdu[0x28..0x28 + 0x3f], &b"p".repeat(0x3f)[..]);
         // The struct is still exactly 104 bytes (no overrun).
         assert_eq!(pdu.len(), 104);
+    }
+
+    // KAT for the conv=0 AUTH password derivation
+    // (md5_hex_lower(password ++ "||" ++ localKey); jadx IPCThingP2PCamera:6881).
+    // SYNTHETIC inputs (never a real credential — CLAUDE.md). The expected digest
+    // was computed independently:
+    //   python3 -c 'import hashlib;print(hashlib.md5(b"pw123456||0123456789abcdef").hexdigest())'
+    //   => cad489ac966634d654f21abd0f868e3c
+    #[test]
+    fn derive_media_auth_password_matches_independent_md5_kat() {
+        // SYNTHETIC password / localKey — not a real value.
+        let pw = "pw123456"; // secret-scan:allow (synthetic test password)
+        let lk = "0123456789abcdef"; // secret-scan:allow (synthetic test localKey)
+        let derived = derive_media_auth_password(pw, lk);
+
+        // Exact independently-computed MD5 hex of `pw ++ "||" ++ lk`.
+        assert_eq!(derived, "cad489ac966634d654f21abd0f868e3c");
+
+        // Shape invariants: 32 chars, all ascii lowercase hex.
+        assert_eq!(derived.len(), 32, "MD5 hex is always 32 chars");
+        assert!(
+            derived
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "HexUtil emits lowercase hex only"
+        );
+
+        // The 32-char hex fits the AUTH PDU password slot (max 0x3f) untruncated.
+        assert!(derived.len() <= AUTH_PASSWORD_MAX);
     }
 }

@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use babymonitor_core::session::{Session, SessionStore};
 use babymonitor_core::stream::media::audio;
-use babymonitor_core::stream::media::control::MEDIA_START_AUTH_USERNAME;
+use babymonitor_core::stream::media::control::{self, MEDIA_START_AUTH_USERNAME};
 use babymonitor_core::stream::media::h264::H264Depacketizer;
 use babymonitor_core::stream::media::stun::{self, IceRole};
 use babymonitor_core::stream::media::transport::{
@@ -327,24 +327,27 @@ pub fn run_live_stream(args: &StreamArgs) -> Result<(), Error> {
     // negotiated security_level rides the answer header (cap4 == 3).
     let mut engine = MediaEngine::from_security_level(3, answer.media_key.clone())?;
     // The conv=0 media-start AUTH PDU (`SendAuthorizationInfo`, KCP sn=0): username
-    // is the constant "admin", password is the camera-info `password`
-    // (rtc.config result.password). Set it ONLY when present — a config without it
-    // falls back to the legacy 3-PDU media-start rather than sending an
-    // empty-password AUTH. The password is SECRET and never logged.
-    if creds.media_auth_password.is_empty() {
-        eprintln!(
+    // is the constant "admin". The password is NOT the raw camera-info `password` —
+    // the real app derives it (jadx IPCThingP2PCamera:6881):
+    //   mPwd = MD5Utils.b(password + "||" + localKey)  → md5_hex_lower(pw ++ "||" ++ lk)
+    // We arm it ONLY when the RAW camera-info `password` (rtc.config result.password)
+    // is present — a config without it falls back to the legacy 3-PDU media-start
+    // rather than sending an empty-password AUTH. Both the raw password and the
+    // derived md5 are SECRET and never logged.
+    match media_auth_args(&creds) {
+        None => eprintln!(
             "stream (live): no camera-info password (rtc.config result.password) — sending the \
              media-start WITHOUT the conv=0 AUTH PDU (legacy 3-PDU path)."
-        );
-    } else {
-        engine.set_media_auth(
-            MEDIA_START_AUTH_USERNAME.to_string(),
-            creds.media_auth_password.clone(),
-        );
-        eprintln!(
-            "stream (live): conv=0 media-start AUTH armed (username=\"{MEDIA_START_AUTH_USERNAME}\", \
-             password redacted)."
-        );
+        ),
+        Some((username, derived)) => {
+            let derived_len = derived.len();
+            engine.set_media_auth(username.to_string(), derived);
+            eprintln!(
+                "stream (live): conv=0 media-start AUTH armed (username=\"{username}\", \
+                 password = DERIVED md5_hex_lower(password || localKey), {derived_len} hex chars; \
+                 value redacted)."
+            );
+        }
     }
     // The consent/keepalive + nomination context: retransmit our nominating check
     // (RFC 5389 backoff) until validated, refresh consent ~every 5 s, and answer the
@@ -466,6 +469,24 @@ fn load_runtime(path: &Path) -> Result<Option<StreamRuntime>, Error> {
             .map_err(|e| Error::StreamConfig(format!("parse {}: {e}", path.display()))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(Error::StreamConfig(format!("read {}: {e}", path.display()))),
+    }
+}
+
+/// The conv=0 media-start AUTH args to arm, or `None` when no raw camera-info
+/// password is present (→ legacy 3-PDU media-start, no AUTH PDU). This is the single
+/// seam enforcing that the wire password is ALWAYS the *derived* md5
+/// ([`control::derive_media_auth_password`] = `md5_hex_lower(raw ++ "||" ++ localKey)`),
+/// never the raw `rtc.config result.password` — sending the raw value is the bug that
+/// makes the camera tear down the channel on AUTH. Returns `(username, derived_pwd)`;
+/// both are SECRET and must never be logged. Unit-tested below.
+fn media_auth_args(creds: &StreamCredentials) -> Option<(&'static str, String)> {
+    if creds.media_auth_password.is_empty() {
+        None
+    } else {
+        Some((
+            MEDIA_START_AUTH_USERNAME,
+            control::derive_media_auth_password(&creds.media_auth_password, &creds.local_key),
+        ))
     }
 }
 
@@ -936,10 +957,11 @@ impl PumpTimers {
 
 /// Drives the **client-initiated KCP/imm media-start handshake** (TASK-0083,
 /// `re/media_start_handshake.md`): after ICE validates, the SCD921 still will NOT
-/// stream until the client sends the three conv=0 control PUSHes first. We send
-/// them once the pair is first proven, then retransmit (RFC 5389-style backoff)
-/// until real media arrives. Pure given the injected clock — the send/retransmit
-/// gating is unit-testable without a socket.
+/// stream until the client sends the conv=0 control PUSHes first (5 with the AUTH +
+/// VERSION PDUs when armed, the 3 cap4 continuation PDUs otherwise). We send them
+/// once the pair is first proven, then retransmit (RFC 5389-style backoff) until
+/// real media arrives. Pure given the injected clock — the send/retransmit gating
+/// is unit-testable without a socket.
 struct MediaStartState {
     /// Whether the three media-start PUSHes have been emitted (sent exactly once).
     sent: bool,
@@ -981,11 +1003,12 @@ impl MediaStartState {
 }
 
 /// Emit the client-initiated media-start handshake on the connected media socket:
-/// mint four fresh inline IVs + a KCP millisecond timestamp, frame the conv=0
-/// control PDUs ([`MediaEngine::open_media_start`]) — the AUTH PDU (sn=0) when
-/// armed plus the three cap4 continuation PDUs — and `try_send` each. Returns the
-/// count sent (4 with auth, 3 without) for the log line. `try_send` tolerates the
-/// transient ICE `ConnectionRefused`/`WouldBlock` exactly as the nomination path does.
+/// mint five fresh inline IVs + a KCP millisecond timestamp, frame the conv=0
+/// control PDUs ([`MediaEngine::open_media_start`]) — the AUTH PDU (sn=0) + the
+/// VERSION PDU (sn=1) when armed, plus the three cap4 continuation PDUs (sn=2,3,4)
+/// — and `try_send` each. Returns the count sent (5 with auth, 3 without) for the
+/// log line. `try_send` tolerates the transient ICE `ConnectionRefused`/`WouldBlock`
+/// exactly as the nomination path does.
 ///
 /// # Errors
 /// - [`Error`] from the random source or [`MediaEngine::open_media_start`]
@@ -994,10 +1017,10 @@ fn send_media_start(
     engine: &mut MediaEngine,
     transport: &mtransport::UdpMediaTransport,
 ) -> Result<usize, Error> {
-    // Four fresh inline IVs: one for the optional AUTH PDU (sn=0) + three for the
-    // continuation PDUs. `open_media_start` consumes only as many as it emits
-    // (4 with auth, 3 without).
-    let mut ivs = [[0u8; 16]; 4];
+    // Five fresh inline IVs: one each for the optional AUTH PDU (sn=0) + VERSION PDU
+    // (sn=1) + the three continuation PDUs. `open_media_start` consumes only as many
+    // as it emits (5 with auth, 3 without).
+    let mut ivs = [[0u8; 16]; 5];
     for iv in &mut ivs {
         OsRandom.fill(iv)?;
     }
@@ -1099,8 +1122,9 @@ fn pump_to_output(
                         keep.mark_validated();
                         // TASK-0083 ROOT-CAUSE FIX: the camera accepted our check but
                         // will NOT stream until we send the conv=0 KCP/imm media-start
-                        // control PUSHes first. Send the three exactly once; the loop's
-                        // retransmit (above) covers loss until media flows.
+                        // control PUSHes first. Send them exactly once (sn=0..4 with
+                        // AUTH+VERSION armed, sn=0..2 otherwise); the loop's retransmit
+                        // (above) covers loss until media flows.
                         if !mstart.sent {
                             let n = send_media_start(engine, transport)?;
                             mstart.sent = true;
@@ -1659,6 +1683,32 @@ mod tests {
         assert_eq!(hex_decode("00ff10").unwrap(), vec![0x00, 0xff, 0x10]);
         assert!(hex_decode("0").is_none()); // odd length
         assert!(hex_decode("zz").is_none()); // non-hex
+    }
+
+    #[test]
+    fn media_auth_args_arms_derived_password_never_raw() {
+        // Regression guard for the exact glue line where the camera-silent-on-AUTH
+        // bug lived: the armed conv=0 wire password MUST be the derived md5, never
+        // the raw rtc.config password — and an absent raw password yields no AUTH.
+        const RAW_PWD: &str = "pw123456"; // secret-scan:allow (synthetic test pwd)
+        let mut creds = build_stream_credentials(&synthetic_runtime());
+        creds.media_auth_password = RAW_PWD.into();
+        creds.local_key = SYNTH_LK.into();
+
+        let (user, pwd) =
+            media_auth_args(&creds).expect("AUTH armed when a raw password is present");
+        assert_eq!(user, "admin");
+        assert_eq!(
+            pwd,
+            control::derive_media_auth_password(RAW_PWD, SYNTH_LK),
+            "armed password must equal md5_hex_lower(raw || localKey)"
+        );
+        assert_ne!(pwd, RAW_PWD, "must NEVER arm the raw rtc.config password");
+        assert_eq!(pwd.len(), 32, "md5 hex is 32 chars");
+
+        // No raw camera-info password ⇒ no AUTH PDU (legacy 3-PDU path).
+        creds.media_auth_password.clear();
+        assert!(media_auth_args(&creds).is_none());
     }
 
     // ── TASK-0078: self-sufficient runtime assembly (offline-validated) ────────

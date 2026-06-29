@@ -426,9 +426,10 @@ pub(crate) fn build_ffmpeg_cmd(
     cmd
 }
 
-/// Spawn an ffmpeg `Command` as an [`OutputSink::Ffmpeg`], surfacing a clear
-/// "ffmpeg not found" message.
-pub(crate) fn spawn_ffmpeg_sink(mut cmd: Command, target: String) -> Result<OutputSink, Error> {
+/// Spawn an ffmpeg `Command`, returning the child handle + its captured stdin
+/// pipe. Shared by [`spawn_ffmpeg_sink`] (the replay path) and the live A/V sink's
+/// threaded video writer, which owns the stdin on its own thread.
+pub(crate) fn spawn_ffmpeg_child(mut cmd: Command) -> Result<(Child, ChildStdin), Error> {
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
             Error::Transport(
@@ -443,6 +444,13 @@ pub(crate) fn spawn_ffmpeg_sink(mut cmd: Command, target: String) -> Result<Outp
         .stdin
         .take()
         .ok_or_else(|| Error::Transport("ffmpeg stdin pipe was not captured".to_string()))?;
+    Ok((child, stdin))
+}
+
+/// Spawn an ffmpeg `Command` as an [`OutputSink::Ffmpeg`], surfacing a clear
+/// "ffmpeg not found" message.
+pub(crate) fn spawn_ffmpeg_sink(cmd: Command, target: String) -> Result<OutputSink, Error> {
+    let (child, stdin) = spawn_ffmpeg_child(cmd)?;
     Ok(OutputSink::Ffmpeg {
         child,
         stdin,

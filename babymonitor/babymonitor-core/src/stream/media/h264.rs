@@ -96,6 +96,13 @@ impl H264Depacketizer {
         self.fu_accum.is_some()
     }
 
+    /// Discard any in-progress FU-A reassembly so the next clean NAL / keyframe
+    /// resyncs. The live pump calls this after a malformed fragment so one bad
+    /// packet drops a frame instead of tearing down the whole stream.
+    pub fn reset(&mut self) {
+        self.fu_accum = None;
+    }
+
     fn depacketize_stap_a(&self, payload: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
         // STAP-A: drop the 1-byte STAP-A header, then repeated [u16 size | NAL].
         let mut out = Vec::new();

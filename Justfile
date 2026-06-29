@@ -135,6 +135,35 @@ cert-crosscheck:
 run *ARGS:
     cargo run --manifest-path {{MANIFEST}} --bin babymonitor-cli -- {{ARGS}}
 
+# Watch the camera live: build + start the `--features live` pipeline, wait for it
+# to answer, then open VLC on it automatically and stop everything when VLC closes.
+# Needs the owner's gitignored secrets/ + a valid session (run `auth live-login`
+# first if it has expired). Opening VLC promptly is what keeps the KCP window
+# advancing — if the player attaches late the camera can freeze (~12 frames, TASK-0085).
+[group('run')]
+live-stream port="8556":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    PORT="{{port}}"
+    LOG="$(mktemp)"
+    echo "live-stream: building + starting the camera pipeline on :$PORT (this can take ~30-60s)…"
+    cargo run --quiet --manifest-path babymonitor/babymonitor-cli/Cargo.toml \
+        --features live --bin babymonitor-cli -- stream --output http --port "$PORT" >"$LOG" 2>&1 &
+    SPID=$!
+    cleanup() { kill "$SPID" 2>/dev/null; pkill -P "$SPID" 2>/dev/null; pkill -f "babymonitor-cli -- stream --output http --port $PORT" 2>/dev/null; rm -f "$LOG"; }
+    trap cleanup EXIT INT TERM
+    echo "live-stream: waiting for the camera to answer + the server to come up…"
+    if ! timeout 150 bash -c "tail -n +1 -f '$LOG' | grep -m1 'pumping; connect a player'"; then
+        echo "live-stream: did not come up in time. Last log:"; tail -25 "$LOG"; exit 1
+    fi
+    echo "live-stream: serving http://127.0.0.1:$PORT/stream.ts — opening VLC (close VLC to stop)…"
+    sleep 1
+    # --network-caching gives VLC a ~1.5s jitter cushion; the client's bounded
+    # video queue (LiveAvSink) keeps the camera's KCP window advancing so the
+    # source itself does not freeze (TASK-0085).
+    vlc --no-video-title-show --network-caching=1500 "http://127.0.0.1:$PORT/stream.ts" >/dev/null 2>&1 || true
+    echo "live-stream: VLC closed; stopping pipeline."
+
 # Regression tripwire: run every non-destructive CLI command; must not panic.
 [group('run')]
 showcase:

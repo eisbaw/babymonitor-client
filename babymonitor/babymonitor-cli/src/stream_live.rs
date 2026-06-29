@@ -1045,6 +1045,188 @@ fn kcp_ts_ms() -> u32 {
 /// decoded unit by conv (video → H.264 Annex-B; audio → S16LE), feed the MPEG-TS
 /// muxer, and keep the ICE path alive (send a consent refresh ~every 5 s, answer
 /// the camera's inbound checks).
+/// Best-effort ingress/egress trace for diagnosing the live media path (the
+/// continuous-stream freeze — TASK-0085/0086). Writes timestamped lines to the
+/// file named by `$BABYMONITOR_STREAM_TRACE` (default
+/// `<tmpdir>/babymonitor-stream-trace.log`, truncated at start). Every failure is
+/// swallowed — tracing must never perturb the stream. Only KCP cursors
+/// (conv/cmd/sn/una), counts, and queue depth are written — no secret/PII value.
+struct StreamTrace {
+    file: Option<std::io::BufWriter<std::fs::File>>,
+    start: Instant,
+    dg_in: u64,
+    media_ok: u64,
+    media_drop: u64,
+    stun_in: u64,
+    wask_in: u64,
+    max_rx_sn: i64,
+    last_rx_una: i64,
+    acks_out: u64,
+    video_units: u64,
+    audio_units: u64,
+    depay_err: u64,
+    last_media: Option<Instant>,
+    last_summary: Instant,
+    detailed_until: Instant,
+    stall_logged: bool,
+}
+
+impl StreamTrace {
+    fn new() -> Self {
+        let path = std::env::var_os("BABYMONITOR_STREAM_TRACE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("babymonitor-stream-trace.log"));
+        let file = std::fs::File::create(&path)
+            .ok()
+            .map(std::io::BufWriter::new);
+        if file.is_some() {
+            eprintln!(
+                "stream (live): tracing ingress/egress to {}",
+                path.display()
+            );
+        }
+        let now = Instant::now();
+        let mut t = Self {
+            file,
+            start: now,
+            dg_in: 0,
+            media_ok: 0,
+            media_drop: 0,
+            stun_in: 0,
+            wask_in: 0,
+            max_rx_sn: -1,
+            last_rx_una: -1,
+            acks_out: 0,
+            video_units: 0,
+            audio_units: 0,
+            depay_err: 0,
+            last_media: None,
+            last_summary: now,
+            detailed_until: now + Duration::from_secs(12),
+            stall_logged: false,
+        };
+        t.line(
+            "trace start — '<< in' = a datagram FROM the camera (cmd 0x51=PUSH 0x52=ACK \
+             0x53=WASK 0x54=WINS; sn=its segment#, una=what it thinks WE have ACKed); \
+             '>> ack xN' = ACKs we sent; vq=enqueued/written/dropped video NALs.",
+        );
+        t
+    }
+
+    fn line(&mut self, s: &str) {
+        use std::io::Write as _;
+        if let Some(f) = &mut self.file {
+            let ms = self.start.elapsed().as_millis();
+            let _ = writeln!(f, "[+{ms:>8}ms] {s}");
+            let _ = f.flush();
+        }
+    }
+
+    fn stun(&mut self) {
+        self.stun_in += 1;
+    }
+
+    /// Record one received media datagram (KCP header read straight off the wire;
+    /// the AES payload is never touched / never logged).
+    fn ingress(&mut self, now: Instant, dg: &[u8]) {
+        self.dg_in += 1;
+        if dg.len() < 24 {
+            return;
+        }
+        let conv = u32::from_le_bytes([dg[0], dg[1], dg[2], dg[3]]);
+        let cmd = dg[4];
+        let wnd = u16::from_le_bytes([dg[6], dg[7]]);
+        let sn = u32::from_le_bytes([dg[12], dg[13], dg[14], dg[15]]);
+        let una = u32::from_le_bytes([dg[16], dg[17], dg[18], dg[19]]);
+        let is_wask = cmd == 0x53;
+        if is_wask {
+            self.wask_in += 1;
+        }
+        let is_push = cmd == 0x51;
+        let gap = is_push && self.max_rx_sn >= 0 && sn as i64 > self.max_rx_sn + 1;
+        if is_push && sn as i64 > self.max_rx_sn {
+            self.max_rx_sn = sn as i64;
+        }
+        self.last_rx_una = una as i64;
+        let detail = now < self.detailed_until;
+        if detail || is_wask || gap {
+            let tag = if is_wask {
+                "  <-- WASK: camera is PROBING our window (expects a WINS reply)"
+            } else if gap {
+                "  <-- SN GAP (a PUSH was lost)"
+            } else {
+                ""
+            };
+            self.line(&format!(
+                "<< in conv={conv} cmd=0x{cmd:02x} sn={sn} una={una} wnd={wnd} len={}{tag}",
+                dg.len()
+            ));
+        }
+    }
+
+    fn media_ok(&mut self, now: Instant) {
+        self.media_ok += 1;
+        self.last_media = Some(now);
+    }
+
+    fn media_drop(&mut self) {
+        self.media_drop += 1;
+    }
+
+    fn acks(&mut self, now: Instant, n: usize) {
+        self.acks_out += n as u64;
+        if n > 0 && now < self.detailed_until {
+            self.line(&format!(">> ack x{n}"));
+        }
+    }
+
+    fn units(&mut self, video: u64, audio: u64) {
+        self.video_units += video;
+        self.audio_units += audio;
+    }
+
+    fn depay_err(&mut self) {
+        self.depay_err += 1;
+    }
+
+    /// Per-loop: a 500 ms rolling SUMMARY + a one-shot STALL marker once media has
+    /// started but nothing has arrived for >1.5 s (the freeze).
+    fn tick(&mut self, now: Instant, vid: (u64, u64, u64)) {
+        let (enq, wr, drop) = vid;
+        if now.duration_since(self.last_summary) >= Duration::from_millis(500) {
+            self.last_summary = now;
+            self.line(&format!(
+                "SUMMARY dg_in={} media_ok={} drop={} stun={} wask={} max_sn={} last_una={} acks_out={} vunits={} aunits={} depay_err={} vq(enq/wr/drop)={}/{}/{} depth={}",
+                self.dg_in, self.media_ok, self.media_drop, self.stun_in, self.wask_in,
+                self.max_rx_sn, self.last_rx_una, self.acks_out, self.video_units, self.audio_units,
+                self.depay_err, enq, wr, drop, enq.saturating_sub(wr)
+            ));
+        }
+        if let Some(t) = self.last_media {
+            if !self.stall_logged && now.duration_since(t) >= Duration::from_millis(1500) {
+                self.stall_logged = true;
+                self.line(&format!(
+                    "STALL: {}ms with no media. camera: max_sn={} last_una={} wask_in={}; we sent acks_out={}; video vq enq/wr/drop={}/{}/{} depth={}. \
+                     HINT: if max_sn froze while last_una<=max_sn and acks_out kept climbing, the camera is NOT crediting our ACKs (window/WINS — TASK-0086); \
+                     if wask_in>0 it asked for our window and we never sent WINS; if depth stayed >0 the player under-drained.",
+                    now.duration_since(t).as_millis(), self.max_rx_sn, self.last_rx_una, self.wask_in,
+                    self.acks_out, enq, wr, drop, enq.saturating_sub(wr)
+                ));
+            }
+        }
+    }
+
+    fn finish(&mut self, vid: (u64, u64, u64)) {
+        let (enq, wr, drop) = vid;
+        self.line(&format!(
+            "FINAL dg_in={} media_ok={} drop={} stun={} wask={} max_sn={} last_una={} acks_out={} vunits={} aunits={} depay_err={} vq(enq/wr/drop)={}/{}/{}",
+            self.dg_in, self.media_ok, self.media_drop, self.stun_in, self.wask_in,
+            self.max_rx_sn, self.last_rx_una, self.acks_out, self.video_units, self.audio_units,
+            self.depay_err, enq, wr, drop
+        ));
+    }
+}
+
 fn pump_to_output(
     args: &StreamArgs,
     engine: &mut MediaEngine,
@@ -1052,6 +1234,7 @@ fn pump_to_output(
     keep: &mut PathKeepalive,
 ) -> Result<(), Error> {
     let mut sink = LiveAvSink::spawn(args)?;
+    let mut trace = StreamTrace::new();
     let mut depay = H264Depacketizer::new();
     let mut buf = vec![0u8; 2048];
     eprintln!(
@@ -1069,8 +1252,10 @@ fn pump_to_output(
         mut n_media_ok,
         mut n_media_drop,
     ) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut n_depay_err = 0u64;
     loop {
         let now = Instant::now();
+        trace.tick(now, sink.video_stats());
         // Bidirectional ICE: until the pair is validated, (re)transmit our
         // nominating check with RFC 5389 backoff. try_send tolerates the transient
         // ICMP "Connection refused" while the camera's media port is not open yet —
@@ -1102,6 +1287,7 @@ fn pump_to_output(
                 let dg = &buf[..n];
                 if is_stun(dg) {
                     n_stun_in += 1;
+                    trace.stun();
                     if diag && n_stun_in <= 5 {
                         let mt = stun::StunMessage::decode(dg)
                             .map(|m| m.msg_type)
@@ -1142,6 +1328,7 @@ fn pump_to_output(
                         Err(e) => eprintln!("stream (live): ignoring malformed STUN packet: {e}"),
                     }
                 } else {
+                    trace.ingress(now, dg);
                     if diag && (n_media_ok + n_media_drop) < 16 && dg.len() >= 24 {
                         let conv = u32::from_le_bytes([dg[0], dg[1], dg[2], dg[3]]);
                         let sn = u32::from_le_bytes([dg[12], dg[13], dg[14], dg[15]]);
@@ -1155,6 +1342,7 @@ fn pump_to_output(
                     match engine.push_datagram(dg) {
                         Ok(units) => {
                             n_media_ok += 1;
+                            trace.media_ok(now);
                             // A valid (authenticated) media datagram — the path is
                             // alive (validate it, stopping nomination) even if this
                             // one did not complete a frame yet.
@@ -1170,9 +1358,11 @@ fn pump_to_output(
                             // camera's send window advances and it keeps streaming
                             // (without ACKs it sends its initial window then stalls
                             // — cap4: the app sends ~785 packets back, mostly ACKs).
-                            for ack in engine.drain_media_acks()? {
-                                transport.try_send(&ack)?;
+                            let acks = engine.drain_media_acks()?;
+                            for ack in &acks {
+                                transport.try_send(ack)?;
                             }
+                            trace.acks(now, acks.len());
                             // Real media (a decoded video/audio unit) proves the
                             // handshake landed — stop retransmitting the media-start.
                             // (A conv=0 control datagram yields no units, so it does
@@ -1180,15 +1370,38 @@ fn pump_to_output(
                             if !units.is_empty() {
                                 mstart.mark_media();
                             }
+                            let mut nv = 0u64;
+                            let mut na = 0u64;
                             for u in &units {
                                 if u.is_video() {
-                                    for nal in depay.push(&u.payload)? {
-                                        sink.write_video(&nal)?;
+                                    nv += 1;
+                                    match depay.push(&u.payload) {
+                                        Ok(nals) => {
+                                            for nal in &nals {
+                                                sink.write_video(nal)?;
+                                            }
+                                        }
+                                        // A malformed RTP fragment must NOT kill the
+                                        // live feed: drop it, resync the FU-A
+                                        // reassembly at the next clean NAL/keyframe,
+                                        // and keep streaming (rate-limited log + trace).
+                                        Err(e) => {
+                                            n_depay_err += 1;
+                                            depay.reset();
+                                            trace.depay_err();
+                                            if n_depay_err == 1 || n_depay_err % 100 == 0 {
+                                                eprintln!(
+                                                    "stream (live): skipped malformed video fragment #{n_depay_err}: {e}"
+                                                );
+                                            }
+                                        }
                                     }
                                 } else if u.is_downstream_audio() {
+                                    na += 1;
                                     sink.write_audio(audio::downstream_pcm_s16le(&u.payload))?;
                                 }
                             }
+                            trace.units(nv, na);
                         }
                         // A foreign-session / corrupt datagram (failed HMAC or
                         // PKCS#7) is a drop, NOT a stream-fatal error: cap4 shows
@@ -1198,6 +1411,7 @@ fn pump_to_output(
                         // gates still reject it, so nothing mis-decoded slips through.
                         Err(e) => {
                             n_media_drop += 1;
+                            trace.media_drop();
                             eprintln!("stream (live): dropping undecodable media datagram: {e}");
                         }
                     }
@@ -1216,6 +1430,8 @@ fn pump_to_output(
             }
         }
     }
+    let vstats = sink.video_stats();
+    trace.finish(vstats);
     sink.finish()
 }
 
@@ -1522,9 +1738,28 @@ fn record_p2p_type(rec: &serde_json::Value) -> Option<i32> {
 
 /// A live A/V MPEG-TS sink: ffmpeg reads H.264 Annex-B on stdin and downstream
 /// S16LE audio from a FIFO this process feeds incrementally (16 kHz mono → AAC).
+///
+/// **Both** the video and audio writes are handed to background threads (each
+/// behind its own channel) so the caller — the single-threaded media pump — NEVER
+/// blocks inside a sink write. That decoupling is what keeps the KCP recv/ACK loop
+/// running: if the pump stalled inside a blocking ffmpeg-stdin write while the
+/// player drained slowly, it would stop ACKing and the camera's send window would
+/// never advance, so the stream freezes right after its first window (~12
+/// segments — TASK-0085). The video queue doubles as the few-frames cushion a
+/// player needs to ride out jitter without underrunning.
 struct LiveAvSink {
-    sink: crate::stream::OutputSink,
+    video: VideoOut,
     audio: Option<AudioFifo>,
+}
+
+/// Where decoded video NALs go.
+enum VideoOut {
+    /// Threaded writer feeding an ffmpeg child's stdin (`--output http`/`ts`),
+    /// decoupled from the pump via a bounded queue.
+    Ffmpeg(VideoWriter),
+    /// Raw Annex-B straight to this process's stdout (`--output stdout`, for
+    /// `mpv -`): no muxer, no backpressure worth a thread — kept direct.
+    Stdout(std::io::Stdout),
 }
 
 impl LiveAvSink {
@@ -1532,13 +1767,10 @@ impl LiveAvSink {
     /// audio mux — only video is written.
     fn spawn(args: &StreamArgs) -> Result<Self, Error> {
         if args.output == OutputMode::Stdout {
-            let sink = crate::stream::OutputSink::spawn(
-                args.output,
-                args.port,
-                args.ts_out.as_ref(),
-                None,
-            )?;
-            return Ok(Self { sink, audio: None });
+            return Ok(Self {
+                video: VideoOut::Stdout(std::io::stdout()),
+                audio: None,
+            });
         }
         let (output_args, target) =
             crate::stream::ffmpeg_output_target(args.output, args.port, args.ts_out.as_ref())?;
@@ -1548,15 +1780,26 @@ impl LiveAvSink {
             &args_ref,
             Some((fifo.path(), audio::DOWNSTREAM_SAMPLE_RATE_HZ)),
         );
-        let sink = crate::stream::spawn_ffmpeg_sink(cmd, target)?;
+        let (child, stdin) = crate::stream::spawn_ffmpeg_child(cmd)?;
         Ok(Self {
-            sink,
+            video: VideoOut::Ffmpeg(VideoWriter::spawn(child, stdin, target)),
             audio: Some(fifo),
         })
     }
 
     fn write_video(&mut self, nal: &[u8]) -> Result<(), Error> {
-        self.sink.write_annexb(nal)
+        match &mut self.video {
+            // Non-blocking enqueue — the recv/ACK loop must never stall here.
+            VideoOut::Ffmpeg(w) => {
+                w.send(nal);
+                Ok(())
+            }
+            VideoOut::Stdout(out) => {
+                use std::io::Write as _;
+                out.write_all(nal)
+                    .map_err(|e| Error::Transport(format!("writing Annex-B to stdout: {e}")))
+            }
+        }
     }
 
     fn write_audio(&mut self, pcm: &[u8]) -> Result<(), Error> {
@@ -1566,11 +1809,189 @@ impl LiveAvSink {
         Ok(())
     }
 
+    /// `(enqueued, written, dropped)` video NAL counts for the trace (0/0/0 for the
+    /// stdout sink, which has no queue).
+    fn video_stats(&self) -> (u64, u64, u64) {
+        match &self.video {
+            VideoOut::Ffmpeg(w) => w.stats(),
+            VideoOut::Stdout(_) => (0, 0, 0),
+        }
+    }
+
     fn finish(self) -> Result<(), Error> {
         if let Some(fifo) = self.audio {
             fifo.finish()?;
         }
-        self.sink.finish()
+        match self.video {
+            VideoOut::Ffmpeg(w) => w.finish(),
+            VideoOut::Stdout(mut out) => {
+                use std::io::Write as _;
+                out.flush()
+                    .map_err(|e| Error::Transport(format!("flushing stdout: {e}")))
+            }
+        }
+    }
+}
+
+/// Background video writer: owns the ffmpeg child + its stdin and drains decoded
+/// Annex-B NALs from a **bounded** queue onto that stdin on its own thread. The
+/// pump enqueues with [`send`](Self::send), which NEVER blocks — when the queue is
+/// full (the player/muxer is behind) it drops the NAL and counts it, so the KCP
+/// recv/ACK loop keeps the camera's window advancing instead of stalling.
+struct VideoWriter {
+    tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    handle: Option<std::thread::JoinHandle<Result<(), Error>>>,
+    child: std::process::Child,
+    target: String,
+    // `enqueued`/`dropped`/`writer_gone` are touched only on the pump thread
+    // (`send`/`stats`/`finish`); `written` is the one shared with the writer thread.
+    enqueued: std::sync::atomic::AtomicU64,
+    written: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    dropped: std::sync::atomic::AtomicU64,
+    writer_gone: std::sync::atomic::AtomicBool,
+}
+
+impl VideoWriter {
+    /// Queue depth in decoded NAL chunks — ~5–10 s of 1080p headroom: deep enough
+    /// to absorb a slow player attach + jitter without ever blocking the pump,
+    /// bounded so a dead/stalled player cannot grow memory without limit.
+    const QUEUE_CHUNKS: usize = 512;
+
+    fn spawn(
+        child: std::process::Child,
+        mut stdin: std::process::ChildStdin,
+        target: String,
+    ) -> Self {
+        use std::io::Write as _;
+        use std::sync::atomic::Ordering::Relaxed;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(Self::QUEUE_CHUNKS);
+        let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let written_t = std::sync::Arc::clone(&written);
+        let handle = std::thread::spawn(move || -> Result<(), Error> {
+            while let Ok(chunk) = rx.recv() {
+                if let Err(e) = stdin.write_all(&chunk) {
+                    // A broken pipe means ffmpeg / the player went away — stop
+                    // quietly; the pump stays alive and the run ends on idle-timeout
+                    // or `finish`. Any other write error is a real failure.
+                    if e.kind() == std::io::ErrorKind::BrokenPipe {
+                        return Ok(());
+                    }
+                    return Err(Error::Transport(format!("writing Annex-B to ffmpeg: {e}")));
+                }
+                written_t.fetch_add(1, Relaxed);
+            }
+            // Channel closed (finish) → drop stdin → EOF so ffmpeg drains + exits.
+            Ok(())
+        });
+        Self {
+            tx: Some(tx),
+            handle: Some(handle),
+            child,
+            target,
+            enqueued: std::sync::atomic::AtomicU64::new(0),
+            written,
+            dropped: std::sync::atomic::AtomicU64::new(0),
+            writer_gone: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Enqueue one Annex-B NAL for the writer thread. NEVER blocks the caller: if
+    /// the bounded queue is full the NAL is dropped (and counted) so the recv/ACK
+    /// loop is never starved. A drop is a brief decode glitch recovered at the next
+    /// keyframe — far better than freezing the source by stalling its ACKs.
+    fn send(&self, nal: &[u8]) {
+        use std::sync::atomic::Ordering::Relaxed;
+        use std::sync::mpsc::TrySendError;
+        let Some(tx) = &self.tx else { return };
+        match tx.try_send(nal.to_vec()) {
+            Ok(()) => {
+                self.enqueued.fetch_add(1, Relaxed);
+            }
+            // Queue full = the player/muxer is behind. Drop this NAL (a brief glitch,
+            // recovered at the next keyframe) so the recv/ACK loop is never starved.
+            Err(TrySendError::Full(_)) => {
+                let n = self.dropped.fetch_add(1, Relaxed) + 1;
+                if n == 1 || n % 200 == 0 {
+                    eprintln!(
+                        "stream (live): video queue full — dropped {n} NAL(s) so far (player not draining fast enough)"
+                    );
+                }
+            }
+            // Writer thread gone (ffmpeg/player exited) — a DIFFERENT failure than
+            // backpressure, so do NOT report it as a slow player. Log once; the pump
+            // tears down shortly after via the audio path.
+            Err(TrySendError::Disconnected(_)) => {
+                self.dropped.fetch_add(1, Relaxed);
+                if !self.writer_gone.swap(true, Relaxed) {
+                    eprintln!(
+                        "stream (live): video sink writer exited (ffmpeg/player gone) — video output stopped"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `(enqueued, written, dropped)` NAL counts. Queue depth = `enqueued - written`
+    /// (the over/underflow signal for the ingress/egress trace).
+    fn stats(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.enqueued.load(Relaxed),
+            self.written.load(Relaxed),
+            self.dropped.load(Relaxed),
+        )
+    }
+
+    /// Close the queue, flush, and wait for ffmpeg to finish.
+    fn finish(mut self) -> Result<(), Error> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let dropped = self.dropped.load(Relaxed);
+        if dropped > 0 {
+            eprintln!(
+                "stream (live): {dropped} video NAL(s) dropped this session (queue overflow)."
+            );
+        }
+        drop(self.tx.take()); // close the queue → thread drops stdin → ffmpeg EOF
+        if let Some(h) = self.handle.take() {
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(Error::Transport("video writer thread panicked".to_string()));
+                }
+            }
+        }
+        let status = self
+            .child
+            .wait()
+            .map_err(|e| Error::Transport(format!("waiting for ffmpeg ({}): {e}", self.target)))?;
+        // `code().is_none()` = terminated by signal (e.g. the recipe's SIGTERM when
+        // VLC closes) — a normal live teardown, not a mux failure.
+        if status.success() || status.code().is_none() {
+            Ok(())
+        } else {
+            Err(Error::Transport(format!(
+                "ffmpeg muxer exited with {status} (target {})",
+                self.target
+            )))
+        }
+    }
+}
+
+impl Drop for VideoWriter {
+    /// Safety net for the pump's early-`?`-return paths where [`VideoWriter::finish`]
+    /// is never called: close the queue, join the writer (so its `stdin` drops →
+    /// ffmpeg EOF), and reap ffmpeg so it is not left a zombie. Idempotent after a
+    /// completed `finish` (the handle/tx are already taken and the child reaped).
+    fn drop(&mut self) {
+        self.tx = None; // close the queue → writer thread drops stdin → ffmpeg EOF
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        if matches!(self.child.try_wait(), Ok(None) | Err(_)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 

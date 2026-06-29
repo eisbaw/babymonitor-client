@@ -174,14 +174,16 @@ check-evidence-selftest:
     python3 re/scripts/check_evidence.py --selftest
 
 # Secret/PII gate over tracked files + pending diff + backlog tasks.
+# NOTE: the scanner lives under secrets/ (gitignored) so its owner-email allowlist
+# is not a tracked file; it is therefore local-only and absent on a fresh clone.
 [group('grounding')]
 secret-scan:
-    @bash re/scripts/secret_scan.sh
+    @bash secrets/secret_scan.sh
 
 # Prove secret-scan bites: plants a fake secret it must flag.
 [group('grounding')]
 secret-scan-selftest:
-    @bash re/scripts/secret_scan.sh --selftest
+    @bash secrets/secret_scan.sh --selftest
 
 # Run the script self-tests that prove the grounding gates can go red.
 [group('grounding')]

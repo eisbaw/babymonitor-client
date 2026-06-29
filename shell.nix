@@ -21,7 +21,7 @@ pkgs.mkShell {
     rustc cargo clippy rustfmt rust-analyzer pkg-config openssl.dev
 
     # Project management & docs
-    just git curl wget pandoc graphviz
+    just git git-filter-repo curl wget pandoc graphviz
 
     # Python for ad-hoc scripts
     python3 python3Packages.requests python3Packages.lxml

@@ -26,8 +26,9 @@
 //! `babymonitor-core/tests/cap4_stun_kat.rs` (`#[ignore]`d, reads the gitignored
 //! cap4 capture + the runtime-recovered ICE pwd — never an inlined secret).
 //!
-//! [`StunMessage::xor_mapped_address`] decodes a real cap4 Binding Success
-//! response's XOR-MAPPED-ADDRESS to the captured srflx `***REMOVED-SRFLX***:14363`.
+//! [`StunMessage::xor_mapped_address`] decodes a Binding Success response's
+//! XOR-MAPPED-ADDRESS to a **srflx** candidate; the real cap4 srflx is recovered
+//! at runtime from the gitignored capture and is never inlined here.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -666,10 +667,11 @@ mod tests {
     // ── XOR-MAPPED-ADDRESS round-trip (IPv4 + IPv6) ────────────────────────
     #[test]
     fn xor_mapped_address_ipv4_round_trip() {
-        // Encode the cap4 srflx ***REMOVED-SRFLX***:14363 as an XOR-MAPPED-ADDRESS in a
-        // Binding Success and decode it back.
+        // Encode a documentation srflx address (RFC 5737 TEST-NET-1) as an
+        // XOR-MAPPED-ADDRESS in a Binding Success and decode it back. The real
+        // cap4 srflx is runtime-resolved from the capture, never inlined.
         let txid = *b"abcdefghijkl";
-        let addr: SocketAddr = "***REMOVED-SRFLX***:14363".parse().unwrap();
+        let addr: SocketAddr = "192.0.2.81:14363".parse().unwrap();
         let value = encode_xor_mapped_for_test(addr, &txid);
         let mut msg = Vec::new();
         msg.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());

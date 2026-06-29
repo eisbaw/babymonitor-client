@@ -332,8 +332,9 @@ mod tests {
     // BYTE-EXACT against the cap3 offer SDP STRUCTURE (synthetic ids substituted
     // for the real session's): the builder must reproduce the captured offer SDP
     // line-for-line (m=application imm 6001, ufrag/pwd, aes-key, AES/KCP 330,
-    // ssrc cname). The media key 0x55..6a is the cap3 a=aes-key value; the
-    // ids/ufrag/pwd are synthetic (no real session id committed).
+    // ssrc cname). The media key, ids, and ufrag/pwd are ALL synthetic here — the
+    // real cap3 a=aes-key is resolved at runtime from the answer SDP
+    // (extract_aes_key); no real session key is inlined.
     #[test]
     fn build_offer_sdp_reproduces_cap3_structure() {
         let params = OfferSdpParams {
@@ -341,8 +342,8 @@ mod tests {
             stream_id: "SYNTHSESSID1782489574vhBJTOjV".into(),
             ice_ufrag: "SYN1".into(),
             ice_pwd: "SYNTHICEPWD1111111111111".into(),
-            // cap3 a=aes-key:***REMOVED-MEDIAKEY***
-            media_key: hex::decode("***REMOVED-MEDIAKEY***").unwrap(),
+            // synthetic aes-key (the real cap3 key is runtime-resolved, never inlined)
+            media_key: hex::decode("00112233445566778899aabbccddeeff").unwrap(),
             cname: "SYNTH_USER_ID".into(),
             rtpmap_param: 330,
         };
@@ -359,7 +360,7 @@ mod tests {
              a=ice-ufrag:SYN1\r\n\
              a=ice-pwd:SYNTHICEPWD1111111111111\r\n\
              a=ice-options:trickle\r\n\
-             a=aes-key:***REMOVED-MEDIAKEY***\r\n\
+             a=aes-key:00112233445566778899aabbccddeeff\r\n\
              a=mid:imm0\r\n\
              a=rtpmap:6001 AES/KCP 330\r\n\
              a=ssrc:0 cname:SYNTH_USER_ID\r\n";

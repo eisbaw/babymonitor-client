@@ -199,7 +199,7 @@ Access-unit boundary = RTP M-bit (byte1 bit7). Keyframe = NAL type 5 (IDR), prec
 
 ---
 
-## Key file references (all under `/home/mpedersen/topics/philips_babymonitor_re/`)
+## Key file references (all paths relative to the repository root)
 
 `decompiled/ghidra_p2p/funcs/`: `0016e350_FUN_0016e350.c` (ingress+HMAC), `0015e448_ctx_session_chan_process_pkt.c` (per-segment decrypt+PKCS7), `00164ffc_FUN_00164ffc.c` / `00164f94_FUN_00164f94.c` (AES-CBC dec/enc), `00164db4_FUN_00164db4.c` (AES-128 setkey), `00165068_FUN_00165068.c` (GCM setkey), `00164acc_FUN_00164acc.c` (ChaCha), `00167bd0_FUN_00167bd0.c` (offerer key + PT6001 codec), `0016a004_FUN_0016a004.c` (answerer key + HMAC ctx), `0016304c_FUN_0016304c.c` (send IV+pad), `00168f78_FUN_00168f78.c` (KCP setup + setprocesspkt), `0016950c_FUN_0016950c.c` (send HMAC append), `0014d338_ikcp_input.c`, `0014cec4_ikcp_parse_data.c`, `0014c3c8_ikcp_recv.c`, `0014c798_ikcp_recv_mbufwithdata.c`, `0014decc_ikcp_flush_mbuf.c`, `0014eb64_ikcp_setmtu.c`, `001636c4_FUN_001636c4.c`, `00173054_imm_p2p_rtp_decode_rtp2.c`, `0015026c_..._nal_stapa.c`, `00150100_..._nal_fua.c`, `00150448_..._find_next_nal_unit.c`, `00175fa0_imm_p2p_rtc_sdp_negotiate.c`, `00174e2c_imm_p2p_rtc_sdp_decode.c`, `0016b3f0_FUN_0016b3f0.c` (PATH B SRTP worker — separate transport).
 `re/ghidra/`: `imm_p2p_rtc_sdp_{get,set}_aes_key.c`, `imm_p2p_rtc_recv_frame.c`, `imm_p2p_rtc_recv_data.c`, `imm_p2p_h264_packetize.c`.

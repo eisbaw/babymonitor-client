@@ -1760,6 +1760,12 @@ enum VideoOut {
     /// Raw Annex-B straight to this process's stdout (`--output stdout`, for
     /// `mpv -`): no muxer, no backpressure worth a thread — kept direct.
     Stdout(std::io::Stdout),
+    /// (gui feature) In-app SDL2 window (`--output window`): the pump enqueues
+    /// Annex-B NALs to the [`GuiSink`](crate::gui::GuiSink)'s bounded queue
+    /// (drop-on-full — the TASK-0085 ACK-loop fix is preserved), a presenter
+    /// thread decodes in-process (libavcodec) and renders. No subprocess, no HTTP.
+    #[cfg(feature = "gui")]
+    Window(crate::gui::GuiSink),
 }
 
 impl LiveAvSink {
@@ -1771,6 +1777,22 @@ impl LiveAvSink {
                 video: VideoOut::Stdout(std::io::stdout()),
                 audio: None,
             });
+        }
+        if args.output == OutputMode::Window {
+            #[cfg(feature = "gui")]
+            return Ok(Self {
+                // Video-only window: audio is not wired into the GUI sink in v1
+                // (documented gap, re/gui_window.md). The recv/ACK loop stays
+                // alive because GuiSink::send never blocks (bounded drop-on-full).
+                video: VideoOut::Window(crate::gui::GuiSink::spawn("babymonitor — live")?),
+                audio: None,
+            });
+            #[cfg(not(feature = "gui"))]
+            return Err(Error::Transport(
+                "--output window needs the `gui` feature — rebuild with \
+                 `cargo build --features live,gui`"
+                    .to_string(),
+            ));
         }
         let (output_args, target) =
             crate::stream::ffmpeg_output_target(args.output, args.port, args.ts_out.as_ref())?;
@@ -1799,6 +1821,12 @@ impl LiveAvSink {
                 out.write_all(nal)
                     .map_err(|e| Error::Transport(format!("writing Annex-B to stdout: {e}")))
             }
+            // Non-blocking enqueue — same discipline as the ffmpeg writer.
+            #[cfg(feature = "gui")]
+            VideoOut::Window(gui) => {
+                gui.send(nal);
+                Ok(())
+            }
         }
     }
 
@@ -1815,6 +1843,8 @@ impl LiveAvSink {
         match &self.video {
             VideoOut::Ffmpeg(w) => w.stats(),
             VideoOut::Stdout(_) => (0, 0, 0),
+            #[cfg(feature = "gui")]
+            VideoOut::Window(gui) => gui.stats(),
         }
     }
 
@@ -1829,6 +1859,8 @@ impl LiveAvSink {
                 out.flush()
                     .map_err(|e| Error::Transport(format!("flushing stdout: {e}")))
             }
+            #[cfg(feature = "gui")]
+            VideoOut::Window(gui) => gui.finish(),
         }
     }
 }

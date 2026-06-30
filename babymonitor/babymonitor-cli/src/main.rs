@@ -60,6 +60,12 @@ mod stream;
 #[cfg(feature = "live")]
 mod stream_live;
 
+// In-app SDL2 video window (TASK-0115) — an alternative to the ffmpeg/HTTP stream
+// output (renders the feed in our own window, no external player). Compiled ONLY
+// under `--features gui` (SDL2 + X11 deps kept out of the default/offline build).
+#[cfg(feature = "gui")]
+mod gui;
+
 /// Path (relative to this crate) of the synthetic device-list fixture used as the
 /// default OFFLINE body. It is committed, obviously-synthetic test data — never a
 /// real capture.
@@ -107,6 +113,14 @@ enum Command {
     /// for `vlc`/`mpv`/`ffplay`. The live path is honestly gated; `--replay-annexb`
     /// runs the depacketize -> mux/serve path OFFLINE (no camera). See its --help.
     Stream(stream::StreamArgs),
+    /// (gui feature) Open an SDL2 window for N seconds to prove the in-app GUI
+    /// render stack works (TASK-0115). No camera, no decode.
+    #[cfg(feature = "gui")]
+    GuiSelftest {
+        /// Seconds to keep the window open (close it to stop early).
+        #[arg(default_value = "3")]
+        secs: u64,
+    },
 }
 
 /// `auth` subcommands.
@@ -213,6 +227,10 @@ fn main() -> ExitCode {
         Some(Command::Auth { action }) => run_auth(action, json),
         Some(Command::Devices { action }) => run_devices(action, json),
         Some(Command::Stream(args)) => stream::run_stream(&args, json),
+        #[cfg(feature = "gui")]
+        Some(Command::GuiSelftest { secs }) => {
+            gui::selftest(secs).map(|_| ()).map_err(Error::Transport)
+        }
     };
 
     match result {

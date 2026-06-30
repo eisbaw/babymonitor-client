@@ -65,6 +65,10 @@ pub enum OutputMode {
     Ts,
     /// Write raw Annex-B H.264 to stdout for `mpv -` / `ffplay -f h264 -`.
     Stdout,
+    /// Render the live feed in an in-app SDL2 window (feature `gui`): an
+    /// in-process libavcodec H.264 decode → YUV → SDL texture, no subprocess and
+    /// no HTTP. Needs both `live` and `gui` features. See `re/gui_window.md`.
+    Window,
 }
 
 /// Arguments for `babymonitor-cli stream`.
@@ -300,7 +304,7 @@ fn run_replay(args: &StreamArgs, path: &PathBuf) -> Result<(), Error> {
             "stream: warning — no IDR keyframe in the sample; the decoder may not render a picture."
         );
     }
-    if let Some(audio_path) = &args.replay_audio {
+    if let (Some(audio_path), false) = (&args.replay_audio, args.output == OutputMode::Window) {
         if let Ok(meta) = std::fs::metadata(audio_path) {
             let bytes = meta.len() as usize;
             eprintln!(
@@ -328,10 +332,16 @@ fn announce(sink: &OutputSink, args: &StreamArgs) {
                 eprintln!("    ffplay {target}");
             }
             OutputMode::Ts => eprintln!("stream: writing MPEG-TS to {target}"),
-            OutputMode::Stdout => {}
+            OutputMode::Stdout | OutputMode::Window => {}
         },
         OutputSink::Stdout(_) => {
             eprintln!("stream: writing raw Annex-B H.264 to stdout — pipe to `mpv -` or `ffplay -f h264 -`.");
+        }
+        #[cfg(feature = "gui")]
+        OutputSink::Window(_) => {
+            eprintln!(
+                "stream: rendering the decoded feed in an in-app SDL2 window (close it to stop)."
+            );
         }
     }
 }
@@ -362,6 +372,12 @@ pub(crate) enum OutputSink {
     },
     /// Raw Annex-B to this process's stdout (video-only; no audio mux).
     Stdout(io::Stdout),
+    /// (gui feature) In-app SDL2 window: Annex-B is decoded in-process by
+    /// libavcodec and rendered (video-only; no audio mux — see `re/gui_window.md`).
+    /// Lets the offline `--replay-annexb` path exercise the real window+decoder
+    /// with NO camera. The live path uses its own `LiveAvSink` window sink.
+    #[cfg(feature = "gui")]
+    Window(crate::gui::GuiSink),
 }
 
 /// Build the shared ffmpeg muxer `Command`: raw-H.264 on stdin (`pipe:0`), an
@@ -481,6 +497,9 @@ pub(crate) fn ffmpeg_output_target(
         OutputMode::Stdout => Err(Error::Transport(
             "stdout mode is not an ffmpeg sink".to_string(),
         )),
+        OutputMode::Window => Err(Error::Transport(
+            "window mode is not an ffmpeg sink".to_string(),
+        )),
     }
 }
 
@@ -498,6 +517,26 @@ impl OutputSink {
         if mode == OutputMode::Stdout {
             return Ok(Self::Stdout(io::stdout()));
         }
+        if mode == OutputMode::Window {
+            #[cfg(feature = "gui")]
+            {
+                if audio.is_some() {
+                    eprintln!(
+                        "stream: note — --output window renders video only; the downstream \
+                         audio track is not played (v1 gap, see re/gui_window.md)."
+                    );
+                }
+                return Ok(Self::Window(crate::gui::GuiSink::spawn(
+                    "babymonitor — replay",
+                )?));
+            }
+            #[cfg(not(feature = "gui"))]
+            return Err(Error::Transport(
+                "--output window needs the `gui` feature — rebuild with \
+                 `cargo build --features gui` (offline replay) or `--features live,gui` (live)"
+                    .to_string(),
+            ));
+        }
         let (output_args, target) = ffmpeg_output_target(mode, port, ts_out)?;
         let args: Vec<&str> = output_args.iter().map(String::as_str).collect();
         let cmd = build_ffmpeg_cmd(&args, audio.as_ref().map(|a| (a.path.as_path(), a.rate)));
@@ -510,6 +549,14 @@ impl OutputSink {
         let res = match self {
             Self::Ffmpeg { stdin, .. } => stdin.write_all(buf),
             Self::Stdout(out) => out.write_all(buf),
+            // Non-blocking enqueue → presenter thread decodes + renders. Never
+            // stalls the caller (the offline replay loop, or — if reused — the
+            // recv/ACK loop). Returns early so it skips the io-error mapping below.
+            #[cfg(feature = "gui")]
+            Self::Window(gui) => {
+                gui.send(buf);
+                return Ok(());
+            }
         };
         res.map_err(|e| {
             // A broken pipe means the player/ffmpeg went away — report it plainly.
@@ -520,6 +567,8 @@ impl OutputSink {
     /// Close the input and wait for the muxer to finish.
     pub(crate) fn finish(self) -> Result<(), Error> {
         match self {
+            #[cfg(feature = "gui")]
+            Self::Window(gui) => gui.finish(),
             Self::Stdout(mut out) => out
                 .flush()
                 .map_err(|e| Error::Transport(format!("flushing stdout: {e}"))),

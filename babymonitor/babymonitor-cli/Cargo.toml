@@ -35,6 +35,15 @@ live = [
     "babymonitor-core/live-tls",
 ]
 
+# `gui` gates the in-app SDL2 video window (TASK-0115) — an alternative to the
+# ffmpeg/HTTP `stream` output: it renders the decoded feed in OUR OWN window (no
+# external player, no HTTP). Decode is IN-PROCESS via the ffmpeg-the-third
+# libavcodec binding (NOT a subprocess, NOT an MPEG-TS/HTTP hop): YUV420 frames go
+# straight into an SDL2 IYUV texture (decision recorded in re/gui_window.md). The
+# SDL2 + libav + X11 deps are kept OUT of the default/offline build so `just e2e`
+# stays lean+green.
+gui = ["dep:sdl2", "dep:ffmpeg-the-third"]
+
 [dependencies]
 babymonitor-core = { path = "../babymonitor-core" }
 clap.workspace = true
@@ -54,3 +63,12 @@ chrono = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 aes-gcm = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
+
+# ── gui-only (feature `gui`) — the in-app render window (TASK-0115) ───────────
+# Links the system SDL2 (provided by shell.nix) via pkg-config; no bundled build.
+sdl2 = { version = "0.37", default-features = false, features = ["use-pkgconfig"], optional = true }
+# In-process H.264 DECODER (libavcodec binding — links ffmpeg's libs, no subprocess
+# and no MPEG-TS/HTTP hop). Generates bindings from the system ffmpeg headers via
+# bindgen (needs LIBCLANG_PATH from shell.nix). codec = decode, software-scaling =
+# YUV->RGB (swscale).
+ffmpeg-the-third = { version = "3", default-features = false, features = ["codec", "format", "software-scaling"], optional = true }

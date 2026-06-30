@@ -5,15 +5,18 @@ Avent "Baby Monitor+", hardware **SCD921 / SCD923**) deeply enough to reimplemen
 software second-screen client in Rust — focused on the two hardest parts: the **live
 video/audio stream** and the **account/device authentication**.
 
-**Current auth correction (2026-06-25):** the earlier "pure-static auth is
-exhausted / proven identity gate" conclusion is now **superseded**. A fresh static
-review found that the Rust live client did **not** match the APK's login request
-shape: the app posts all signed params in the form body, encrypts `postData` with
-ET=3 AES-GCM before signing, uses epoch-second `time`, and uses UUID-shaped
-`requestId`. The Rust live path has been corrected to build that Java-shaped
-request. A fresh guarded live `token.get` probe is still pending, so do not treat the
-older TASK-0050/0051 `ILLEGAL_CLIENT_ID` differential as proof of an app-attestation
-wall.
+**Milestone — the live stream works.** The Rust client now **logs in against the real
+Tuya cloud** (password + email-MFA → an authenticated `sid` session) and **streams the
+SCD921's live A/V end-to-end** — WebRTC-over-MQTT **302** signaling → host-direct ICE →
+KCP / AES-128-CBC + HMAC-SHA1 media → **H.264 video + S16LE audio**. It plays in a
+standard player over HTTP **or in an in-app GUI window** (`stream --output window`).
+The earlier "pure-static auth is exhausted / proven identity gate" and "no working
+video without auth" conclusions are **superseded**: the unblock was making the login
+request APK-faithful (form-body params, ET=3 AES-GCM `postData`, epoch-second `time`,
+UUID `requestId`) plus fixing the client signer — the old TASK-0050/0051
+`ILLEGAL_CLIENT_ID` differential was a **client** bug, not a server attestation wall.
+See `babymonitor/README.md` for the `stream` command and `re/gui_window.md` for the
+in-app window.
 
 ## Scope / authorized use
 
@@ -69,18 +72,21 @@ A Ghidra control-flow recovery of `libThingP2PSDK.so` pins the implementable spe
 
 - The `connect_v2` control JSON, the **302 `{header,msg,token}` signaling envelope**
   (`type` = offer/answer/candidate), and the SDP the device emits are byte-exact.
-- The media path is largely **standard WebRTC** (SDP, trickle-ICE, **DTLS-SRTP** via a
-  bundled mbedTLS), which maps onto `webrtc-rs` + `rumqttc`.
-- One Tuya-custom twist: the SDP carries an extra `m=application` section with an
-  **`a=aes-key:<hex>` line that conveys the media AES key in the SDP itself** (not a
-  DTLS exporter). The 302 payload is itself AES-encrypted with the device `localKey`
-  (AES-128/ECB/PKCS5, recovered and KAT-tested).
+- Signaling is **standard WebRTC shape** (SDP offer/answer, trickle-ICE), carried over
+  Tuya's MQTT brokers via `rumqttc`. The **media is NOT DTLS-SRTP**: the live run
+  confirmed Tuya's own framing — **KCP** reliability over UDP carrying **AES-128-CBC +
+  20-byte HMAC-SHA1** units (the cap4-validated "suite 3"), after a full-ICE
+  host-direct path is nominated.
+- The media AES key is conveyed in the SDP itself — an extra `m=application` section
+  with an **`a=aes-key:<hex>` line** (not a DTLS exporter). The 302 signaling payload
+  is in turn AES-encrypted with the device `localKey` (AES-128/ECB/PKCS5, recovered
+  and KAT-tested).
 
 The recovered shape matches independent public Tuya WebRTC projects
-(`seydx/tuya-ipc-terminal`, `tuya/webrtc-demo-go`) field-for-field. The transport is
-**implementable given the runtime-gated per-session inputs**; the residual that only a
-live capture closes is the actual `a=aes-key` value + the negotiated SDP bytes
-(`re/webrtc_session.md` §9).
+(`seydx/tuya-ipc-terminal`, `tuya/webrtc-demo-go`) field-for-field, and the transport
+is now **implemented and confirmed on a live run**: the client negotiates the SDP,
+nominates the ICE pair, and decrypts real media end-to-end (`re/webrtc_session.md`,
+`re/gui_window.md`).
 
 ### Auth = mobile-app sign, `MD5(...)`
 
@@ -118,7 +124,7 @@ camera-config).
 > prove `bmp_token` irrelevant. The native/JNI key material is now treated as
 > statically reproducible unless a fresh APK-shaped probe proves otherwise.
 
-## 3. Current auth status: APK-shaped static login pending fresh probe
+## 3. Auth + live stream: working
 
 The previous "server-side appKey↔app binding" conclusion was based on probes that
 were not byte-faithful to the APK request. Static review of the Java and native path
@@ -144,23 +150,20 @@ What is still known:
    path and needs one fresh guarded `token.get` probe before login can be called
    open or blocked.
 
-### What remains blocked without auth: the whole live stream
+### The full live stream now works
 
-This is **not** "you cannot log in but could still stream." There is **no working
-video until the client has an authenticated session:
+With the APK-faithful login the client obtains a real session and the **entire A/V
+chain runs**: the authenticated `sid` connects the Tuya MQTT broker that carries the
+WebRTC **302** signaling, the offer/answer + trickle-ICE establish a host-direct
+path, and the KCP / AES-128-CBC + HMAC-SHA1 media decrypts to **H.264 video + S16LE
+audio**. It is byte-validated offline against the cap4 capture and confirmed on an
+authorized live run against the owner's own camera (TASK-0083/0085).
 
-- The video transport is **cloud-brokered WebRTC-over-MQTT**: the 302 signaling
-  envelope rides Tuya's MQTT brokers (`User.domain.mobile*MqttUrl`,
-  `re/tuya_cloud_auth.md` §4), and connecting to those brokers needs the
-  **authenticated session** (`sid`) that the blocked login issues. No session ⇒ no
-  MQTT signaling ⇒ no WebRTC offer/answer ⇒ no frames.
-- The **LAN path (Tuya local protocol, TCP port 6668) is datapoint-only** — it
-  carries device datapoints (DPs), **not** an A/V media stream. It is not an
-  alternative way to view the camera.
-
-So either a working APK-shaped login or an injected captured session is a hard
-prerequisite for the project's actual goal (seeing the baby), not merely for a green
-`auth status`.
+The earlier "no video without auth" caveat was correct about the *dependency* (no
+session ⇒ no MQTT signaling ⇒ no frames) — that gate is now **passed, not bypassed**.
+The **LAN path (Tuya local protocol, TCP 6668) remains datapoint-only** and is still
+not an A/V source. See `babymonitor/README.md` for the `stream` command (HTTP/VLC, raw
+stdout, or the in-app GUI window) and `re/gui_window.md` for the window internals.
 
 ## 4. What the Rust client does — and does not do
 
@@ -175,10 +178,10 @@ prerequisite for the project's actual goal (seeing the baby), not merely for a g
 - `babymonitor-cli` — a CLI viewer with `auth` and `devices` subcommands, human + `--json`
   output, and secret/PII fields redacted by default.
 
-It is **complete and token-injectable**, and the live login request shape has now been
-corrected, but it still needs a fresh guarded live probe before we can claim login
-works. `auth login` is an offline status command; `auth live-login` is the gated
-network path. The session-token slot is **injectable, and the consumer is wired**:
+It is **complete and token-injectable**, and the corrected live login now works
+end-to-end (password + email-MFA → session), driving signed cloud calls and the live
+A/V stream. `auth login` is an offline status command; `auth live-login` is the gated
+network path that performs the real login. The session-token slot is **injectable, and the consumer is wired**:
 `devices list --live` (gated `--features live`, TASK-0055) **loads an injected `sid`**
 from the on-disk session store and drives a byte-faithful, signed `device.list`
 request with it. With no session injected it reports the no-session state honestly.

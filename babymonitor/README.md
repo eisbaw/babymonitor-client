@@ -34,29 +34,69 @@ nix-shell --run 'just run -- devices list'
 nix-shell --run 'just run -- --json auth status'
 ```
 
-## Login status: static request-shape fix pending live re-test
+## Status: live login + full A/V stream working
 
-> **Correction (2026-06-25):** the previous "blocked by a proven server-side
-> identity gate" status is superseded. Static review found the Rust live login path
-> was not APK-faithful: signed params were sent as URL query params instead of form
-> fields, `postData` was raw JSON instead of ET=3 AES-GCM encrypted before signing,
-> `time` used milliseconds instead of seconds, and `requestId` was not UUID-shaped.
-> The live path now builds the Java-shaped request. A fresh guarded `token.get`
-> probe is required before calling the login avenue blocked or open.
+The client **logs in against the real Tuya cloud** (`auth live-login`: password +
+email-MFA → an authenticated `sid`/`uid` session), drives **signed cloud calls** with
+that session (`device.list`, `rtc.config.get`), and **streams the SCD921's live A/V
+end-to-end** — WebRTC-over-MQTT **302** signaling → host-direct ICE → KCP /
+AES-128-CBC + HMAC-SHA1 media → **H.264 video + S16LE audio**. The media back-half is
+byte-validated offline against the cap4 capture and confirmed on an authorized live
+run against the owner's own camera (TASK-0083/0085; commits `f8d9acf`, `e1528da`).
 
-What works **offline today**:
+> **The earlier "blocked" framing is superseded.** The previous status (login pending
+> a fresh probe; "no working video without auth") predates the working end-to-end
+> stream. The unblock was making the login request APK-faithful (form-body params,
+> ET=3 AES-GCM `postData`, epoch-second `time`, UUID `requestId`) plus fixing the
+> client signer — `ILLEGAL_CLIENT_ID` was a client bug, not a server attestation wall.
+
+Offline (no camera, no network) the same decode/mux path is exercised by
+`stream --replay-annexb` and asserted by the `just stream-validate` gate.
 
 | Command | Status |
 |---|---|
-| `auth status` / `auth logout` | works (reads/clears the local session store) |
-| `auth login` | live-gated; request shape corrected, fresh guarded probe pending |
-| `devices list` / `devices show <id>` | works against a **fixture body** (`--fixture <file>`; defaults to the synthetic test fixture) |
-| `devices list --live` | live-gated; consumes an injected/stored session, otherwise no fetch and no network touched |
+| `auth live-login` (`--features live`) | real login: password + email-MFA → session persisted to the store |
+| `auth status` / `auth logout` | reads/clears the local session store (offline) |
+| `devices list --live` (`--features live`) | signed `device.list` with the stored `sid` → finds the SCD921 |
+| `devices list` / `devices show <id>` | offline against a **fixture body** (`--fixture <file>`; defaults to the synthetic fixture) |
+| `stream` (`--features live`) | full live A/V → MPEG-TS over HTTP, raw stdout, **or an in-app GUI window** |
 
 Every command supports `--json`. **Secret/PII fields** (`localKey`, `secKey`,
 `p2pKey`, `initStr`, session/relay descriptors, …) are **redacted by default**;
 `--show-secrets` opts in (and prints a stderr warning) — intended only for your
 own authorized/synthetic data.
+
+## Live A/V stream (`stream`)
+
+`babymonitor-cli stream` drives the whole pipeline (login → discovery → 302
+signaling → ICE → media) and renders the decoded feed. Three output modes:
+
+| `--output` | What | Play with |
+|---|---|---|
+| `http` (default) | MPEG-TS served over HTTP (ffmpeg muxer) | `vlc http://127.0.0.1:8554/stream.ts` |
+| `window` | in-app SDL2 video window — **in-process** libavcodec H.264 decode → YUV → GPU texture (no subprocess, no HTTP). Needs `--features live,gui`. | (opens its own window) |
+| `stdout` | raw Annex-B H.264 | `mpv -` / `ffplay -f h264 -` |
+
+```sh
+# HTTP + VLC (the just recipe builds, waits for the camera, auto-opens VLC, and
+# stops the pipeline when VLC closes):
+nix-shell --run 'just live-stream'
+
+# In-app GUI window (renders in our own SDL2 window — no external player):
+nix-shell --run 'cargo run --manifest-path babymonitor/babymonitor-cli/Cargo.toml \
+    --features live,gui --bin babymonitor-cli -- stream --output window'
+```
+
+The GUI window decodes **in-process** via the `ffmpeg-the-third` libavcodec binding
+(decision + the `ffmpeg_7` pin rationale in `../re/gui_window.md`), not a subprocess,
+and uploads YUV420 straight into an SDL2 IYUV texture. The bounded video queue keeps
+the camera's KCP window advancing so the source never freezes (the TASK-0085 fix).
+
+Known v1 limits: **video only** — downstream audio is received but not played
+(TASK-0116); and **no working window close button** — the nix `sdl2-compat` build
+panics on the event enum, so the loop uses `pump_events` and the window is stopped by
+terminating the process (hardening tracked in TASK-0117). Stream health is observable without touching
+frame content via `$BABYMONITOR_STREAM_TRACE` (KCP cursors + frame counters; no PII).
 
 ## The live gold-oracle test (gated)
 

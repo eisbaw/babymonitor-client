@@ -11,8 +11,11 @@ stream + pairing/auth first.
 
 ## Hard rules
 
-- **Static analysis only.** No live capture is available. The stream/pairing protocol is
-  expected to live in native `.so` libs — treat Ghidra/radare2 analysis as first-class.
+- **Static recovery first; owner-authorized validation allowed.** The protocol is recovered by
+  static analysis — the stream/pairing logic lives in native `.so` libs, so treat Ghidra/radare2 as
+  first-class. Emulator network captures (`emulator_captures/` cap0–cap6, via the sibling
+  `android_emulator_re` project) and live runs against the owner's own device are now available and
+  used for **validation** (this supersedes the original "static-only, no live capture" rule, 2026-06-28).
 - **Honesty over confidence.** Never fabricate protocol/wire-format details. Each claim states a
   confidence level and cites evidence (`file:line`, or `lib.so` + offset). If something can't be
   determined statically, say so and note what evidence would unblock it.

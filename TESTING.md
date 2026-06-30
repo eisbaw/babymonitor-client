@@ -134,9 +134,10 @@ What Wave-1 (static RE) taught, to fold into Wave-2 planning:
    **not computable under pure static analysis**. A working login needs the runtime config blob OR one
    live sign vector. **No oracle exists statically** — a self-derived signer is unverifiable.
    Wave-2 must sequence the auth DECISION first; everything (device list, stream) is gated on it.
-2. **Streams are understood, unbuilt.** WebRTC-over-MQTT (302 signaling, DTLS-SRTP, H.264/Opus) is the
-   confirmed transport; the Rust impl (webrtc-rs + rumqttc) is Wave-2 and ultimately needs auth for the
-   device's p2p creds + a live device returning p2pType=4.
+2. **Streams are built and working.** WebRTC-over-MQTT (302 signaling) → ICE → KCP / AES-128-CBC +
+   HMAC-SHA1 media (suite 3, **NOT** DTLS-SRTP) → H.264 video + S16LE audio is the confirmed transport,
+   and the Rust impl (rumqttc + a custom KCP/AES media engine, not webrtc-rs) streams the owner's live
+   camera end-to-end.
 3. **The grounding gates work and caught real defects** — but the recurring failure mode was
    **verdict-overturn lag**: when a later spike overturned an earlier verdict, the entry/sibling docs
    kept asserting the old model (recurred 4×, each caught by the review gate, never the lint). Wave-2
@@ -145,5 +146,6 @@ What Wave-1 (static RE) taught, to fold into Wave-2 planning:
 4. **Two-tool corroboration matters.** radare2 alone mischaracterized fcn.11658 (called it white-box;
    it's AES) and miscounted xrefs/cmd-numbers; Ghidra's decompiler corrected these. Use Ghidra C as the
    primary source for any further deep native logic; cross-check vs r2.
-5. **Honesty discipline held:** the client is token-pending (cannot log in) and says so everywhere —
-   no fake login, secrets gitignored + redacted, #[ignore]d live tests that go red on faked success.
+5. **Honesty discipline held:** the client now logs in for real (password + email-MFA → session) and
+   streams live A/V end-to-end — earlier it was token-pending and said so everywhere. Throughout: no
+   fake login, secrets gitignored + redacted, #[ignore]d live tests that go red on faked success.

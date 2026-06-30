@@ -3,7 +3,8 @@
 The transport decision for the SCD921 live A/V stream, so Wave-2 implements the
 cheaper viable path first. Method: **JS-first**, corroborated in decompiled Java
 (`decompiled/jadx/`) and the committed native symbol/string dumps, then
-cross-checked against public Tuya WebRTC projects. Static analysis only.
+cross-checked against public Tuya WebRTC projects. Statically recovered; the SCD921 transport was
+later live-validated end-to-end (see `re/prd.md`).
 
 > Citation note (symbol-anchored — TASK-0024): cites name a **symbol**
 > (class/method/enum); any `...File.java ~:NN` line is an **approximate hint** for

@@ -12,8 +12,8 @@
 > SDK's **WebRTC mode**, which is **NOT the wire path this device uses for live A/V**.
 > Several DTLS-SRTP / webrtc-rs claims below are superseded — each is flagged inline
 > (look for "Superseded 2026-06-28, v0.1.0-live-stream"). The conv=0 media
-> authorization (§5b) is the actual unblock. Sustained continuous A/V is NOT yet
-> verified (see §9 follow-ups). Secrets remain referenced by `secrets/` location
+> authorization (§5b) is the actual unblock. Sustained continuous A/V is now verified
+> (TASK-0085 fixed the KCP ACK-loop starvation). Secrets remain referenced by `secrets/` location
 > only.
 
 The end-to-end, implementable spec for the Tuya WebRTC-over-MQTT live A/V session
@@ -28,7 +28,7 @@ recovered from `send_frame`/`recv_frame`, and the session state machine.
 > **Method.** Ghidra (`analyzeHeadless`) is the PRIMARY decompiler (user directive);
 > radare2 is the cross-check. Both run over the same arm64
 > `decompiled/nativelibs/libThingP2PSDK.so` (gitignored; inventoried in
-> `re/native_libs.md`). Static analysis only.
+> `re/native_libs.md`). Statically recovered; the live path was later validated end-to-end (v0.1.0-live-stream).
 >
 > **Citation convention (symbol-anchored — TASK-0024).** Native claims are
 > anchored on a **demangled symbol** or a **literal string**, plus a committed

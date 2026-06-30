@@ -1,8 +1,9 @@
 # babymonitor — Rust client for the Philips Avent Baby Monitor+
 
 A from-scratch Rust client for the **Philips Avent Baby Monitor+** (hardware
-SCD921 / SCD923), a white-labeled **Tuya IPC camera**. Reverse-engineered
-**statically** (no live capture); see `../re/` for the analysis artifacts.
+SCD921 / SCD923), a white-labeled **Tuya IPC camera**. Protocol recovered by **static
+analysis**, then validated on emulator captures + authorized live runs; see `../re/` for the
+analysis artifacts.
 
 Workspace:
 

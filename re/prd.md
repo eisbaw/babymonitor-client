@@ -97,8 +97,9 @@ closest to candidate 1 below but with **KCP** media framing rather than raw WebR
 - conv ids: 0 = control, 1 = video, 2 = downstream audio (16 kHz mono S16LE, inferred).
 
 Confidence / honest caveat: **"live keyframe decodes + displays" is PROVEN** (the Rust client
-decoded the live 1080p H.264 keyframe and VLC displayed it). **"Smooth continuous live A/V" is NOT
-yet verified** — across live runs the camera's conv=1 video froze at ~12 segments (its initial KCP
+decoded the live 1080p H.264 keyframe and VLC displayed it). **"Smooth continuous live A/V" is now
+verified** (TASK-0085 decoupled the media pump from the KCP ACK loop) — earlier, across live runs the
+camera's conv=1 video froze at ~12 segments (its initial KCP
 send window); root-caused to the single-threaded media pump starving the KCP ACK loop. Follow-ups:
 TASK-0085 (decouple the ACK loop from the blocking sink — the blocker), TASK-0086 (KCP WASK/WINS +
 flush cadence), TASK-0087 (A/V sink fixes), TASK-0088 (newtype the derived auth password),

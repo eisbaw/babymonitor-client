@@ -164,6 +164,33 @@ live-stream port="8556":
     vlc --no-video-title-show --network-caching=1500 "http://127.0.0.1:$PORT/stream.ts" >/dev/null 2>&1 || true
     echo "live-stream: VLC closed; stopping pipeline."
 
+# Live camera in an in-app SDL2 window (no external player / HTTP): the
+# `--features live,gui` pipeline with `--output window` (in-process libavcodec decode
+# -> SDL window). Needs the owner's gitignored secrets/ + a valid session (run
+# `auth live-login` first if it has expired). The binary is run directly (not via
+# `cargo run`) so the stop signal reaches it, not an orphaned grandchild. The window
+# has no close button yet and the nix sdl2-compat build makes SDL swallow
+# SIGINT/SIGTERM/SIGQUIT (TASK-0117), so this foreground shell traps Ctrl-C/TERM/HUP
+# and SIGKILLs the window. Stop it by pressing Ctrl-C in this terminal.
+[group('run')]
+gui-stream:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    echo "gui-stream: building the live GUI window pipeline (first build can take ~30-60s)…"
+    cargo build --quiet --manifest-path babymonitor/babymonitor-cli/Cargo.toml \
+        --features live,gui --bin babymonitor-cli
+    BIN=babymonitor/target/debug/babymonitor-cli
+    echo "gui-stream: starting — a window opens once the camera answers (stages 1-6)."
+    echo "gui-stream: press Ctrl-C HERE (or close this terminal) to stop."
+    "$BIN" stream --output window &
+    SPID=$!
+    # SDL swallows INT/TERM/QUIT, so the binary cannot stop itself on Ctrl-C; this
+    # foreground shell's trap is the real stop — it SIGKILLs (uncatchable) the binary
+    # on Ctrl-C (INT), kill (TERM), or terminal close (HUP), and on normal EXIT.
+    trap 'kill -9 "$SPID" 2>/dev/null' EXIT INT TERM HUP
+    wait "$SPID"
+    echo "gui-stream: stream stopped."
+
 # Regression tripwire: run every non-destructive CLI command; must not panic.
 [group('run')]
 showcase:

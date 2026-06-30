@@ -50,9 +50,11 @@ nix's SDL2 is **sdl2-compat** (an SDL3-backed shim). It emits some event type va
 `event_pump.pump_events()` (drives the OS queue at the C level) and **never** iterate the Rust
 `Event` enum. Consequence / **documented limitation**: there is no X-close-button handling — the
 window is closed by stopping the process (Ctrl-C / the run timeout). Good enough for a viewer;
-**TASK-0117** tracks adding a hand-rolled SDL3-safe event filter (and note: SDL installs its own
-SIGTERM handler that it turns into an SDL_QUIT event the loop ignores, so a plain `kill`/`timeout
---signal=TERM` does NOT stop the window — it needs SIGKILL or Ctrl-C).
+**TASK-0117** tracks adding a hand-rolled SDL3-safe event filter. Note: this sdl2-compat build
+makes SDL swallow **SIGINT, SIGTERM, and SIGQUIT** — turning each into an SDL_QUIT the loop ignores
+(verified empirically) — so a plain `kill`, Ctrl-C, or `timeout --signal=TERM` does NOT stop the
+window; only **SIGKILL** does. The `just gui-stream` recipe wraps the run so its foreground shell
+traps Ctrl-C/TERM/HUP and SIGKILLs the binary.
 
 ### libav logging silenced to `Quiet`
 We feed the decoder one NAL per packet and drain after each, so libavcodec logs

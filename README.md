@@ -1,9 +1,12 @@
-# Philips Avent Baby Monitor+ — static RE to a Rust client
+# Philips Avent Baby Monitor+ — reverse-engineered Rust client
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Reverse-engineering the Android app **`com.philips.ph.babymonitorplus`** (Philips
 Avent "Baby Monitor+", hardware **SCD921 / SCD923**) deeply enough to reimplement a
-software second-screen client in Rust — focused on the two hardest parts: the **live
-video/audio stream** and the **account/device authentication**.
+software second-screen client in **Rust** — built because the official app won't run on
+the owner's phone, so they want their own client. The two hardest parts are solved: the
+**live video/audio stream** and the **account/device authentication**.
 
 **Milestone — the live stream works.** The Rust client now **logs in against the real
 Tuya cloud** (password + email-MFA → an authenticated `sid` session) and **streams the
@@ -17,6 +20,21 @@ UUID `requestId`) plus fixing the client signer — the old TASK-0050/0051
 `ILLEGAL_CLIENT_ID` differential was a **client** bug, not a server attestation wall.
 See `babymonitor/README.md` for the `stream` command and `re/gui_window.md` for the
 in-app window.
+
+## Quick start
+
+All tools (jadx, Ghidra, radare2, cargo, ffmpeg) come from `shell.nix`, so everything
+runs inside the project's nix shell:
+
+```sh
+nix-shell --run 'just e2e'              # build + the full offline test suite (no device needed)
+nix-shell --run 'just stream-validate'  # offline demo: replay a synthetic H.264 sample through the
+                                        # real RTP depacketizer + ffmpeg muxer -> a playable MPEG-TS
+```
+
+Watching a **real** SCD921 live — `just gui-stream` (in-app window) or `just live-stream`
+(HTTP -> VLC) — needs the **owner's own device + an authenticated session** (the gated
+`--features live` build); see [`babymonitor/README.md`](babymonitor/README.md).
 
 ## Scope / authorized use
 
@@ -141,14 +159,13 @@ That means the older corrupted-sign differential (TASK-0050) and "final wire dif
 task (TASK-0051) were testing the wrong envelope. They remain useful history, but
 they no longer prove a permanent app-attestation or client-identity wall.
 
-What is still known:
+With that envelope corrected, the guarded `token.get` -> `password.login` -> email-MFA
+flow completes against the real cloud and issues a session: `ILLEGAL_CLIENT_ID` was the
+client signer/identity bug above, not a server wall. Supporting facts:
 
 1. The appKey is the real provisioned identity, not a demo key (TASK-0046,
    `re/identity_enumeration.md`).
 2. Region hosts have been broadly enumerated (TASK-0048, `re/regions_decrypt.md`).
-3. The current Rust live builder now mirrors the APK's form-body/encrypted-postData
-   path and needs one fresh guarded `token.get` probe before login can be called
-   open or blocked.
 
 ### The full live stream now works
 
@@ -186,10 +203,10 @@ network path that performs the real login. The session-token slot is **injectabl
 from the on-disk session store and drives a byte-faithful, signed `device.list`
 request with it. With no session injected it reports the no-session state honestly.
 The wiring is test-backed offline
-(`injected_sid_rides_device_list_envelope_and_canonical_sign`, no network), and the
-`#[ignore]`d live end-to-end test asserts the honest pending state for the full
-stream. So given one captured live `sid` (§6), or a successful fresh `auth live-login`,
-the read path can run for real.
+(`injected_sid_rides_device_list_envelope_and_canonical_sign`, no network); the
+`#[ignore]`d live end-to-end test (`babymonitor-cli/tests/live_e2e.rs`) drives the real
+login -> discover -> stream chain when run with the owner's credentials, and is kept out
+of `just e2e`/CI so the offline gate needs no device.
 
 Build and run (from the repo root, inside the nix shell):
 
@@ -202,11 +219,14 @@ nix-shell --run 'just run -- devices list'      # works against a synthetic fixt
 nix-shell --run 'just showcase'                    # run every read-only CLI command (regression tripwire)
 ```
 
-## 5. Methodology + constraint
+## 5. Methodology
 
-**Static analysis only** — no Frida, no rooted device, no emulator, no live packet
-capture (`re/prd.md`). The consequence is that the live protocol is reconstructed from
-decompiled Java/Kotlin **and** native libraries.
+The protocol was reverse-engineered primarily by **static analysis** of the decompiled
+Java/Kotlin **and** native libraries (jadx + Ghidra/radare2). Ground-truth **gold
+vectors** then came from emulator network captures (`cap0`–`cap4`), and the assembled
+client was **confirmed on authorized live runs against the owner's own SCD921**. So the
+original static-only constraint (`re/prd.md`) was relaxed to allow owner-authorized
+capture and live validation — the recovery is static, the proof is empirical.
 
 Tooling:
 
@@ -229,27 +249,19 @@ Tooling:
 > docs note that jadx line hints are approximate and drift between runs; the cited
 > **symbol** is authoritative.)
 
-## 6. Alternate unblock: one injected session
+## 6. Optional: inject a captured session (skip `auth live-login`)
 
-A fresh APK-shaped login probe is the direct static path. Separately, exactly **one**
-captured session converts the tested client from "token-injectable" to "can drive the
-read path" without solving login first. This is tracked as **TASK-0022** and remains
-useful because the device-list and streaming credentials ride the authenticated
-session.
+`auth live-login` performs the real login. As an alternative, exactly **one** captured
+session lets the client drive the read/stream path without logging in again — handy for
+reusing a session or skipping a repeat login. Tracked as **TASK-0022**; the device-list
+and streaming credentials all ride the authenticated session.
 
-**What one capture yields.** A single authorized extraction from the genuine app on
-the owner's own device can provide:
-
-1. **A live session token** — the `sid` (plus `uid` and the resolved
-   `User.domain.mobileApiUrl`) issued by a real login. The `sid` is the bearer for
-   every subsequent atop call **and** for the MQTT broker connection that carries the
-   WebRTC 302 signaling.
-2. If the fresh APK-shaped static probe still fails, any extra app/runtime identity
-   element the genuine app presents can be compared against the static request.
-
-A captured `sid` is enough to drive the **read path** (device-list → camera-config →
-MQTT signaling) without solving login first, because the client's session slot is
-injectable.
+**What one capture yields.** A single authorized extraction from the genuine app on the
+owner's own device provides a live session token — the `sid` (plus `uid` and the
+resolved `User.domain.mobileApiUrl`). The `sid` is the bearer for every subsequent atop
+call **and** for the MQTT broker connection that carries the WebRTC 302 signaling, so it
+is enough to drive the full read/stream path (device-list → camera-config → MQTT
+signaling).
 
 **How to use a captured `sid` with the client.** The client persists a session as JSON
 (`sid`, `uid`, `mobile_api_base`, `expires_at`) in the on-disk **session store** — the
@@ -291,9 +303,9 @@ same file `auth status` reads. To validate the full chain end-to-end:
    stream run; it checks **shape only** (a camera is found, transport is WebRTC) and
    never prints a `sid`/`uid`/device id.
 
-This is the honest seam: the static work is complete up to the server-side identity
-binding, and a single owned-device capture closes it — no further reverse engineering
-required, only evidence this project chose not to collect.
+Either path — a fresh `auth live-login` or an injected `sid` — reaches the same place:
+the read/stream chain running against the real account, with every `sid`/`uid`/device
+id kept out of stdout and the repo.
 
 ## License
 

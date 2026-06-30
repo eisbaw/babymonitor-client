@@ -1784,7 +1784,7 @@ impl LiveAvSink {
                 // Video-only window: audio is not wired into the GUI sink in v1
                 // (documented gap, re/gui_window.md). The recv/ACK loop stays
                 // alive because GuiSink::send never blocks (bounded drop-on-full).
-                video: VideoOut::Window(crate::gui::GuiSink::spawn("babymonitor — live")?),
+                video: VideoOut::Window(crate::gui::GuiSink::spawn("babymonitor - live")?),
                 audio: None,
             });
             #[cfg(not(feature = "gui"))]

@@ -168,10 +168,10 @@ live-stream port="8556":
 # `--features live,gui` pipeline with `--output window` (in-process libavcodec decode
 # -> SDL window). Needs the owner's gitignored secrets/ + a valid session (run
 # `auth live-login` first if it has expired). The binary is run directly (not via
-# `cargo run`) so the stop signal reaches it, not an orphaned grandchild. The window
-# has no close button yet and the nix sdl2-compat build makes SDL swallow
-# SIGINT/SIGTERM/SIGQUIT (TASK-0117), so this foreground shell traps Ctrl-C/TERM/HUP
-# and SIGKILLs the window. Stop it by pressing Ctrl-C in this terminal.
+# `cargo run`) so signals reach it, not an orphaned grandchild. The window has a
+# working close button, and Ctrl-C / SIGTERM also stop it (gui::close_requested); the
+# foreground shell ALSO traps Ctrl-C/TERM/HUP as a SIGKILL backstop. Stop it by
+# closing the window or pressing Ctrl-C in this terminal.
 [group('run')]
 gui-stream:
     #!/usr/bin/env bash
@@ -184,9 +184,9 @@ gui-stream:
     echo "gui-stream: press Ctrl-C HERE (or close this terminal) to stop."
     "$BIN" stream --output window &
     SPID=$!
-    # SDL swallows INT/TERM/QUIT, so the binary cannot stop itself on Ctrl-C; this
-    # foreground shell's trap is the real stop — it SIGKILLs (uncatchable) the binary
-    # on Ctrl-C (INT), kill (TERM), or terminal close (HUP), and on normal EXIT.
+    # The binary now stops itself on close / Ctrl-C / SIGTERM (gui::close_requested);
+    # this trap is a belt-and-suspenders SIGKILL backstop (terminal close/HUP, or a
+    # wedged window) so we never leave an orphan.
     trap 'kill -9 "$SPID" 2>/dev/null' EXIT INT TERM HUP
     wait "$SPID"
     echo "gui-stream: stream stopped."

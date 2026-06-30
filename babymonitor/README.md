@@ -92,11 +92,13 @@ The GUI window decodes **in-process** via the `ffmpeg-the-third` libavcodec bind
 and uploads YUV420 straight into an SDL2 IYUV texture. The bounded video queue keeps
 the camera's KCP window advancing so the source never freezes (the TASK-0085 fix).
 
-Known v1 limits: **video only** — downstream audio is received but not played
-(TASK-0116); and **no working window close button** — the nix `sdl2-compat` build
-panics on the event enum, so the loop uses `pump_events` and the window is stopped by
-terminating the process (hardening tracked in TASK-0117). Stream health is observable without touching
-frame content via `$BABYMONITOR_STREAM_TRACE` (KCP cursors + frame counters; no PII).
+The window **closes** on the X button, Ctrl-C, or SIGTERM: `gui::close_requested` reads raw SDL
+event types via a small FFI (the sdl2 0.37 `Event` enum panics on the nix `sdl2-compat` shim, so the
+crate root is `deny(unsafe_code)` for that one spot), and the live presenter exits via
+`process::exit(0)` — graceful-shutdown signalling is a TASK-0117 follow-up. Known v1 limit:
+**video only** — downstream audio is received but not played (TASK-0116). Stream health is
+observable without touching frame content via `$BABYMONITOR_STREAM_TRACE` (KCP cursors + frame
+counters; no PII).
 
 ## The live gold-oracle test (gated)
 

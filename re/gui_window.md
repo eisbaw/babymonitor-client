@@ -44,17 +44,22 @@ express this (it cannot relate two of its own captures), which is the E0597
 `texture_creator does not live long enough` the first cut hit. The creator is declared before the
 texture so it always outlives it.
 
-### sdl2-compat event-enum panic workaround (`pump_events`)
+### sdl2-compat event-enum panic — raw event-type polling (`close_requested`)
 nix's SDL2 is **sdl2-compat** (an SDL3-backed shim). It emits some event type values that the
-`sdl2 0.37` crate's `Event` enum conversion panics on (e.g. `0x207`). We therefore call
-`event_pump.pump_events()` (drives the OS queue at the C level) and **never** iterate the Rust
-`Event` enum. Consequence / **documented limitation**: there is no X-close-button handling — the
-window is closed by stopping the process (Ctrl-C / the run timeout). Good enough for a viewer;
-**TASK-0117** tracks adding a hand-rolled SDL3-safe event filter. Note: this sdl2-compat build
-makes SDL swallow **SIGINT, SIGTERM, and SIGQUIT** — turning each into an SDL_QUIT the loop ignores
-(verified empirically) — so a plain `kill`, Ctrl-C, or `timeout --signal=TERM` does NOT stop the
-window; only **SIGKILL** does. The `just gui-stream` recipe wraps the run so its foreground shell
-traps Ctrl-C/TERM/HUP and SIGKILLs the binary.
+`sdl2 0.37` crate's safe `Event` enum conversion panics on (e.g. `0x207`), so `poll_iter()` is
+unusable. We instead read the **raw event `type_` integer** via a small `unsafe` FFI
+(`gui::close_requested`: `SDL_PumpEvents` + `SDL_PollEvent`), acting only on `SDL_QUIT` /
+`SDL_WINDOWEVENT_CLOSE` and discarding everything else — no Rust enum conversion, no panic. This is
+the one spot the CLI crate needs `unsafe`, so its root is `deny(unsafe_code)` (not `forbid`); the
+core crate stays `forbid` (TASK-0117).
+
+Consequence: **the X close button now works** — clicking it (a `WM_DELETE_WINDOW`) stops the
+window. And because this sdl2-compat build turns **SIGINT/SIGTERM/SIGQUIT into an `SDL_QUIT`** that
+`close_requested` now honors, **Ctrl-C and a plain `kill`/`timeout --signal=TERM` stop it too** —
+all verified empirically (`xdotool windowclose` and `SIGTERM` each exit the process ~1 s later;
+`SIGKILL` of course also works). In the live/replay presenter the close calls
+`std::process::exit(0)` (the window IS the app); the selftest loop simply breaks. The `just
+gui-stream` recipe keeps its foreground-shell trap as a belt-and-suspenders SIGKILL backstop.
 
 ### libav logging silenced to `Quiet`
 We feed the decoder one NAL per packet and drain after each, so libavcodec logs
@@ -78,8 +83,11 @@ and drains the queue. Dropped NALs are counted and surface in the trace.
 - **Audio is not wired** into the window sink. `--output window` is **video-only**; the downstream
   16 kHz audio track is decoded by the engine but not played (the ffmpeg `http`/`ts` modes still
   mux it to AAC). A follow-up task should add an SDL audio device fed from the same engine.
-- **No window-close (X button) handling** — see the sdl2-compat note above. Stop the process to
-  close.
+- **Window close is abrupt** — the X button / Ctrl-C / SIGTERM now stop the window
+  (`gui::close_requested`), but the live presenter does so via `std::process::exit(0)`, which skips
+  graceful teardown (no `GuiSink::finish` summary, no MQTT session teardown — the camera times its
+  own session out rather than being told). TASK-0117 tracks signalling the media pump to unwind
+  cleanly instead.
 - **No on-screen error text** — health is judged by counters (libav logging is `Quiet`).
 
 ## Verification

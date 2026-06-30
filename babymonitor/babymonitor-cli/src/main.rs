@@ -32,7 +32,11 @@
 //! authorized data. Because this build has no live fetch, the only data it can
 //! print comes from a fixture the caller supplies.
 
-#![forbid(unsafe_code)]
+// `deny` (not `forbid`): the whole crate is safe EXCEPT one localized FFI in the
+// `gui` feature — reading raw SDL event types to detect the window-close button,
+// because the sdl2 0.37 `Event` enum panics on nix sdl2-compat (SDL3) event values
+// (TASK-0117, `gui::close_requested`). `deny` still keeps unsafe out everywhere else.
+#![deny(unsafe_code)]
 
 use std::path::PathBuf;
 use std::process::ExitCode;

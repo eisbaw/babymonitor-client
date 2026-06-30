@@ -527,7 +527,7 @@ impl OutputSink {
                     );
                 }
                 return Ok(Self::Window(crate::gui::GuiSink::spawn(
-                    "babymonitor — replay",
+                    "babymonitor - replay",
                 )?));
             }
             #[cfg(not(feature = "gui"))]

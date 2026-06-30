@@ -20,6 +20,42 @@ use babymonitor_core::Error;
 use ffmpeg_the_third as ff;
 use sdl2::pixels::{Color, PixelFormatEnum};
 
+/// Drain the OS event queue and report whether the user asked to close the window
+/// (the X / window-manager close, or SDL_QUIT). We read the raw SDL event **type
+/// integer** via FFI rather than the sdl2 crate's `Event` enum: under nix's
+/// sdl2-compat (SDL3) the enum conversion panics on some event values (e.g. 0x207)
+/// the 0.37 crate does not map, so the safe `poll_iter()` is unusable. Reading the
+/// integer type sidesteps that — we act only on QUIT / window-close and discard
+/// everything else. This is the single place the crate needs `unsafe` (a C poll +
+/// union tag read), which is why the crate is `deny(unsafe_code)`, not `forbid`.
+#[allow(unsafe_code)]
+fn close_requested() -> bool {
+    use sdl2::sys;
+    let mut quit = false;
+    // SAFETY: SDL_PumpEvents/SDL_PollEvent act on the process-global event queue of
+    // the initialised event subsystem (the caller holds an EventPump for the loop's
+    // lifetime). We only read `type_` (the union's common tag) and, for a window
+    // event, `window.event`; the `&&` short-circuits so `window.event` is read only
+    // when the event IS a window event. SDL_PollEvent initialises the active union
+    // variant before returning 1 (a union needs no all-bytes-init), and we read only
+    // those fields, so each read is of initialised memory.
+    unsafe {
+        sys::SDL_PumpEvents();
+        let mut ev = std::mem::MaybeUninit::<sys::SDL_Event>::uninit();
+        while sys::SDL_PollEvent(ev.as_mut_ptr()) == 1 {
+            let ty = ev.assume_init_ref().type_;
+            if ty == sys::SDL_EventType::SDL_QUIT as u32
+                || (ty == sys::SDL_EventType::SDL_WINDOWEVENT as u32
+                    && ev.assume_init_ref().window.event
+                        == sys::SDL_WindowEventID::SDL_WINDOWEVENT_CLOSE as u8)
+            {
+                quit = true;
+            }
+        }
+    }
+    quit
+}
+
 /// Smoke-test: open an SDL2 window, animate a fill for `secs` seconds. Proves the
 /// SDL2 stack links + a real window opens — no camera, no decoder. Returns the
 /// presented-frame count so a headless caller can confirm it ran.
@@ -27,20 +63,22 @@ pub fn selftest(secs: u64) -> Result<u64, String> {
     let sdl = sdl2::init()?;
     let video = sdl.video()?;
     let window = video
-        .window("babymonitor — gui selftest", 640, 360)
+        .window("babymonitor - gui selftest", 640, 360)
         .position_centered()
         .build()
         .map_err(|e| e.to_string())?;
     let mut canvas = window.into_canvas().build().map_err(|e| e.to_string())?;
-    let mut pump = sdl.event_pump()?;
-    eprintln!("gui-selftest: SDL window open for {secs}s…");
+    let _pump = sdl.event_pump()?; // keep the event subsystem alive for close_requested
+    eprintln!("gui-selftest: SDL window open for {secs}s (or until you close it)…");
     let start = Instant::now();
     let mut frames = 0u64;
     loop {
-        // nix's SDL2 is sdl2-compat (SDL3-backed) and emits some event values the
-        // sdl2 0.37 crate's Event enum panics on (e.g. 0x207). Pump the OS queue at
-        // the C level so the window stays alive WITHOUT the Rust enum conversion.
-        pump.pump_events();
+        // Stop on the window's close button / SDL_QUIT (raw event types — see
+        // `close_requested` — because the sdl2 0.37 Event enum panics on some
+        // sdl2-compat (SDL3) event values).
+        if close_requested() {
+            break;
+        }
         let t = start.elapsed().as_millis() as u32;
         canvas.set_draw_color(Color::RGB((t / 8 % 256) as u8, 80, 160));
         canvas.clear();
@@ -178,7 +216,7 @@ fn present_loop(title: &str, rx: &Receiver<Vec<u8>>, presented: &AtomicU64) -> R
     canvas.clear();
     canvas.present();
     let texture_creator = canvas.texture_creator();
-    let mut pump = sdl.event_pump()?;
+    let _pump = sdl.event_pump()?; // keep the event subsystem alive for close_requested
 
     // In-process H.264 decoder (libavcodec).
     let codec = ff::decoder::find(ff::codec::Id::H264).ok_or("no libavcodec H.264 decoder")?;
@@ -199,7 +237,13 @@ fn present_loop(title: &str, rx: &Receiver<Vec<u8>>, presented: &AtomicU64) -> R
     let mut count: u64 = 0;
 
     while let Ok(nal) = rx.recv() {
-        pump.pump_events();
+        // User closed the window (X button / SDL_QUIT) -> the window IS the app, so
+        // stop the whole stream and exit. Raw event types (see `close_requested`)
+        // because the sdl2 0.37 Event enum panics on some sdl2-compat (SDL3) values.
+        if close_requested() {
+            eprintln!("stream (gui): window closed — stopping the stream.");
+            std::process::exit(0);
+        }
         let packet = ff::Packet::copy(&nal);
         if decoder.send_packet(&packet).is_ok() {
             present_frames(

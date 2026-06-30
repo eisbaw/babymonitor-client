@@ -297,5 +297,5 @@ required, only evidence this project chose not to collect.
 
 ## License
 
-The Rust workspace declares **MIT** (`babymonitor/Cargo.toml`). There is **no top-level
-`LICENSE` file yet** — add one before any public distribution.
+**MIT** — see the top-level [`LICENSE`](LICENSE) file. The Rust workspace also declares
+`license = "MIT"` in `babymonitor/Cargo.toml`.

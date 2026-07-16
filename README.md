@@ -97,6 +97,13 @@ protocol claim in `re/*.md` carries a confidence label and a symbol-anchored cit
 linted by `just check-evidence`; `just secret-scan` blocks any leaked credential or PII.
 Follow the `re/*.md` links for per-claim evidence and honest limitations.
 
+## Thanks to
+
+Thanks to [`rust-async-tuyapi`](https://github.com/FruitieX/rust-async-tuyapi),
+and especially [uplg's Tuya protocol 3.5 pull request
+#21](https://github.com/FruitieX/rust-async-tuyapi/pull/21), for making this LAN
+protocol work available as a public reference. See [`NOTICES.txt`](NOTICES.txt).
+
 ## License
 
 **MIT** — see [`LICENSE`](LICENSE) (the Rust workspace also declares `license = "MIT"`).

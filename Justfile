@@ -27,6 +27,12 @@ clean:
 test:
     cargo test --manifest-path {{MANIFEST}}
 
+# Compile, test, and lint the live-feature orchestration using injected/loopback I/O.
+[group('test')]
+test-live:
+    cargo test --manifest-path {{MANIFEST}} -p babymonitor-cli --features live
+    cargo clippy --manifest-path {{MANIFEST}} -p babymonitor-cli --all-targets --features live -- -D warnings
+
 # Run clippy with warnings denied.
 [group('quality')]
 lint:
@@ -59,9 +65,9 @@ test-bmp-decode:
 test-regions:
     cd re/scripts && python3 test_regions_decrypt.py
 
-# End-to-end gate (build+test+lint+fmt-check+stub-grep+offline). Green before any commit.
+# End-to-end gate (default/live tests + lint + formatting + offline integration).
 [group('test')]
-e2e: build test lint fmt-check stub-grep assert-offline test-bmp-decode test-regions stream-validate
+e2e: build test test-live lint fmt-check stub-grep assert-offline test-bmp-decode test-regions stream-validate
 
 # Offline-validate the `stream` mux/serve path (TASK-0070/0073): synthesize an
 # Annex-B H.264 sample + a 16 kHz mono S16LE downstream-audio sample, replay them

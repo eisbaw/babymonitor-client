@@ -1,5 +1,5 @@
 //! `babymonitor-cli stream` — drive the live A/V pipeline (selected cloud-MQTT or
-//! authenticated LAN frame-32 signaling → media RX/decode) and re-mux the decoded
+//! key-proven LAN frame-32 signaling → media RX/decode) and re-mux the decoded
 //! Annex-B H.264 into **MPEG-TS served over HTTP** so a standard player connects:
 //!
 //! ```text
@@ -76,7 +76,7 @@ pub enum OutputMode {
 pub enum SignalingMode {
     /// Existing Tuya cloud MQTT carrier (behavior-compatible default).
     Cloud,
-    /// Authenticated camera-local TCP frame-32 carrier; never uses cloud APIs.
+    /// Key-proven camera-local TCP frame-32 carrier; never uses cloud APIs.
     Lan,
     /// Try LAN first, then explicitly diagnose and fall back to cloud on error.
     Auto,

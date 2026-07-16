@@ -7,7 +7,7 @@
 //! ```text
 //! 1 carrier     explicit cloud / lan / auto selection
 //! 2 bootstrap   cloud session+rtc.config OR secure stable LAN config
-//! 3 signaling   MQTT message-2.2 OR authenticated LAN frame type 32
+//! 3 signaling   MQTT message-2.2 OR key-proven LAN frame type 32
 //! 6 ICE         host-direct UDP + connectivity check                [LIVE I/O]
 //! 7 media       MediaEngine pump: suite-3 AES-128-CBC + 20B HMAC-SHA1
 //!               / KCP / fixed-12B RTP -> H.264 (conv 1) + S16LE audio (conv 2)
@@ -27,12 +27,16 @@
 //! `--replay-annexb`/cap4 path proves byte-exact; only the live socket front half
 //! is environmentally gated.
 
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use babymonitor_core::session::{Session, SessionStore};
 use babymonitor_core::stream::lan_config::{LanConfigStore, LanDeviceConfig};
+use babymonitor_core::stream::lan_discovery::{
+    decode_udp_advertisement, encode_app_discovery_request, LanAdvertisement,
+    UDP_DISCOVERY_APP_PORT, UDP_DISCOVERY_PORTS,
+};
 use babymonitor_core::stream::lan_transport::{Lan302ConnectConfig, Lan302Transport};
 use babymonitor_core::stream::media::audio;
 use babymonitor_core::stream::media::control::{self, MEDIA_START_AUTH_USERNAME};
@@ -49,11 +53,12 @@ use babymonitor_core::stream::session::{
     has_usable_host_candidate, NegotiationOutcome, OsRandom, RandomSource, SignalingFlow,
     SignalingSession,
 };
-use babymonitor_core::stream::signaling::ParsedAnswer;
+use babymonitor_core::stream::signaling::{IceServer, ParsedAnswer};
 use babymonitor_core::stream::topics;
 use babymonitor_core::stream::transport::{
     connect_and_negotiate, BrokerConfig, LiveSignalingParams,
 };
+use babymonitor_core::stream::tuya_lan::{LanKey, LanProtocolVersion};
 use babymonitor_core::stream::StreamCredentials;
 use babymonitor_core::Error;
 use serde::Deserialize;
@@ -61,6 +66,21 @@ use serde::Deserialize;
 use crate::stream::{OutputMode, SignalingMode, StreamArgs};
 
 type LiveLanSignalingSession = SignalingSession<Lan302Transport<TcpStream>>;
+
+/// Resources retained until the media run ends. Native code may query STUN after
+/// socket creation, so keep both the established frame-32 TCP session and the
+/// advertised responder alive and check responder health at teardown. The
+/// authorized TASK-0126 runs used the host candidate and sent zero STUN queries.
+struct LiveLanSignalingGuard {
+    _session: LiveLanSignalingSession,
+    _local_stun: LocalStunServer,
+}
+
+impl LiveLanSignalingGuard {
+    fn check_health(&self) -> Result<(), Error> {
+        self._local_stun.check_health()
+    }
+}
 
 /// Default path of the owner-injected runtime bundle (gitignored).
 const RUNTIME_BUNDLE: &str = "secrets/stream_runtime.json";
@@ -72,9 +92,25 @@ const RUNTIME_BUNDLE: &str = "secrets/stream_runtime.json";
 /// cloud-relayed answer from a camera waking from idle.
 const MAX_ANSWER_POLLS: usize = 600;
 
+/// Provisioning needs only enough time to receive one fresh, correlated answer.
+/// At the LAN transport's 250 ms read timeout this is a 20 s upper bound. A
+/// successfully decrypted response proves that the legacy 3.3 codec, localKey,
+/// device routing id, and selected endpoint belong together before we persist
+/// them as the camera configuration.
+const LAN_PROVISION_ANSWER_POLLS: usize = 80;
+
+/// The APK keeps its UDP listeners alive continuously; a bounded CLI discovery
+/// run sends the same command-37 request every six seconds and waits through
+/// three intervals for a matching camera advertisement.
+const LAN_DISCOVERY_WINDOW: Duration = Duration::from_secs(18);
+const LAN_DISCOVERY_RETRY: Duration = Duration::from_secs(6);
+const LAN_DISCOVERY_POLL: Duration = Duration::from_millis(20);
+const LAN_DISCOVERY_DATAGRAM_MAX: usize = 64 * 1024;
+
 /// Extra polls AFTER the answer to collect the camera's TRICKLED ICE candidates
-/// (phase 2). The answer SDP carries none (cap3/cap4), so the host candidate the
-/// media transport needs only arrives here. Poll count (≈ 30 s idle); see
+/// (phase 2). The answer SDP carries none; the TASK-0126 LAN-local-STUN run proved
+/// that this SCD921 sends its host candidate as a separate frame-32 envelope.
+/// Poll count (≈ 30 s idle); see
 /// TASK-0083 (early-exit once a host candidate is in hand to cut time-to-frame).
 const TRICKLE_POLLS: usize = 300;
 
@@ -237,7 +273,7 @@ where
             cloud()
         }
         SignalingMode::Auto => {
-            eprintln!("stream (live): signaling mode=auto; trying authenticated LAN first.");
+            eprintln!("stream (live): signaling mode=auto; trying key-proven LAN first.");
             match lan() {
                 Ok(value) => Ok(value),
                 Err(lan_error) => {
@@ -251,12 +287,450 @@ where
     }
 }
 
+/// Non-secret result of a cryptographically verified LAN provisioning run.
+pub(crate) struct LanProvisionOutcome {
+    /// Secure config location. The file itself contains secrets and is mode 0600.
+    pub config_path: PathBuf,
+    /// Hardware-gateway protocol verified by the camera exchange.
+    pub hgw_version: &'static str,
+}
+
+/// Build the durable LAN-only cache from already-captured owner artifacts.
+///
+/// This operation performs no REST, DNS, or MQTT work. It reads the private
+/// device/session/RTC captures, verifies `camera_ip` against each supported Hgw
+/// codec, and persists the first proven version via [`LanConfigStore::save`].
+/// Protocols 3.4/3.5 prove the localKey in their commands 3/4/5 handshake; 3.3
+/// must return a decryptable, fresh, correlated IPC_LAN_302 answer. No identifier,
+/// key, password, or camera address is printed by this layer.
+pub(crate) fn provision_lan_config(
+    camera_ip: Option<IpAddr>,
+    port: u16,
+    secrets_dir: &Path,
+    output: Option<&Path>,
+) -> Result<LanProvisionOutcome, Error> {
+    if port == 0 {
+        return Err(Error::StreamConfig(
+            "lan provision: --port must be non-zero".to_string(),
+        ));
+    }
+
+    let dev = find_camera_record(secrets_dir)?;
+    if dev.p2p_type != 4 {
+        return Err(Error::StreamConfig(format!(
+            "lan provision: camera p2pType is {}; this path requires p2pType=4",
+            dev.p2p_type
+        )));
+    }
+
+    let discovered = match camera_ip {
+        Some(camera_ip) => {
+            validate_camera_ip(camera_ip)?;
+            None
+        }
+        None => Some(discover_lan_endpoint(&dev.dev_id)?),
+    };
+    let camera_ip = camera_ip
+        .or_else(|| discovered.as_ref().map(|endpoint| endpoint.camera_ip))
+        .expect("explicit or discovered camera address");
+    let preferred_version = discovered
+        .as_ref()
+        .and_then(|endpoint| endpoint.hgw_version);
+
+    let rtc_path = secrets_dir.join("tuya_rtc_config.json");
+    let rtc_capture = read_json(&rtc_path).map_err(|error| {
+        Error::StreamConfig(format!(
+            "lan provision: cannot read cached RTC config {}: {error}",
+            rtc_path.display()
+        ))
+    })?;
+    let rtc_result = rtc_capture
+        .get("result")
+        .filter(|value| value.is_object())
+        .unwrap_or(&rtc_capture);
+    let rtc = RtcConfig::from_rtc_result(rtc_result).map_err(|error| {
+        Error::StreamConfig(format!(
+            "lan provision: cached RTC config is unusable: {error}"
+        ))
+    })?;
+    if rtc.dev_id != dev.dev_id {
+        return Err(Error::StreamConfig(
+            "lan provision: cached device-list and RTC config identify different cameras"
+                .to_string(),
+        ));
+    }
+
+    let sender_id = cached_sender_id(&rtc, secrets_dir)?;
+    let media_auth_password = if rtc.password.is_empty() {
+        None
+    } else {
+        Some(rtc.password.clone())
+    };
+    let endpoint = SocketAddr::new(camera_ip, port);
+    let local_key = LanKey::from_local_key(&dev.local_key)?;
+    let hgw_version = detect_lan_protocol(preferred_version, |version| {
+        if version == LanProtocolVersion::V3_3 {
+            let candidate = LanDeviceConfig {
+                camera_ip,
+                port,
+                device_id: dev.dev_id.clone(),
+                sender_id: sender_id.clone(),
+                local_key: dev.local_key.clone(),
+                hgw_version: version.as_str().to_string(),
+                media_auth_password: media_auth_password.clone(),
+            };
+            verify_legacy_33_signaling(&candidate)
+        } else {
+            let config = Lan302ConnectConfig {
+                address: endpoint,
+                version,
+                device_id: dev.dev_id.clone(),
+                local_key: local_key.clone(),
+            };
+            Lan302Transport::connect_tcp(&config).map(drop)
+        }
+    })?;
+
+    let config = LanDeviceConfig {
+        camera_ip,
+        port,
+        device_id: dev.dev_id,
+        sender_id,
+        local_key: dev.local_key,
+        hgw_version: hgw_version.as_str().to_string(),
+        media_auth_password,
+    };
+    let store = match output {
+        Some(path) => LanConfigStore::new(path),
+        None => LanConfigStore::default_path()?,
+    };
+    store.save(&config)?;
+    Ok(LanProvisionOutcome {
+        config_path: store.path().to_path_buf(),
+        hgw_version: hgw_version.as_str(),
+    })
+}
+
+/// Resolve the stable signaling sender/cname without exposing it. The cached
+/// RTC session is authoritative; the captured login user is a fallback for
+/// older RTC captures whose nested session omitted `uid`.
+fn cached_sender_id(rtc: &RtcConfig, secrets_dir: &Path) -> Result<String, Error> {
+    if !rtc.uid.trim().is_empty() {
+        return Ok(rtc.uid.clone());
+    }
+    let path = secrets_dir.join("tuya_session.json");
+    let session = read_json(&path).map_err(|error| {
+        Error::StreamConfig(format!(
+            "lan provision: RTC config has no sender uid and cached session {} cannot be read: {error}",
+            path.display()
+        ))
+    })?;
+    nested_str(&session, &["uid"])
+        .or_else(|| nested_str(&session, &["result", "uid"]))
+        .ok_or_else(|| {
+            Error::StreamConfig(
+                "lan provision: neither cached RTC config nor session contains a sender uid"
+                    .to_string(),
+            )
+        })
+}
+
+/// Determine the actual camera codec using the version-specific proof supplied
+/// by `verify`. A mere open TCP port is never accepted as version evidence.
+fn detect_lan_protocol<F>(
+    preferred: Option<LanProtocolVersion>,
+    mut verify: F,
+) -> Result<LanProtocolVersion, Error>
+where
+    F: FnMut(LanProtocolVersion) -> Result<(), Error>,
+{
+    let mut failures = Vec::new();
+    let mut versions = vec![
+        LanProtocolVersion::V3_5,
+        LanProtocolVersion::V3_4,
+        LanProtocolVersion::V3_3,
+    ];
+    if let Some(preferred) = preferred {
+        versions.retain(|version| *version != preferred);
+        versions.insert(0, preferred);
+    }
+    for version in versions {
+        match verify(version) {
+            Ok(()) => return Ok(version),
+            Err(error) => failures.push(format!("{}: {error}", version.as_str())),
+        }
+    }
+    Err(Error::Transport(format!(
+        "camera accepted neither an authenticated Tuya LAN 3.5/3.4 handshake nor a key-confirming 3.3 IPC_LAN_302 exchange; verify the camera address and cached localKey ({})",
+        failures.join("; ")
+    )))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DiscoveredLanEndpoint {
+    camera_ip: IpAddr,
+    hgw_version: Option<LanProtocolVersion>,
+}
+
+fn validate_camera_ip(camera_ip: IpAddr) -> Result<(), Error> {
+    let IpAddr::V4(camera_ip) = camera_ip else {
+        return Err(Error::StreamConfig(
+            "lan provision: camera address must be IPv4; the current ICE/media route is IPv4-only"
+                .to_string(),
+        ));
+    };
+    if camera_ip.is_unspecified()
+        || camera_ip.is_multicast()
+        || camera_ip.is_loopback()
+        || camera_ip.is_broadcast()
+    {
+        return Err(Error::StreamConfig(
+            "lan provision: camera address must be a concrete non-loopback unicast address"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the camera's current DHCP address using only local UDP traffic.
+///
+/// The three listener ports and command-37 request mirror the APK. A fixed UDP
+/// key validates only shared framing/integrity, not the sender, so an
+/// advertisement is accepted as a candidate only when its `gwId` equals the
+/// private cached camera id. The
+/// subsequent TCP provisioning proof remains mandatory before anything is saved.
+fn discover_lan_endpoint(expected_device_id: &str) -> Result<DiscoveredLanEndpoint, Error> {
+    let mut listeners = Vec::with_capacity(UDP_DISCOVERY_PORTS.len());
+    for port in UDP_DISCOVERY_PORTS {
+        let socket =
+            UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))).map_err(|error| {
+                Error::Transport(format!("bind Tuya UDP discovery port {port}: {error}"))
+            })?;
+        socket.set_nonblocking(true).map_err(|error| {
+            Error::Transport(format!(
+                "set Tuya UDP discovery port {port} nonblocking: {error}"
+            ))
+        })?;
+        listeners.push((port, socket));
+    }
+
+    let interfaces = discovery_interfaces()?;
+    let mut senders = Vec::with_capacity(interfaces.len());
+    for interface in interfaces {
+        let Ok(socket) = UdpSocket::bind(SocketAddr::from((interface.local_ip, 0))) else {
+            continue;
+        };
+        if socket.set_broadcast(true).is_ok() {
+            senders.push((interface, socket));
+        }
+    }
+    if senders.is_empty() {
+        return Err(Error::Transport(
+            "could not bind any broadcast-capable IPv4 interface for Tuya UDP discovery"
+                .to_string(),
+        ));
+    }
+    eprintln!(
+        "lan provision: probing {} local broadcast interface path(s) (addresses withheld)",
+        senders.len()
+    );
+
+    let started = Instant::now();
+    let mut next_broadcast = Duration::ZERO;
+    let mut rejected_packets = 0_u64;
+    let mut datagram = vec![0_u8; LAN_DISCOVERY_DATAGRAM_MAX];
+    let mut random = OsRandom;
+    while started.elapsed() < LAN_DISCOVERY_WINDOW {
+        let elapsed = started.elapsed();
+        if elapsed >= next_broadcast {
+            let mut successful_sends = 0_usize;
+            for (interface, socket) in &senders {
+                let request = encode_app_discovery_request(interface.local_ip, &mut random)?;
+                for (index, target) in [Ipv4Addr::BROADCAST, interface.broadcast]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if index == 1 && target == Ipv4Addr::BROADCAST {
+                        continue;
+                    }
+                    match socket
+                        .send_to(&request, SocketAddr::from((target, UDP_DISCOVERY_APP_PORT)))
+                    {
+                        Ok(written) if written == request.len() => {
+                            successful_sends = successful_sends.saturating_add(1);
+                        }
+                        Ok(_) | Err(_) => {}
+                    }
+                }
+            }
+            if successful_sends == 0 {
+                return Err(Error::Transport(
+                    "all local Tuya UDP discovery broadcast sends failed".to_string(),
+                ));
+            }
+            next_broadcast = elapsed + LAN_DISCOVERY_RETRY;
+        }
+
+        for (port, socket) in &listeners {
+            loop {
+                let (read, source) = match socket.recv_from(&mut datagram) {
+                    Ok(received) => received,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => {
+                        return Err(Error::Transport(format!(
+                            "receive Tuya UDP discovery port {port}: {error}"
+                        )))
+                    }
+                };
+                match decode_udp_advertisement(&datagram[..read], *port) {
+                    Ok(Some(advertisement)) => {
+                        if let Some(endpoint) = select_discovered_endpoint(
+                            expected_device_id,
+                            &advertisement,
+                            source.ip(),
+                        )? {
+                            eprintln!(
+                                "lan provision: matched cached camera via local UDP discovery (address and identifier withheld)"
+                            );
+                            return Ok(endpoint);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => rejected_packets = rejected_packets.saturating_add(1),
+                }
+            }
+        }
+        std::thread::sleep(LAN_DISCOVERY_POLL);
+    }
+
+    Err(Error::Transport(format!(
+        "Tuya UDP discovery found no advertisement matching the cached camera id within {} seconds ({rejected_packets} malformed or unrecognized packets ignored)",
+        LAN_DISCOVERY_WINDOW.as_secs()
+    )))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DiscoveryInterface {
+    local_ip: Ipv4Addr,
+    broadcast: Ipv4Addr,
+}
+
+fn directed_broadcast(local_ip: Ipv4Addr, netmask: Ipv4Addr) -> Ipv4Addr {
+    let address = u32::from(local_ip);
+    let mask = u32::from(netmask);
+    Ipv4Addr::from((address & mask) | !mask)
+}
+
+fn discovery_interfaces() -> Result<Vec<DiscoveryInterface>, Error> {
+    let mut discovered = Vec::new();
+    let interfaces = if_addrs::get_if_addrs().map_err(|error| {
+        Error::Transport(format!(
+            "enumerate IPv4 interfaces for Tuya discovery: {error}"
+        ))
+    })?;
+    for interface in interfaces {
+        if !interface.is_oper_up() || interface.is_loopback() || interface.is_link_local() {
+            continue;
+        }
+        let if_addrs::IfAddr::V4(address) = interface.addr else {
+            continue;
+        };
+        let broadcast = address
+            .broadcast
+            .unwrap_or_else(|| directed_broadcast(address.ip, address.netmask));
+        if broadcast == address.ip || broadcast.is_unspecified() {
+            continue;
+        }
+        let candidate = DiscoveryInterface {
+            local_ip: address.ip,
+            broadcast,
+        };
+        if !discovered.contains(&candidate) {
+            discovered.push(candidate);
+        }
+    }
+    if discovered.is_empty() {
+        Err(Error::Transport(
+            "no operational broadcast-capable IPv4 interface for Tuya UDP discovery".to_string(),
+        ))
+    } else {
+        Ok(discovered)
+    }
+}
+
+fn select_discovered_endpoint(
+    expected_device_id: &str,
+    advertisement: &LanAdvertisement,
+    source_ip: IpAddr,
+) -> Result<Option<DiscoveredLanEndpoint>, Error> {
+    if advertisement.device_id() != expected_device_id {
+        return Ok(None);
+    }
+    validate_camera_ip(source_ip)?;
+    // The shared UDP discovery key does not authenticate the sender. Treat an
+    // unknown/stale advertised version only as a missing preference; the
+    // subsequent TCP proof still probes every supported codec and is mandatory.
+    let hgw_version = advertisement
+        .hgw_version()
+        .and_then(|version| LanProtocolVersion::from_hgw_version(version).ok());
+    Ok(Some(DiscoveredLanEndpoint {
+        camera_ip: source_ip,
+        hgw_version,
+    }))
+}
+
+/// Prove a legacy 3.3 endpoint with an encrypted application-level round trip.
+///
+/// The 3.3 carrier has CRC32 rather than a keyed frame MAC, so connecting and
+/// decoding a structurally valid frame would not prove the localKey. We send a
+/// fresh offer whose random trace/session ids are known only to this run and
+/// accept the endpoint only if the keyed AES payload decrypts into a valid answer
+/// correlated to both values. The bound UDP socket remains alive so the local ICE
+/// candidate in the offer refers to a real port, although provisioning does not
+/// start or retain a media session.
+fn verify_legacy_33_signaling(config: &LanDeviceConfig) -> Result<(), Error> {
+    debug_assert_eq!(config.hgw_version, LanProtocolVersion::V3_3.as_str());
+    let creds = build_lan_stream_credentials(config);
+    let session_handles = SessionHandles::mint(&config.device_id)?;
+    let offer = build_offer(&creds, &session_handles)?;
+    let media_transport =
+        mtransport::UdpMediaTransport::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
+    let local_port = media_transport.local_addr()?.port();
+    let local_candidates = gather_local_host_candidates(
+        &config.camera_ip.to_string(),
+        config.port,
+        local_port,
+        &OsRandom,
+    );
+
+    let connect = Lan302ConnectConfig {
+        address: config.socket_addr(),
+        version: LanProtocolVersion::V3_3,
+        device_id: config.device_id.clone(),
+        local_key: config.lan_key()?,
+    };
+    let carrier = Lan302Transport::connect_tcp(&connect)?;
+    let offer_args = offer
+        .flow
+        .make_offer_args(offer.sdp.clone(), Vec::new(), None, None);
+    let mut session = SignalingSession::new(carrier, offer.flow);
+    session
+        .negotiate(&offer_args, &local_candidates, LAN_PROVISION_ANSWER_POLLS)
+        .map(drop)
+        .map_err(|error| {
+            Error::Transport(format!(
+                "3.3 key-confirming IPC_LAN_302 exchange failed: {error}"
+            ))
+        })
+}
+
 struct LanPrepared<M, G> {
     creds: StreamCredentials,
     session_handles: SessionHandles,
     media_transport: M,
     outcome: NegotiationOutcome,
     signaling_guard: G,
+    expected_peer_ip: IpAddr,
 }
 
 /// Every external operation available to LAN preparation. Keeping this seam
@@ -281,7 +755,7 @@ struct LiveLanPreparationIo;
 
 impl LanPreparationIo for LiveLanPreparationIo {
     type MediaTransport = mtransport::UdpMediaTransport;
-    type SignalingGuard = LiveLanSignalingSession;
+    type SignalingGuard = LiveLanSignalingGuard;
 
     fn load_config(&mut self, args: &StreamArgs) -> Result<(LanDeviceConfig, PathBuf), Error> {
         // Deliberately no SessionStore and no REST helper: the complete LAN
@@ -338,7 +812,7 @@ fn prepare_lan_stream_with<I: LanPreparationIo>(
     let local_candidates = io.gather_candidates(&config, local_port);
 
     eprintln!(
-        "stream (live): connecting authenticated Tuya LAN {} carrier at camera port {}; no REST or MQTT sockets will be opened.",
+        "stream (live): connecting Tuya LAN {} carrier at camera port {}; no REST or MQTT sockets will be opened.",
         config.hgw_version,
         config.port
     );
@@ -349,6 +823,7 @@ fn prepare_lan_stream_with<I: LanPreparationIo>(
         media_transport,
         outcome,
         signaling_guard,
+        expected_peer_ip: config.camera_ip,
     })
 }
 
@@ -360,6 +835,7 @@ fn prepare_lan_stream(args: &StreamArgs) -> Result<PreparedStream, Error> {
         media_transport: prepared.media_transport,
         outcome: prepared.outcome,
         lan_signaling: Some(prepared.signaling_guard),
+        expected_peer_ip: Some(prepared.expected_peer_ip),
     })
 }
 
@@ -385,11 +861,165 @@ fn build_lan_stream_credentials(config: &LanDeviceConfig) -> StreamCredentials {
     }
 }
 
+/// Minimal RFC 5389 responder advertised only to this camera during LAN ICE
+/// gathering. Ghidra `re/ghidra/ice_gather_from_tokens.c` (`FUN_00152108`) shows
+/// that the camera creates its UDP ICE socket while iterating numeric `stun:`
+/// entries in `msg.token`; an empty list
+/// creates no socket and produces only the empty end-of-candidates sentinel.
+///
+/// The responder binds a numeric address on our LAN, accepts queries only from
+/// the configured camera IP, and reflects the source in XOR-MAPPED-ADDRESS.  It
+/// performs no DNS or WAN I/O and remains alive for the negotiated media session.
+struct LocalStunServer {
+    address: SocketAddr,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    responses: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    failure: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LocalStunServer {
+    fn start(local_ip: IpAddr, camera_ip: IpAddr) -> Result<Self, Error> {
+        let socket = UdpSocket::bind(SocketAddr::new(local_ip, 0))
+            .map_err(|e| Error::Transport(format!("bind LAN-local STUN responder: {e}")))?;
+        let address = socket
+            .local_addr()
+            .map_err(|e| Error::Transport(format!("read LAN-local STUN responder address: {e}")))?;
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .map_err(|e| Error::Transport(format!("configure LAN-local STUN responder: {e}")))?;
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let responses = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failure = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let thread_stop = std::sync::Arc::clone(&stop);
+        let thread_responses = std::sync::Arc::clone(&responses);
+        let thread_failure = std::sync::Arc::clone(&failure);
+        let handle = std::thread::Builder::new()
+            .name("babymonitor-lan-stun".to_string())
+            .spawn(move || {
+                let mut datagram = [0u8; 1500];
+                while !thread_stop.load(std::sync::atomic::Ordering::Acquire) {
+                    let (read, source) = match socket.recv_from(&mut datagram) {
+                        Ok(received) => received,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            continue;
+                        }
+                        Err(e) => {
+                            store_local_stun_failure(
+                                &thread_failure,
+                                format!("LAN-local STUN receive failed: {e}"),
+                            );
+                            break;
+                        }
+                    };
+                    if source.ip() != camera_ip {
+                        continue;
+                    }
+                    let message = match stun::StunMessage::decode(&datagram[..read]) {
+                        Ok(message) => message,
+                        Err(_) => continue,
+                    };
+                    // A STUN-server discovery query is an unauthenticated Binding
+                    // Request.  Authenticated ICE checks use USERNAME and belong on
+                    // the separately advertised media candidate, not this socket.
+                    if message.msg_type != stun::BINDING_REQUEST
+                        || message.attr(stun::ATTR_USERNAME).is_some()
+                    {
+                        continue;
+                    }
+                    let response = stun::encode_server_binding_success(message.txid, source);
+                    if let Err(e) = socket.send_to(&response, source) {
+                        store_local_stun_failure(
+                            &thread_failure,
+                            format!("LAN-local STUN response failed: {e}"),
+                        );
+                        break;
+                    }
+                    thread_responses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+            .map_err(|e| Error::Transport(format!("start LAN-local STUN responder: {e}")))?;
+
+        Ok(Self {
+            address,
+            stop,
+            responses,
+            failure,
+            handle: Some(handle),
+        })
+    }
+
+    fn ice_server(&self) -> IceServer {
+        let urls = match self.address {
+            SocketAddr::V4(address) => format!("stun:{}:{}", address.ip(), address.port()),
+            SocketAddr::V6(address) => format!("stun:[{}]:{}", address.ip(), address.port()),
+        };
+        IceServer {
+            credential: None,
+            ttl: None,
+            urls,
+            username: None,
+        }
+    }
+
+    fn response_count(&self) -> usize {
+        self.responses.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn check_health(&self) -> Result<(), Error> {
+        let failure = self.failure.lock().map_err(|_| {
+            Error::Transport("LAN-local STUN failure state was poisoned".to_string())
+        })?;
+        match failure.as_deref() {
+            Some(message) => Err(Error::Transport(message.to_string())),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for LocalStunServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn store_local_stun_failure(destination: &std::sync::Mutex<Option<String>>, message: String) {
+    if let Ok(mut failure) = destination.lock() {
+        *failure = Some(message);
+    }
+}
+
+fn local_candidate_ip(local_candidates: &[String]) -> Result<IpAddr, Error> {
+    local_candidates
+        .iter()
+        .filter_map(|line| mtransport::parse_candidate(line).ok())
+        .find(|candidate| candidate.kind == mtransport::CandidateKind::Host)
+        .map(|candidate| candidate.ip)
+        .ok_or_else(|| {
+            Error::Transport(
+                "LAN ICE needs a local host candidate before its private STUN responder can start"
+                    .to_string(),
+            )
+        })
+}
+
 fn negotiate_lan(
     config: &LanDeviceConfig,
     offer: &Offer,
     local_candidates: &[String],
-) -> Result<(NegotiationOutcome, LiveLanSignalingSession), Error> {
+) -> Result<(NegotiationOutcome, LiveLanSignalingGuard), Error> {
+    let local_stun =
+        LocalStunServer::start(local_candidate_ip(local_candidates)?, config.camera_ip)?;
+    eprintln!(
+        "stream (live): LAN-local STUN responder armed (address withheld); camera ICE gathering remains on-LAN."
+    );
     let connect = Lan302ConnectConfig {
         address: config.socket_addr(),
         version: config.protocol_version()?,
@@ -397,9 +1027,10 @@ fn negotiate_lan(
         local_key: config.lan_key()?,
     };
     let carrier = Lan302Transport::connect_tcp(&connect)?;
-    let offer_args = offer
-        .flow
-        .make_offer_args(offer.sdp.clone(), Vec::new(), None, None);
+    let offer_args =
+        offer
+            .flow
+            .make_offer_args(offer.sdp.clone(), vec![local_stun.ice_server()], None, None);
     let mut session = SignalingSession::new(carrier, offer.flow.clone());
     let outcome = session.negotiate_with_trickle(
         &offer_args,
@@ -409,7 +1040,18 @@ fn negotiate_lan(
         SIGNALING_POLL_INTERVAL,
         has_usable_host_candidate,
     )?;
-    Ok((outcome, session))
+    local_stun.check_health()?;
+    eprintln!(
+        "stream (live): LAN-local STUN served {} camera query/queries during ICE gathering.",
+        local_stun.response_count()
+    );
+    Ok((
+        outcome,
+        LiveLanSignalingGuard {
+            _session: session,
+            _local_stun: local_stun,
+        },
+    ))
 }
 
 struct PreparedStream {
@@ -417,16 +1059,32 @@ struct PreparedStream {
     session_handles: SessionHandles,
     media_transport: mtransport::UdpMediaTransport,
     outcome: NegotiationOutcome,
-    /// Keep the authenticated LAN socket alive through the media lifetime, as
-    /// the APK keeps its hardware listener registered until explicit teardown.
-    /// TASK-0126 will determine whether active polling/heartbeats are also needed.
-    lan_signaling: Option<LiveLanSignalingSession>,
+    /// Keep the keyed LAN socket alive through the media lifetime, as the APK
+    /// keeps its hardware listener registered until explicit teardown. The
+    /// proven runs were 47–103 seconds; long-session TCP polling/heartbeats are
+    /// not yet validated.
+    lan_signaling: Option<LiveLanSignalingGuard>,
+    /// LAN mode pins media to the same key-proven camera address. Cloud ICE may
+    /// legitimately select another address and therefore leaves this unset.
+    expected_peer_ip: Option<IpAddr>,
 }
 
-fn while_signaling_alive<G, T>(signaling_guard: G, run_media: impl FnOnce() -> T) -> T {
-    let result = run_media();
+fn while_signaling_alive<G, T>(
+    signaling_guard: G,
+    run_media: impl FnOnce() -> Result<T, Error>,
+    check_after: impl FnOnce(&G) -> Result<(), Error>,
+) -> Result<T, Error> {
+    let media_result = run_media();
+    let health_result = check_after(&signaling_guard);
     drop(signaling_guard);
-    result
+    match (media_result, health_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(media), Ok(())) => Err(media),
+        (Ok(_), Err(health)) => Err(health),
+        (Err(media), Err(health)) => Err(Error::Transport(format!(
+            "media path failed ({media}); LAN-local STUN responder also failed ({health})"
+        ))),
+    }
 }
 
 fn prepare_cloud_stream(args: &StreamArgs) -> Result<PreparedStream, Error> {
@@ -530,6 +1188,7 @@ fn prepare_cloud_stream(args: &StreamArgs) -> Result<PreparedStream, Error> {
         media_transport: transport,
         outcome,
         lan_signaling: None,
+        expected_peer_ip: None,
     })
 }
 
@@ -542,6 +1201,7 @@ fn finish_negotiated_stream(args: &StreamArgs, prepared: PreparedStream) -> Resu
         media_transport: mut transport,
         outcome,
         lan_signaling,
+        expected_peer_ip,
     } = prepared;
     let answer = &outcome.answer;
     eprintln!(
@@ -557,10 +1217,14 @@ fn finish_negotiated_stream(args: &StreamArgs, prepared: PreparedStream) -> Resu
     };
     // Point the pre-bound socket at the camera's host candidate (no re-bind; the
     // nominating check is driven by the pump's retransmit state machine).
-    let host = select_and_connect(&mut transport, answer, &outcome.remote_candidates)?;
+    let host = select_and_connect(
+        &mut transport,
+        answer,
+        &outcome.remote_candidates,
+        expected_peer_ip,
+    )?;
     eprintln!(
-        "stream (live): stage 6 ICE — host-direct UDP to {} (nominating with RFC 5389 backoff).",
-        host.socket_addr()
+        "stream (live): stage 6 ICE — host-direct UDP candidate selected (address and port withheld; nominating with RFC 5389 backoff)."
     );
 
     // ── Stages 7-8: media pump -> H.264 + S16LE audio -> MPEG-TS output ────
@@ -595,11 +1259,16 @@ fn finish_negotiated_stream(args: &StreamArgs, prepared: PreparedStream) -> Resu
     // camera's inbound checks so neither side's consent-to-send expires mid-stream.
     let mut keepalive = PathKeepalive::new(ice, &host)?;
     // The APK keeps its hardware response listener registered until explicit
-    // teardown. Hold the authenticated TCP carrier through the same lifetime;
-    // dropping it here closes it only after the media pump has ended.
-    while_signaling_alive(lan_signaling, || {
-        pump_to_output(args, &mut engine, &mut transport, &mut keepalive)
-    })
+    // teardown. Hold the key-proven TCP carrier and local STUN responder through
+    // the same lifetime, then surface any responder thread failure before drop.
+    while_signaling_alive(
+        lan_signaling,
+        || pump_to_output(args, &mut engine, &mut transport, &mut keepalive),
+        |guard| match guard {
+            Some(guard) => guard.check_health(),
+            None => Ok(()),
+        },
+    )
 }
 
 /// Mint the per-session local handles (ICE ufrag/pwd, media key, the unix-second
@@ -899,8 +1568,7 @@ fn negotiate(
 /// `(toward_host, toward_port)` and reading its bound local address. UDP connect
 /// sends NO packet — the kernel just resolves the egress interface for that route
 /// (toward the camera/broker, which on the camera's LAN is our LAN address). This
-/// uses ONLY std (no interface-enumeration crate — those are not in the offline
-/// cargo cache and would break `just assert-offline`).
+/// call deliberately uses the route table rather than enumerating interfaces.
 ///
 /// Returns `None` if the bind/connect fails or resolves to a loopback/unspecified
 /// address (unusable as a candidate the camera can reach).
@@ -939,8 +1607,9 @@ fn format_host_candidate<R: RandomSource>(
 /// IP (egress toward the broker, which on the camera's LAN is our LAN address)
 /// paired with the media socket's bound `local_port`. Empty if no usable LAN IP is
 /// found (then the camera cannot reach us — host-direct cannot work, surfaced
-/// honestly downstream). Logs the chosen `ip:port` (no secret) so a wrong pick on a
-/// multi-homed host is visible.
+/// honestly downstream). The concrete address is deliberately not logged: live
+/// LAN addresses are operational metadata and the candidate itself already goes
+/// over the encrypted signaling channel.
 fn gather_local_host_candidates<R: RandomSource>(
     broker_host: &str,
     broker_port: u16,
@@ -950,7 +1619,9 @@ fn gather_local_host_candidates<R: RandomSource>(
     match primary_lan_ip(broker_host, broker_port) {
         Some(ip) => match format_host_candidate(ip, local_port, rng) {
             Ok(line) => {
-                eprintln!("stream (live): local host candidate = {ip}:{local_port}");
+                eprintln!(
+                    "stream (live): local host candidate prepared (address and port withheld)"
+                );
                 vec![line]
             }
             Err(e) => {
@@ -979,29 +1650,61 @@ fn select_and_connect(
     transport: &mut mtransport::UdpMediaTransport,
     answer: &ParsedAnswer,
     trickled: &[String],
+    expected_peer_ip: Option<IpAddr>,
 ) -> Result<mtransport::IceCandidate, Error> {
-    // The camera's answer SDP carries NO a=candidate lines (cap3/cap4 ground
-    // truth); its host/srflx candidates arrive as trickled 302 `candidate`
-    // messages. Merge any in-SDP candidates (usually none) with the trickled set;
+    // The camera's answer SDP carries no a=candidate lines (cap3 plus the live
+    // TASK-0126 LAN run); the same live run proved its host candidate arrives as
+    // a separate frame-32 `candidate` envelope. Merge any in-SDP candidates
+    // (usually none) with the trickled set;
     // skip (do not abort on) an unparseable trickled line — ICE tolerates unknown
     // candidates, and the others may still be reachable.
     let mut candidates = mtransport::parse_candidates_from_sdp(&answer.sdp)?;
     for line in trickled {
         match mtransport::parse_candidate(line) {
             Ok(c) => candidates.push(c),
-            Err(e) => eprintln!("stream (live): skipping unparseable trickled candidate: {e}"),
+            Err(_) => {
+                eprintln!("stream (live): skipping unparseable trickled candidate (body withheld)")
+            }
         }
     }
-    let host = mtransport::select_host_candidate(&candidates).ok_or_else(|| {
-        Error::Transport(
-            "no ICE host candidate from the camera (none in the answer SDP — expected — and none \
-             trickled over 302 within the window): host-direct needs a host candidate. If the \
-             camera is remote/NAT'd, a srflx/relay path (STUN/TURN) is required (documented stub)."
-                .to_string(),
-        )
-    })?;
+    let host = select_remote_host_candidate(&candidates, expected_peer_ip)?;
     transport.connect_peer(host.socket_addr())?;
     Ok(host)
+}
+
+fn select_remote_host_candidate(
+    candidates: &[mtransport::IceCandidate],
+    expected_peer_ip: Option<IpAddr>,
+) -> Result<mtransport::IceCandidate, Error> {
+    let matching = expected_peer_ip.map(|expected| {
+        candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.kind == mtransport::CandidateKind::Host && candidate.ip == expected
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    let eligible = matching.as_deref().unwrap_or(candidates);
+    if let Some(host) = mtransport::select_host_candidate(eligible) {
+        return Ok(host);
+    }
+    if expected_peer_ip.is_some()
+        && candidates
+            .iter()
+            .any(|candidate| candidate.kind == mtransport::CandidateKind::Host)
+    {
+        return Err(Error::Transport(
+            "LAN ICE host candidate did not match the key-proven camera endpoint (addresses withheld)"
+                .to_string(),
+        ));
+    }
+    Err(Error::Transport(
+        "no ICE host candidate from the camera (none in the answer SDP — expected — and none \
+         trickled over 302 within the window): host-direct needs a host candidate. If the \
+         camera is remote/NAT'd, a srflx/relay path (STUN/TURN) is required (documented stub)."
+            .to_string(),
+    ))
 }
 
 /// The media-path consent/keepalive context (RFC 7675). Holds what is needed to
@@ -2385,6 +3088,216 @@ mod tests {
     }
 
     #[test]
+    fn local_stun_server_reflects_camera_source_on_loopback() {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let server = LocalStunServer::start(loopback, loopback).unwrap();
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let source = client.local_addr().unwrap();
+        let txid = *b"localquery01";
+        let query = stun::encode_server_query(txid, Some("synthetic-test"));
+
+        client.send_to(&query, server.address).unwrap();
+        let mut response = [0u8; 256];
+        let (read, from) = client.recv_from(&mut response).unwrap();
+        let decoded = stun::StunMessage::decode(&response[..read]).unwrap();
+
+        assert_eq!(from, server.address);
+        assert!(decoded.is_binding_success());
+        assert_eq!(decoded.txid, txid);
+        assert_eq!(decoded.xor_mapped_address().unwrap(), Some(source));
+        assert!(decoded.attr(stun::ATTR_MESSAGE_INTEGRITY).is_none());
+    }
+
+    #[test]
+    fn lan_host_selection_is_pinned_to_key_proven_camera() {
+        let expected: IpAddr = "192.0.2.10".parse().unwrap();
+        let wrong =
+            mtransport::parse_candidate("candidate:1 1 UDP 2130706431 192.0.2.99 5001 typ host")
+                .unwrap();
+        let matching =
+            mtransport::parse_candidate("candidate:2 1 UDP 1 192.0.2.10 5002 typ host").unwrap();
+
+        let selected =
+            select_remote_host_candidate(&[wrong.clone(), matching.clone()], Some(expected))
+                .unwrap();
+        assert_eq!(selected, matching);
+        assert_eq!(
+            select_remote_host_candidate(std::slice::from_ref(&wrong), None).unwrap(),
+            wrong
+        );
+    }
+
+    #[test]
+    fn lan_host_selection_rejects_redirect_without_leaking_addresses() {
+        let expected: IpAddr = "192.0.2.10".parse().unwrap();
+        let wrong =
+            mtransport::parse_candidate("candidate:1 1 UDP 2130706431 192.0.2.99 5001 typ host")
+                .unwrap();
+
+        let error = select_remote_host_candidate(&[wrong], Some(expected))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("did not match the key-proven camera endpoint"));
+        assert!(!error.contains("192.0.2"));
+    }
+
+    #[test]
+    fn local_stun_uses_the_advertised_host_candidate_address() {
+        let lines =
+            vec!["a=candidate:1 1 UDP 2130706431 192.0.2.20 54321 typ host\r\n".to_string()];
+        assert_eq!(
+            local_candidate_ip(&lines).unwrap(),
+            "192.0.2.20".parse::<IpAddr>().unwrap()
+        );
+        assert!(local_candidate_ip(&[]).is_err());
+    }
+
+    #[test]
+    fn lan_protocol_probe_accepts_authenticated_3_5_without_fallback() {
+        let attempts = std::cell::RefCell::new(Vec::new());
+        let version = detect_lan_protocol(None, |candidate| {
+            attempts.borrow_mut().push(candidate);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(version, LanProtocolVersion::V3_5);
+        assert_eq!(*attempts.borrow(), vec![LanProtocolVersion::V3_5]);
+    }
+
+    #[test]
+    fn lan_protocol_probe_falls_back_to_authenticated_3_4() {
+        let attempts = std::cell::RefCell::new(Vec::new());
+        let version = detect_lan_protocol(None, |candidate| {
+            attempts.borrow_mut().push(candidate);
+            if candidate == LanProtocolVersion::V3_4 {
+                Ok(())
+            } else {
+                Err(Error::Transport("synthetic 3.5 reject".to_string()))
+            }
+        })
+        .unwrap();
+        assert_eq!(version, LanProtocolVersion::V3_4);
+        assert_eq!(
+            *attempts.borrow(),
+            vec![LanProtocolVersion::V3_5, LanProtocolVersion::V3_4]
+        );
+    }
+
+    #[test]
+    fn lan_protocol_probe_falls_back_to_key_confirmed_3_3() {
+        let attempts = std::cell::RefCell::new(Vec::new());
+        let version = detect_lan_protocol(None, |candidate| {
+            attempts.borrow_mut().push(candidate);
+            if candidate == LanProtocolVersion::V3_3 {
+                Ok(())
+            } else {
+                Err(Error::Transport(format!(
+                    "synthetic {} reject",
+                    candidate.as_str()
+                )))
+            }
+        })
+        .unwrap();
+        assert_eq!(version, LanProtocolVersion::V3_3);
+        assert_eq!(
+            *attempts.borrow(),
+            vec![
+                LanProtocolVersion::V3_5,
+                LanProtocolVersion::V3_4,
+                LanProtocolVersion::V3_3
+            ]
+        );
+    }
+
+    #[test]
+    fn lan_protocol_probe_fails_closed_when_no_codec_is_verified() {
+        let error = detect_lan_protocol(None, |candidate| {
+            Err(Error::Transport(format!(
+                "synthetic {} reject",
+                candidate.as_str()
+            )))
+        })
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(
+            "neither an authenticated Tuya LAN 3.5/3.4 handshake nor a key-confirming 3.3"
+        ));
+        assert!(message.contains("3.5: "));
+        assert!(message.contains("3.4: "));
+        assert!(message.contains("3.3: "));
+    }
+
+    #[test]
+    fn lan_protocol_probe_prioritizes_advertised_version_without_forcing_it() {
+        let attempts = std::cell::RefCell::new(Vec::new());
+        let version = detect_lan_protocol(Some(LanProtocolVersion::V3_3), |candidate| {
+            attempts.borrow_mut().push(candidate);
+            if candidate == LanProtocolVersion::V3_4 {
+                Ok(())
+            } else {
+                Err(Error::Transport("synthetic reject".to_string()))
+            }
+        })
+        .unwrap();
+        assert_eq!(version, LanProtocolVersion::V3_4);
+        assert_eq!(
+            *attempts.borrow(),
+            vec![
+                LanProtocolVersion::V3_3,
+                LanProtocolVersion::V3_5,
+                LanProtocolVersion::V3_4
+            ]
+        );
+    }
+
+    #[test]
+    fn udp_discovery_selection_requires_exact_cached_device_id() {
+        let advertisement =
+            decode_udp_advertisement(br#"{"gwId":"SYNTH_DEVICE_0001","version":"3.5"}"#, 6666)
+                .unwrap()
+                .unwrap();
+        let source = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+
+        assert!(
+            select_discovered_endpoint("SYNTH_OTHER_0001", &advertisement, source)
+                .unwrap()
+                .is_none()
+        );
+        let selected = select_discovered_endpoint("SYNTH_DEVICE_0001", &advertisement, source)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.camera_ip, source);
+        assert_eq!(selected.hgw_version, Some(LanProtocolVersion::V3_5));
+
+        let unknown_version =
+            decode_udp_advertisement(br#"{"gwId":"SYNTH_DEVICE_0001","version":"99.0"}"#, 6666)
+                .unwrap()
+                .unwrap();
+        let selected = select_discovered_endpoint("SYNTH_DEVICE_0001", &unknown_version, source)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.hgw_version, None);
+    }
+
+    #[test]
+    fn udp_discovery_directed_broadcast_uses_interface_netmask() {
+        assert_eq!(
+            directed_broadcast(
+                Ipv4Addr::new(192, 168, 7, 23),
+                Ipv4Addr::new(255, 255, 255, 0)
+            ),
+            Ipv4Addr::new(192, 168, 7, 255)
+        );
+        assert_eq!(
+            directed_broadcast(Ipv4Addr::new(10, 7, 3, 5), Ipv4Addr::new(255, 255, 240, 0)),
+            Ipv4Addr::new(10, 7, 15, 255)
+        );
+    }
+
+    #[test]
     fn lan_mode_never_constructs_cloud_backend() {
         let lan_calls = Cell::new(0);
         let cloud_calls = Cell::new(0);
@@ -2511,12 +3424,37 @@ mod tests {
     fn signaling_guard_outlives_media_operation() {
         let dropped = Rc::new(Cell::new(false));
         let guard = DropProbe(Rc::clone(&dropped));
-        let value = while_signaling_alive(guard, || {
-            assert!(!dropped.get(), "LAN signaling closed before media ended");
-            42
-        });
+        let value = while_signaling_alive(
+            guard,
+            || {
+                assert!(!dropped.get(), "LAN signaling closed before media ended");
+                Ok::<_, Error>(42)
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
         assert_eq!(value, 42);
         assert!(dropped.get(), "LAN signaling closes after media returns");
+    }
+
+    #[test]
+    fn signaling_guard_reports_media_and_teardown_health_failures() {
+        let dropped = Rc::new(Cell::new(false));
+        let guard = DropProbe(Rc::clone(&dropped));
+        let error = while_signaling_alive(
+            guard,
+            || Err::<(), _>(Error::Transport("synthetic media failure".to_string())),
+            |_| Err(Error::Transport("synthetic STUN failure".to_string())),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("synthetic media failure"));
+        assert!(error.contains("synthetic STUN failure"));
+        assert!(
+            dropped.get(),
+            "guard must drop after both results are captured"
+        );
     }
 
     #[test]

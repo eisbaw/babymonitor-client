@@ -32,6 +32,7 @@ live = [
     "dep:hex",
     "dep:aes-gcm",
     "dep:base64",
+    "dep:if-addrs",
     "babymonitor-core/live-tls",
 ]
 
@@ -63,6 +64,7 @@ chrono = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 aes-gcm = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
+if-addrs = { version = "0.14.0", optional = true }
 
 # ── gui-only (feature `gui`) — the in-app render window (TASK-0115) ───────────
 # Links the system SDL2 (provided by shell.nix) via pkg-config; no bundled build.

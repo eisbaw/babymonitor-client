@@ -1,8 +1,10 @@
-//! Authenticated local IPC-LAN-302 signaling transport.
+//! Local IPC-LAN-302 signaling transport.
 //!
 //! Unlike the MQTT carrier, this opens the camera's Tuya LAN TCP endpoint and
-//! carries raw `{header,msg}` JSON in frame type 32.  Commands 3/4/5 establish a
-//! per-connection session key before any signaling message is accepted.
+//! carries raw `{header,msg}` JSON in frame type 32. Protocols 3.4/3.5 use the
+//! authenticated commands 3/4/5 session handshake. Protocol 3.3 uses the APK's
+//! legacy AES-ECB/CRC path; its local key is confirmed only when an inbound
+//! command-32 payload decrypts and correlates as a signaling envelope.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -22,7 +24,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const READ_CHUNK: usize = 16 * 1024;
 
-/// Inputs needed to authenticate one local camera connection.
+/// Inputs needed to establish and key-prove one local camera connection.
 #[derive(Clone)]
 pub struct Lan302ConnectConfig {
     /// Camera TCP endpoint, normally `<camera-ip>:6668`.
@@ -39,7 +41,7 @@ impl std::fmt::Debug for Lan302ConnectConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Lan302ConnectConfig")
-            .field("address", &self.address)
+            .field("address", &"[REDACTED]")
             .field("version", &self.version)
             .field("device_id", &"[REDACTED]")
             .field("local_key", &self.local_key)
@@ -47,7 +49,7 @@ impl std::fmt::Debug for Lan302ConnectConfig {
     }
 }
 
-/// Authenticated frame-32 carrier over an injected byte stream.
+/// Tuya frame-32 carrier over an injected byte stream.
 ///
 /// The generic stream makes declared-length framing and handshake behavior
 /// testable without sockets.  Live callers use [`connect_tcp`](Self::connect_tcp).
@@ -64,8 +66,8 @@ impl<S: Read + Write, R: RandomSource> Lan302Transport<S, R> {
     /// Authenticate an already-open stream using Tuya commands 3/4/5.
     ///
     /// The device command-4 HMAC is verified before command 5 is written or the
-    /// negotiated key is exposed.  Short reads are accumulated solely according
-    /// to the authenticated frame's declared length.
+    /// negotiated key is exposed. Short reads are accumulated solely according
+    /// to the integrity-checked frame's declared length.
     pub fn authenticate(
         mut stream: S,
         version: LanProtocolVersion,
@@ -103,6 +105,22 @@ impl<S: Read + Write, R: RandomSource> Lan302Transport<S, R> {
         })
     }
 
+    /// Establish the APK's legacy 3.3 carrier without a commands 3/4/5
+    /// handshake. This only prepares the keyed codec; successful decryption and
+    /// signaling correlation of an inbound command-32 frame are the key/device
+    /// proof. Callers must not treat an open TCP socket alone as authentication.
+    #[must_use]
+    pub fn establish_33(stream: S, local_key: LanKey, random: R) -> Self {
+        Self {
+            stream,
+            random,
+            encoder: LanEncoder::new(LanProtocolVersion::V3_3, local_key.clone()),
+            decoder: LanDecoder::new(LanProtocolVersion::V3_3, local_key, StatusPresence::Present),
+            next_sequence: 1,
+            pending: VecDeque::new(),
+        }
+    }
+
     fn next_sequence(&mut self) -> Result<u32, Error> {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.checked_add(1).ok_or_else(|| {
@@ -132,7 +150,9 @@ impl<S: Read + Write, R: RandomSource> Lan302Transport<S, R> {
 }
 
 impl Lan302Transport<TcpStream, OsRandom> {
-    /// Connect to the configured camera endpoint and authenticate the session.
+    /// Connect to the configured camera endpoint and establish its selected
+    /// protocol. Protocol 3.3 remains unconfirmed until a valid inbound
+    /// signaling envelope is decrypted; 3.4/3.5 authenticate immediately.
     pub fn connect_tcp(config: &Lan302ConnectConfig) -> Result<Self, Error> {
         if config.device_id.trim().is_empty() {
             return Err(Error::StreamConfig(
@@ -151,8 +171,14 @@ impl Lan302Transport<TcpStream, OsRandom> {
             .map_err(|error| {
                 Error::Transport(format!("set LAN handshake write timeout: {error}"))
             })?;
-        let transport =
-            Self::authenticate(stream, config.version, config.local_key.clone(), OsRandom)?;
+        let transport = match config.version {
+            LanProtocolVersion::V3_3 => {
+                Self::establish_33(stream, config.local_key.clone(), OsRandom)
+            }
+            LanProtocolVersion::V3_4 | LanProtocolVersion::V3_5 => {
+                Self::authenticate(stream, config.version, config.local_key.clone(), OsRandom)?
+            }
+        };
         transport
             .stream
             .set_read_timeout(Some(IO_TIMEOUT))
@@ -193,7 +219,7 @@ impl<S: Read + Write, R: RandomSource> SignalingTransport for Lan302Transport<S,
         let read = match self.stream.read(&mut chunk) {
             Ok(0) => {
                 return Err(Error::Transport(
-                    "camera closed authenticated LAN signaling connection".to_string(),
+                    "camera closed LAN signaling connection".to_string(),
                 ))
             }
             Ok(read) => read,
@@ -205,11 +231,7 @@ impl<S: Read + Write, R: RandomSource> SignalingTransport for Lan302Transport<S,
             {
                 return Ok(None)
             }
-            Err(error) => {
-                return Err(Error::Transport(format!(
-                    "read authenticated LAN signaling: {error}"
-                )))
-            }
+            Err(error) => return Err(Error::Transport(format!("read LAN signaling: {error}"))),
         };
         self.pending.extend(self.decoder.push(&chunk[..read])?);
         self.pop_frame_32()
@@ -395,6 +417,69 @@ mod tests {
         assert!(error.contains("HMAC authentication"), "{error}");
         assert_eq!(writes.borrow().len(), 1, "command 5 was not written");
         assert_eq!(command_34(&writes.borrow()[0]), 3);
+    }
+
+    #[test]
+    fn protocol_33_skips_session_handshake_and_exchanges_keyed_frame_32() {
+        let candidate = SignalingEnvelope::candidate(
+            "DEV",
+            "USER",
+            "SESS",
+            "trace-1",
+            "a=candidate:1 1 UDP 1 192.0.2.1 5000 typ host\r\n",
+            SignalingPath::Lan,
+        )
+        .to_json()
+        .unwrap();
+        let encoder = LanEncoder::new(LanProtocolVersion::V3_3, LanKey::from_bytes(*KEY));
+        let mut random = FixedRandom(0x33);
+        let mut inbound = encoder
+            .encode(
+                &LanMessage::response(1, IPC_LAN_302, 0, candidate),
+                &mut random,
+            )
+            .unwrap();
+        inbound.extend(
+            encoder
+                .encode(
+                    &LanMessage::response(2, IPC_LAN_302, 0, answer_json()),
+                    &mut random,
+                )
+                .unwrap(),
+        );
+
+        let (stream, writes) = MemoryStream::new(inbound);
+        let transport =
+            Lan302Transport::establish_33(stream, LanKey::from_bytes(*KEY), FixedRandom(0x44));
+        assert!(writes.borrow().is_empty(), "3.3 must not emit command 3");
+
+        let flow = SignalingFlow::new("USER", "DEV", "SESS", "trace-1");
+        let args = flow.make_offer_args(
+            "v=0\r\nm=application 9 tuya 6001\r\n".to_string(),
+            Vec::new(),
+            None,
+            None,
+        );
+        let mut session = SignalingSession::new(transport, flow);
+        let outcome = session
+            .negotiate_with_trickle(&args, &[], 4, 0, Duration::ZERO, |_| false)
+            .unwrap();
+        assert_eq!(outcome.answer.remote_ufrag, "REMOTE");
+        assert_eq!(outcome.remote_candidates.len(), 1);
+
+        let writes = writes.borrow();
+        assert_eq!(writes.len(), 2, "offer and end-of-candidates only");
+        for frame in writes.iter() {
+            assert_eq!(command_34(frame), IPC_LAN_302);
+            let mut decoder = LanDecoder::new(
+                LanProtocolVersion::V3_3,
+                LanKey::from_bytes(*KEY),
+                StatusPresence::Absent,
+            );
+            let message = decoder.push(frame).unwrap().pop().unwrap();
+            let envelope = SignalingEnvelope::from_json(message.payload()).unwrap();
+            assert_eq!(envelope.header.path, Some(SignalingPath::Lan));
+        }
     }
 
     fn established_transport(inbound: Vec<u8>) -> (TestTransport, CapturedWrites) {

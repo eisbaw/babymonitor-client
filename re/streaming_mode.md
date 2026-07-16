@@ -111,8 +111,9 @@ publishes the signaling JSON over the device MQTT channel with message code **30
 Two independent sources (decompiled Java + the public `seydx/tuya-ipc-terminal`
 and Tuya's WebRTC docs) give a consistent shape.
 
-**The carrier is the device's standard Tuya MQTT channel, message code 302** — NOT
-a dedicated WebRTC topic. From the `homeCamera.publish(...,302,..)` call in
+**The cloud carrier is the device's standard Tuya MQTT channel, message code
+302; the alternative carrier is local frame type 32** — NOT a dedicated WebRTC
+topic. From the `homeCamera.publish(...,302,..)` call in
 `P2PMQTTServiceManager`
 (`decompiled/jadx/sources/com/thingclips/smart/p2p/utils/P2PMQTTServiceManager.java` ~:1550):
 
@@ -187,6 +188,13 @@ the app**; the decision is the `p2pType`/`skill` data, set per device by the
 cloud. (confidence: likely for the precise `skill.webrtc` semantics — it is read
 from a single in-app sample bean, so the bit-values need a live device record to
 pin; the `p2pType` enum mapping itself is confirmed.)
+
+**TASK-0126 live update:** the SCD921's frame-32 carrier and separate ICE/KCP UDP
+media path now run end to end with all non-camera egress kernel-denied. The
+camera creates no ICE socket for `msg.token:[]`; LAN mode fixes that without
+cloud by advertising the client's numeric route-selected IPv4 RFC 5389 responder. Initial
+pairing and reacquiring a rotated `localKey` after reset remain outside this
+runtime proof.
 
 ---
 

@@ -40,10 +40,10 @@ nix-shell --run 'just run -- --json auth status'
 The client **logs in against the real Tuya cloud** (`auth live-login`: password +
 email-MFA → an authenticated `sid`/`uid` session), drives **signed cloud calls** with
 that session (`device.list`, `rtc.config.get`), and **streams the SCD921's live A/V
-end-to-end** — WebRTC-over-MQTT **302** signaling → host-direct ICE → KCP /
-AES-128-CBC + HMAC-SHA1 media → **H.264 video + S16LE audio**. The media back-half is
-byte-validated offline against the cap4 capture and confirmed on an authorized live
-run against the owner's own camera (TASK-0083/0085; commits `f8d9acf`, `e1528da`).
+end-to-end** over either cloud MQTT or local Tuya frame-32 signaling. Both paths
+continue through host-direct ICE → KCP / AES-128-CBC + HMAC-SHA1 media → **H.264
+video + S16LE audio**. The media back-half is byte-validated offline against cap4;
+cloud and fully LAN-restricted runs are confirmed against the owner's camera.
 
 > **The earlier "blocked" framing is superseded.** The previous status (login pending
 > a fresh probe; "no working video without auth") predates the working end-to-end
@@ -60,6 +60,7 @@ Offline (no camera, no network) the same decode/mux path is exercised by
 | `auth status` / `auth logout` | reads/clears the local session store (offline) |
 | `devices list --live` (`--features live`) | signed `device.list` with the stored `sid` → finds the SCD921 |
 | `devices list` / `devices show <id>` | offline against a **fixture body** (`--fixture <file>`; defaults to the synthetic fixture) |
+| `lan provision` (`--features live`) | build a secure local config and prove its endpoint/protocol/localKey without REST or MQTT |
 | `stream` (`--features live`) | full live A/V → MPEG-TS over HTTP, raw stdout, **or an in-app GUI window** |
 
 Every command supports `--json`. **Secret/PII fields** (`localKey`, `secKey`,
@@ -87,6 +88,32 @@ nix-shell --run 'just live-stream'
 nix-shell --run 'cargo run --manifest-path babymonitor/babymonitor-cli/Cargo.toml \
     --features live,gui --bin babymonitor-cli -- stream --output window'
 ```
+
+For an already paired camera, provision once from the owner's private cached
+device/RTC records, then select the fail-closed LAN carrier:
+
+```sh
+nix-shell --run 'cargo run --manifest-path babymonitor/babymonitor-cli/Cargo.toml \
+    --features live --bin babymonitor-cli -- lan provision'
+nix-shell --run 'cargo run --manifest-path babymonitor/babymonitor-cli/Cargo.toml \
+    --features live --bin babymonitor-cli -- stream --signaling lan'
+```
+
+`lan provision` matches UDP discovery to the cached device ID and then requires a
+key-proving camera exchange before saving mode-0600 metadata. The UDP codec is
+APK-derived/offline-tested; the live camera did not advertise, so the proven run
+used explicit `--camera-ip` and the same cryptographic check. The current media
+route is IPv4-only. During streaming the client advertises its own numeric,
+route-selected local-interface STUN responder—no public STUN/TURN, DNS, REST, or
+MQTT endpoint is used. The validated SCD921 speaks Tuya LAN 3.3 on TCP 6668;
+media flows separately over the negotiated ICE/KCP UDP socket.
+
+This proves cloud-free runtime for the currently paired device, not cloud-free
+factory pairing. A factory reset, account move, or re-pair may rotate `localKey`
+and the cached media password; local recovery of those values is not implemented.
+The 47–103 second proofs retained TCP signaling and the local responder until
+teardown, but did not poll TCP after negotiation; cold camera restart,
+long-session heartbeat/renegotiation, and reconnect behavior remain unvalidated.
 
 The GUI window decodes **in-process** via the `ffmpeg-the-third` libavcodec binding
 (decision + the `ffmpeg_7` pin rationale in `../re/gui_window.md`), not a subprocess,

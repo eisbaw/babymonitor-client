@@ -1,20 +1,28 @@
-//! Authenticated Tuya hardware-gateway LAN framing (protocols 3.4 and 3.5).
+//! Tuya hardware-gateway LAN framing (protocols 3.3, 3.4, and 3.5).
 //!
 //! This is the local TCP transport used by the APK's `normalControl` path.  In
 //! particular, camera signaling uses frame type [`IPC_LAN_302`] with the raw
 //! 302 JSON as its payload; video/audio do **not** travel in these frames.
 //!
-//! The two supported wire formats are deliberately kept distinct:
+//! The three supported wire formats are deliberately kept distinct:
 //!
+//! - 3.3 IPC-LAN-302: `0x55aa`, AES-128/ECB/PKCS7 JSON, CRC32 integrity.
 //! - 3.4: `0x55aa`, AES-128/ECB/PKCS7 payload, HMAC-SHA256 integrity.
 //! - 3.5: `0x6699`, AES-128/GCM payload, 12-byte nonce and 14-byte AAD.
 //!
-//! Both protocols negotiate a per-connection session key using commands 3/4/5.
+//! Protocols 3.4 and 3.5 negotiate a per-connection session key using commands
+//! 3/4/5. The APK's legacy 3.3 `normalControl` path instead encrypts command-32
+//! JSON with `encryptAesData` and sends it through the CRC-framed `sendBytes`
+//! path without a session-key handshake.
 //! The handshake implementation fails closed on the device HMAC; the linked
 //! `rust-async-tuyapi` 3.5 PR only logged that mismatch, which is not acceptable
 //! for an authenticated camera connection.
 //!
-//! Native wire anchors in the APK's `libThingNetworkSdk.so` are the 3.4 builder,
+//! Native wire anchors in the APK's `libnetwork-android.so` are the legacy
+//! `ThingFrame` parse constructor, serializer, CRC verifier, and outbound
+//! constructor at Ghidra addresses `0x26349c`, `0x262eb4`, `0x263168`, and
+//! `0x2636cc`. JNI `encryptAesData`/`parseAesData` at `0x293690`/`0x2938dc`
+//! confirm raw AES-128-ECB/PKCS7 bytes without a `3.3` marker. The 3.4 builder,
 //! parser, and serializer at `0x247960`, `0x253564`, and `0x26392c`; and the 3.5
 //! parser, builder, and serializer at `0x263ebc`, `0x264a3c`, and `0x2647a0`.
 //! The JNI `sendCMD` path at `0x292244` accepts the outer command as an arbitrary
@@ -23,7 +31,11 @@
 //! `P2PMQTTServiceManager.java:1537-1550`, and forwards its JSON unchanged via
 //! `qqpddqd.java:1029-1033`. `sdk/device/dddpppb.java:1039-1046` supplies the
 //! discovered `HgwBean.version`, local key, and frame type to `normalControl`.
+//! Sanitized Ghidra outputs for every native address above are committed as
+//! `re/ghidra/tuya_lan_*.c`; they are the primary APK evidence behind the
+//! independent OpenSSL/Python known-answer tests in this module.
 
+use crate::stream::mqtt_crypto::crc32;
 use crate::stream::session::RandomSource;
 use crate::{Error, Result};
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit as BlockKeyInit};
@@ -47,7 +59,7 @@ pub const SESSION_KEY_NEGOTIATION_RESPONSE: u32 = 4;
 /// Session-key negotiation finish command.
 pub const SESSION_KEY_NEGOTIATION_FINISH: u32 = 5;
 
-/// TCP port used by the authenticated Tuya LAN protocol.
+/// TCP port used by the Tuya hardware-gateway LAN protocol.
 pub const TUYA_LAN_PORT: u16 = 6668;
 
 /// Maximum accepted declared frame body, preventing unbounded allocation from
@@ -66,6 +78,7 @@ const GCM_NONCE_LEN: usize = 12;
 const GCM_TAG_LEN: usize = 16;
 const SUFFIX_LEN: usize = 4;
 const STATUS_LEN: usize = 4;
+const CRC_LEN: usize = 4;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -75,6 +88,8 @@ type HmacSha256 = Hmac<Sha256>;
 /// `pv=2.2` describes a different envelope and must never select this codec.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LanProtocolVersion {
+    /// Tuya LAN protocol 3.3 IPC-LAN-302 (`0x55aa`, AES-ECB + CRC32).
+    V3_3,
     /// Tuya LAN protocol 3.4 (`0x55aa`, AES-ECB + HMAC-SHA256).
     V3_4,
     /// Tuya LAN protocol 3.5 (`0x6699`, AES-GCM).
@@ -84,7 +99,7 @@ pub enum LanProtocolVersion {
 impl LanProtocolVersion {
     /// Parse a discovered/cached hardware-gateway version.
     ///
-    /// `3.4`, `3.5`, and numeric patch forms such as `3.5.0` are accepted.
+    /// `3.3`, `3.4`, `3.5`, and numeric patch forms such as `3.5.0` are accepted.
     /// MQTT payload versions such as `2.2` are rejected.
     pub fn from_hgw_version(value: &str) -> Result<Self> {
         let mut parts = value.trim().split('.');
@@ -98,10 +113,11 @@ impl LanProtocolVersion {
             )));
         }
         match (major, minor) {
+            (Some("3"), Some("3")) => Ok(Self::V3_3),
             (Some("3"), Some("4")) => Ok(Self::V3_4),
             (Some("3"), Some("5")) => Ok(Self::V3_5),
             _ => Err(Error::LanProtocol(format!(
-                "unsupported Hgw LAN version {value:?}; expected 3.4 or 3.5"
+                "unsupported Hgw LAN version {value:?}; expected 3.3, 3.4, or 3.5"
             ))),
         }
     }
@@ -110,6 +126,7 @@ impl LanProtocolVersion {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::V3_3 => "3.3",
             Self::V3_4 => "3.4",
             Self::V3_5 => "3.5",
         }
@@ -219,8 +236,9 @@ impl LanMessage {
 
     /// Construct an outbound camera 302 frame from a JSON object.
     ///
-    /// Frame type 32 is a raw-payload exception: no `3.4`/`3.5` plus twelve
-    /// zero-byte DP header is inserted.
+    /// Frame type 32 is a raw-payload exception: no protocol label plus twelve
+    /// zero-byte DP header is inserted. Protocol 3.3 encryption is applied later
+    /// by its encoder, matching the APK's `normalControl`/`encryptAesData` split.
     pub fn ipc_lan_302(sequence: u32, json: &[u8]) -> Result<Self> {
         let value: serde_json::Value = serde_json::from_slice(json).map_err(|error| {
             Error::LanProtocol(format!("IPC_LAN_302 payload is not valid JSON: {error}"))
@@ -289,6 +307,7 @@ impl LanEncoder {
     /// Protocol 3.4 does not consume randomness.
     pub fn encode<R: RandomSource>(&self, message: &LanMessage, random: &mut R) -> Result<Vec<u8>> {
         match self.version {
+            LanProtocolVersion::V3_3 => encode_33(message, &self.key),
             LanProtocolVersion::V3_4 => encode_34(message, &self.key),
             LanProtocolVersion::V3_5 => {
                 let mut nonce = [0_u8; GCM_NONCE_LEN];
@@ -305,6 +324,7 @@ impl LanEncoder {
         nonce: [u8; GCM_NONCE_LEN],
     ) -> Result<Vec<u8>> {
         match self.version {
+            LanProtocolVersion::V3_3 => encode_33(message, &self.key),
             LanProtocolVersion::V3_4 => encode_34(message, &self.key),
             LanProtocolVersion::V3_5 => encode_35_with_nonce(message, &self.key, nonce),
         }
@@ -321,7 +341,7 @@ impl fmt::Debug for LanEncoder {
     }
 }
 
-/// Incremental TCP decoder for authenticated Tuya LAN frames.
+/// Incremental TCP decoder for validated Tuya LAN frames.
 ///
 /// [`push`](Self::push) accepts arbitrary TCP chunks and may return zero, one,
 /// or several messages. Frame boundaries come only from the declared length;
@@ -371,6 +391,9 @@ impl LanDecoder {
             let needed = match frame_length(self.version, self.status_presence, &self.buffer)? {
                 Some(total_len) if self.buffer.len() == total_len => {
                     let message = match self.version {
+                        LanProtocolVersion::V3_3 => {
+                            decode_33(&self.buffer, &self.key, self.status_presence)?
+                        }
                         LanProtocolVersion::V3_4 => {
                             decode_34(&self.buffer, &self.key, self.status_presence)?
                         }
@@ -387,6 +410,7 @@ impl LanDecoder {
                 })?,
                 None => {
                     let header_len = match self.version {
+                        LanProtocolVersion::V3_3 => HEADER_34_LEN,
                         LanProtocolVersion::V3_4 => HEADER_34_LEN,
                         LanProtocolVersion::V3_5 => HEADER_35_LEN,
                     };
@@ -444,6 +468,12 @@ impl PendingLanHandshake {
         initial_sequence: u32,
         random: &mut R,
     ) -> Result<Self> {
+        if version == LanProtocolVersion::V3_3 {
+            return Err(Error::LanProtocol(
+                "Tuya LAN 3.3 IPC_LAN_302 does not use the commands 3/4/5 session handshake"
+                    .to_string(),
+            ));
+        }
         let mut client_nonce = [0_u8; AES_BLOCK];
         random.fill(&mut client_nonce)?;
         let encoder = LanEncoder::new(version, local_key.clone());
@@ -615,6 +645,7 @@ fn frame_length(
     bytes: &[u8],
 ) -> Result<Option<usize>> {
     let header_len = match version {
+        LanProtocolVersion::V3_3 => HEADER_34_LEN,
         LanProtocolVersion::V3_4 => HEADER_34_LEN,
         LanProtocolVersion::V3_5 => HEADER_35_LEN,
     };
@@ -622,6 +653,7 @@ fn frame_length(
         return Ok(None);
     }
     let expected_prefix = match version {
+        LanProtocolVersion::V3_3 => PREFIX_34,
         LanProtocolVersion::V3_4 => PREFIX_34,
         LanProtocolVersion::V3_5 => PREFIX_35,
     };
@@ -633,7 +665,7 @@ fn frame_length(
             version.as_str()
         )));
     }
-    // Native 3.5 parser `libThingNetworkSdk.so:0x263ebc` reads and rejects both
+    // Native 3.5 parser `libnetwork-android.so:0x263ebc` reads and rejects both
     // reserved bytes before sequence/command/length and before GCM decryption.
     if version == LanProtocolVersion::V3_5 && bytes[4..6] != [0, 0] {
         return Err(Error::LanProtocol(format!(
@@ -642,6 +674,7 @@ fn frame_length(
         )));
     }
     let declared = match version {
+        LanProtocolVersion::V3_3 => be_u32(&bytes[12..16])? as usize,
         LanProtocolVersion::V3_4 => be_u32(&bytes[12..16])? as usize,
         LanProtocolVersion::V3_5 => be_u32(&bytes[14..18])? as usize,
     };
@@ -651,18 +684,30 @@ fn frame_length(
         )));
     }
     let minimum = match version {
-        // At least one padded AES block, HMAC, suffix.
-        LanProtocolVersion::V3_4 => status_presence.byte_len() + AES_BLOCK + HMAC_LEN + SUFFIX_LEN,
+        // Status (responses) + CRC32 + suffix. Payload shape is checked only
+        // after CRC verification so malformed frames never bypass integrity.
+        LanProtocolVersion::V3_3 => status_presence.byte_len() + CRC_LEN + SUFFIX_LEN,
+        // Check the HMAC before rejecting a short or non-block-aligned payload.
+        // Some devices return compact command errors; integrity classification
+        // must happen before the AES decoder reports their payload shape.
+        LanProtocolVersion::V3_4 => status_presence.byte_len() + HMAC_LEN + SUFFIX_LEN,
         // Nonce + tag; 3.5's suffix is not counted in the declared body.
         LanProtocolVersion::V3_5 => GCM_NONCE_LEN + status_presence.byte_len() + GCM_TAG_LEN,
     };
     if declared < minimum {
+        let (sequence, command) = match version {
+            LanProtocolVersion::V3_3 => (be_u32(&bytes[4..8])?, be_u32(&bytes[8..12])?),
+            LanProtocolVersion::V3_4 => (be_u32(&bytes[4..8])?, be_u32(&bytes[8..12])?),
+            LanProtocolVersion::V3_5 => (be_u32(&bytes[6..10])?, be_u32(&bytes[10..14])?),
+        };
         return Err(Error::LanProtocol(format!(
-            "declared {} LAN body {declared} is below minimum {minimum}",
-            version.as_str()
+            "declared {} LAN body {declared} is below minimum {minimum} \
+             (sequence {sequence}, command {command})",
+            version.as_str(),
         )));
     }
     let suffix_outside_length = match version {
+        LanProtocolVersion::V3_3 => 0,
         LanProtocolVersion::V3_4 => 0,
         LanProtocolVersion::V3_5 => SUFFIX_LEN,
     };
@@ -671,6 +716,92 @@ fn frame_length(
         .and_then(|length| length.checked_add(suffix_outside_length))
         .map(Some)
         .ok_or_else(|| Error::LanProtocol("LAN frame length overflow".to_string()))
+}
+
+fn encode_33(message: &LanMessage, key: &LanKey) -> Result<Vec<u8>> {
+    // The APK encrypts IPC_LAN_302 in Java with `encryptAesData` before calling
+    // native `sendBytes`; the native legacy ThingFrame itself only adds CRC
+    // framing. Preserve raw payloads for other commands (notably heartbeat),
+    // whose command-specific transforms are outside this camera signaling path.
+    let encoded_payload = if message.command == IPC_LAN_302 {
+        aes_ecb_encrypt_padded(&message.payload, key)?
+    } else {
+        message.payload.clone()
+    };
+    let declared = message
+        .status
+        .map_or(0, |_| STATUS_LEN)
+        .checked_add(encoded_payload.len())
+        .and_then(|length| length.checked_add(CRC_LEN + SUFFIX_LEN))
+        .ok_or_else(|| Error::LanProtocol("3.3 frame length overflow".to_string()))?;
+    if declared > MAX_LAN_FRAME_BODY {
+        return Err(Error::LanProtocol(format!(
+            "3.3 frame body {declared} exceeds limit {MAX_LAN_FRAME_BODY}"
+        )));
+    }
+
+    let mut frame = Vec::with_capacity(HEADER_34_LEN + declared);
+    frame.extend_from_slice(&PREFIX_34);
+    frame.extend_from_slice(&message.sequence.to_be_bytes());
+    frame.extend_from_slice(&message.command.to_be_bytes());
+    frame.extend_from_slice(&(declared as u32).to_be_bytes());
+    if let Some(status) = message.status {
+        frame.extend_from_slice(&status.to_be_bytes());
+    }
+    frame.extend_from_slice(&encoded_payload);
+    let integrity = crc32(&frame);
+    frame.extend_from_slice(&integrity.to_be_bytes());
+    frame.extend_from_slice(&SUFFIX_34);
+    Ok(frame)
+}
+
+fn decode_33(frame: &[u8], key: &LanKey, status_presence: StatusPresence) -> Result<LanMessage> {
+    if frame.len() < HEADER_34_LEN + status_presence.byte_len() + CRC_LEN + SUFFIX_LEN {
+        return Err(Error::LanProtocol("truncated 3.3 frame".to_string()));
+    }
+    if frame[frame.len() - SUFFIX_LEN..] != SUFFIX_34 {
+        return Err(Error::LanProtocol("invalid 3.3 frame suffix".to_string()));
+    }
+    let crc_start = frame
+        .len()
+        .checked_sub(CRC_LEN + SUFFIX_LEN)
+        .ok_or_else(|| Error::LanProtocol("truncated 3.3 CRC".to_string()))?;
+    let expected_crc = be_u32(&frame[crc_start..crc_start + CRC_LEN])?;
+    if crc32(&frame[..crc_start]) != expected_crc {
+        return Err(Error::LanProtocol(
+            "3.3 CRC32 integrity check failed".to_string(),
+        ));
+    }
+
+    let payload_start = HEADER_34_LEN
+        .checked_add(status_presence.byte_len())
+        .ok_or_else(|| Error::LanProtocol("3.3 payload offset overflow".to_string()))?;
+    if payload_start > crc_start {
+        return Err(Error::LanProtocol(
+            "truncated 3.3 status/payload".to_string(),
+        ));
+    }
+    let status = match status_presence {
+        StatusPresence::Absent => None,
+        StatusPresence::Present => Some(be_u32(&frame[HEADER_34_LEN..payload_start])?),
+    };
+    let command = be_u32(&frame[8..12])?;
+    let encoded_payload = &frame[payload_start..crc_start];
+    let payload = if command == IPC_LAN_302 {
+        if encoded_payload.is_empty() && status.is_some_and(|code| code != 0) {
+            Vec::new()
+        } else {
+            aes_ecb_decrypt_padded(encoded_payload, key)?
+        }
+    } else {
+        encoded_payload.to_vec()
+    };
+    Ok(LanMessage {
+        sequence: be_u32(&frame[4..8])?,
+        command,
+        status,
+        payload,
+    })
 }
 
 fn encode_34(message: &LanMessage, key: &LanKey) -> Result<Vec<u8>> {
@@ -725,7 +856,7 @@ fn decode_34(frame: &[u8], key: &LanKey, status_presence: StatusPresence) -> Res
         .verify_slice(&frame[hmac_start..hmac_start + HMAC_LEN])
         .map_err(|_| Error::LanProtocol("3.4 HMAC authentication failed".to_string()))?;
 
-    // Native parser `libThingNetworkSdk.so:0x253564` leaves the response status
+    // Native parser `libnetwork-android.so:0x253564` leaves the response status
     // in plaintext between the 16-byte header and AES-ECB ciphertext; its HMAC
     // authenticates header + status + ciphertext.
     let payload_start = HEADER_34_LEN
@@ -854,6 +985,11 @@ fn derive_session_key(
         *output = left ^ right;
     }
     let derived = match version {
+        LanProtocolVersion::V3_3 => {
+            return Err(Error::LanProtocol(
+                "Tuya LAN 3.3 has no commands 3/4/5 session-key derivation".to_string(),
+            ));
+        }
         LanProtocolVersion::V3_4 => aes_encrypt_block(local_key, mixed)?,
         LanProtocolVersion::V3_5 => {
             let cipher = Aes128Gcm::new_from_slice(local_key.bytes())
@@ -883,7 +1019,7 @@ fn aes_encrypt_block(key: &LanKey, mut block: [u8; AES_BLOCK]) -> Result<[u8; AE
     Ok(block)
 }
 
-fn aes_ecb_encrypt_padded(plaintext: &[u8], key: &LanKey) -> Result<Vec<u8>> {
+pub(crate) fn aes_ecb_encrypt_padded(plaintext: &[u8], key: &LanKey) -> Result<Vec<u8>> {
     let cipher = Aes128::new_from_slice(key.bytes())
         .map_err(|_| Error::LanProtocol("invalid AES-128 key length".to_string()))?;
     let padding = AES_BLOCK - (plaintext.len() % AES_BLOCK);
@@ -896,10 +1032,10 @@ fn aes_ecb_encrypt_padded(plaintext: &[u8], key: &LanKey) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-fn aes_ecb_decrypt_padded(ciphertext: &[u8], key: &LanKey) -> Result<Vec<u8>> {
+pub(crate) fn aes_ecb_decrypt_padded(ciphertext: &[u8], key: &LanKey) -> Result<Vec<u8>> {
     if ciphertext.is_empty() || ciphertext.len() % AES_BLOCK != 0 {
         return Err(Error::LanProtocol(format!(
-            "3.4 ciphertext is {} bytes; expected a non-empty AES block multiple",
+            "AES-ECB ciphertext is {} bytes; expected a non-empty AES block multiple",
             ciphertext.len()
         )));
     }
@@ -909,13 +1045,12 @@ fn aes_ecb_decrypt_padded(ciphertext: &[u8], key: &LanKey) -> Result<Vec<u8>> {
     for chunk in output.chunks_mut(AES_BLOCK) {
         cipher.decrypt_block(chunk.into());
     }
-    let padding =
-        usize::from(*output.last().ok_or_else(|| {
-            Error::LanProtocol("3.4 plaintext was empty after decrypt".to_string())
-        })?);
+    let padding = usize::from(*output.last().ok_or_else(|| {
+        Error::LanProtocol("AES-ECB plaintext was empty after decrypt".to_string())
+    })?);
     if padding == 0 || padding > AES_BLOCK || padding > output.len() {
         return Err(Error::LanProtocol(
-            "invalid 3.4 PKCS7 padding (wrong key or corrupt frame)".to_string(),
+            "invalid AES-ECB PKCS7 padding (wrong key or corrupt frame)".to_string(),
         ));
     }
     let payload_len = output.len() - padding;
@@ -924,7 +1059,7 @@ fn aes_ecb_decrypt_padded(ciphertext: &[u8], key: &LanKey) -> Result<Vec<u8>> {
         .any(|byte| usize::from(*byte) != padding)
     {
         return Err(Error::LanProtocol(
-            "inconsistent 3.4 PKCS7 padding (wrong key or corrupt frame)".to_string(),
+            "inconsistent AES-ECB PKCS7 padding (wrong key or corrupt frame)".to_string(),
         ));
     }
     output.truncate(payload_len);
@@ -980,6 +1115,10 @@ mod tests {
         LanKey::from_bytes(std::array::from_fn(|index| index as u8))
     }
 
+    fn ascii_key() -> LanKey {
+        LanKey::from_bytes(*b"0123456789abcdef")
+    }
+
     fn decode_one(
         version: LanProtocolVersion,
         key: LanKey,
@@ -1001,6 +1140,10 @@ mod tests {
     #[test]
     fn hgw_version_is_the_only_supported_version_selector() {
         assert_eq!(
+            LanProtocolVersion::from_hgw_version("3.3").unwrap(),
+            LanProtocolVersion::V3_3
+        );
+        assert_eq!(
             LanProtocolVersion::from_hgw_version("3.4").unwrap(),
             LanProtocolVersion::V3_4
         );
@@ -1008,7 +1151,7 @@ mod tests {
             LanProtocolVersion::from_hgw_version(" 3.5.0 ").unwrap(),
             LanProtocolVersion::V3_5
         );
-        for invalid in ["2.2", "3.3", "3.6", "3.5-beta", "3.4.", ""] {
+        for invalid in ["2.2", "3.2", "3.6", "3.5-beta", "3.4.", ""] {
             assert!(LanProtocolVersion::from_hgw_version(invalid).is_err());
         }
     }
@@ -1038,6 +1181,39 @@ mod tests {
         assert_eq!(message.command(), IPC_LAN_302);
         assert_eq!(message.payload(), OFFER_JSON);
         assert_eq!(message.status(), None);
+    }
+
+    #[test]
+    fn protocol_33_frame_matches_independent_known_answer() {
+        let message = LanMessage::ipc_lan_302(0x0102_0304, OFFER_JSON).unwrap();
+        let actual = LanEncoder::new(LanProtocolVersion::V3_3, ascii_key())
+            .encode_with_nonce(&message, [0; GCM_NONCE_LEN])
+            .unwrap();
+
+        // AES ciphertext generated independently with OpenSSL 3 `enc
+        // -aes-128-ecb`; CRC generated with Python zlib. The APK's JNI wrappers
+        // and ThingFrame serializer independently pin the same operations/order.
+        let expected = hex::decode(concat!(
+            "000055aa010203040000002000000038",
+            "d5e72be1640d300e444da1c37fecf73c",
+            "538fb59b24a177a0b7e1e4cc988cb5a5",
+            "2ff08d848b44f69ca22d849beb55ba70",
+            "10bc7b3a",
+            "0000aa55"
+        ))
+        .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(&actual[16..19], &expected[16..19]);
+        assert!(!actual.windows(3).any(|bytes| bytes == b"3.3"));
+
+        let decoded = decode_one(
+            LanProtocolVersion::V3_3,
+            ascii_key(),
+            StatusPresence::Absent,
+            &actual,
+        )
+        .unwrap();
+        assert_eq!(decoded, message);
     }
 
     #[test]
@@ -1102,9 +1278,13 @@ mod tests {
     }
 
     #[test]
-    fn response_status_and_binary_payload_round_trip_for_both_versions() {
+    fn response_status_and_binary_payload_round_trip_for_all_versions() {
         let payload = b"before\0\0\x99\x66middle\0\0\xaa\x55after".to_vec();
-        for version in [LanProtocolVersion::V3_4, LanProtocolVersion::V3_5] {
+        for version in [
+            LanProtocolVersion::V3_3,
+            LanProtocolVersion::V3_4,
+            LanProtocolVersion::V3_5,
+        ] {
             let message = LanMessage::response(91, 0xdead_beef, 0x1122_3344, payload.clone());
             let frame = LanEncoder::new(version, synthetic_key())
                 .encode_with_nonce(&message, [0x5a; GCM_NONCE_LEN])
@@ -1177,7 +1357,11 @@ mod tests {
 
     #[test]
     fn decoder_handles_every_byte_fragmented_and_multiple_frames_coalesced() {
-        for version in [LanProtocolVersion::V3_4, LanProtocolVersion::V3_5] {
+        for version in [
+            LanProtocolVersion::V3_3,
+            LanProtocolVersion::V3_4,
+            LanProtocolVersion::V3_5,
+        ] {
             let first = LanMessage::request(1, 32, b"first".to_vec());
             let second = LanMessage::request(2, 0xfedc_ba98, b"second".to_vec());
             let encoder = LanEncoder::new(version, synthetic_key());
@@ -1220,6 +1404,20 @@ mod tests {
     #[test]
     fn corrupt_authentication_suffix_and_lengths_fail_closed() {
         let request = LanMessage::request(4, IPC_LAN_302, b"{}".to_vec());
+
+        let mut frame_33 = LanEncoder::new(LanProtocolVersion::V3_3, synthetic_key())
+            .encode_with_nonce(&request, [0; GCM_NONCE_LEN])
+            .unwrap();
+        frame_33[HEADER_34_LEN] ^= 1;
+        let error = decode_one(
+            LanProtocolVersion::V3_3,
+            synthetic_key(),
+            StatusPresence::Absent,
+            &frame_33,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("CRC32 integrity check failed"));
 
         let mut frame_34 = LanEncoder::new(LanProtocolVersion::V3_4, synthetic_key())
             .encode_with_nonce(&request, [0; GCM_NONCE_LEN])
@@ -1281,7 +1479,7 @@ mod tests {
 
         let mut short_34 = vec![0_u8; HEADER_34_LEN];
         short_34[..4].copy_from_slice(&PREFIX_34);
-        short_34[12..16].copy_from_slice(&((AES_BLOCK + HMAC_LEN) as u32).to_be_bytes());
+        short_34[12..16].copy_from_slice(&((HMAC_LEN + SUFFIX_LEN - 1) as u32).to_be_bytes());
         let mut decoder = LanDecoder::new(
             LanProtocolVersion::V3_4,
             synthetic_key(),
@@ -1298,6 +1496,19 @@ mod tests {
             StatusPresence::Absent,
         );
         assert!(decoder.push(&oversized_35).is_err());
+    }
+
+    #[test]
+    fn protocol_33_rejects_session_handshake() {
+        let error = PendingLanHandshake::begin(
+            LanProtocolVersion::V3_3,
+            synthetic_key(),
+            1,
+            &mut PatternRandom(0x10),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("does not use the commands 3/4/5"));
     }
 
     fn assert_handshake(version: LanProtocolVersion, expected_session_key: [u8; AES_BLOCK]) {

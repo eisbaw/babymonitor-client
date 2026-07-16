@@ -6,9 +6,14 @@ A from-scratch **Rust** client for the Philips Avent "Baby Monitor+" (hardware
 **SCD921 / SCD923**) — reverse-engineered from the Android app
 `com.philips.ph.babymonitorplus` so the camera can be watched without the official app.
 
-It logs in to the real cloud (password + email-MFA) and **streams the camera's live A/V
-end-to-end** — WebRTC-over-MQTT signaling → ICE → KCP / AES media → H.264 video + audio —
-played in a standard player or an in-app window.
+It can log in to the real cloud (password + email-MFA), but an already provisioned
+camera can now **stream entirely over its LAN**: key-proven Tuya frame-32
+signaling on TCP 6668 → local ICE → KCP / AES media → H.264 video + audio. Cloud
+MQTT remains available as an explicitly selected remote-signaling mode.
+
+The proof used fresh client processes against an already-running paired camera.
+A camera cold-power restart and long-session reconnect behavior are not yet
+validated; factory reset/re-pair recovery may still require the vendor flow.
 
 ## Quick start
 
@@ -21,9 +26,10 @@ nix-shell --run 'just stream-validate'  # offline demo: a synthetic H.264 sample
 ```
 
 Watching a **real** camera — `just gui-stream` (in-app window) or `just live-stream`
-(HTTP → VLC) — needs the **owner's own device + an authenticated session** (the gated
-`--features live` build). See [`babymonitor/README.md`](babymonitor/README.md) for the
-`stream` command and its options.
+(HTTP → VLC) — needs the **owner's own device** and the gated `--features live`
+build. Cloud mode needs an authenticated session; LAN mode uses a private,
+owner-provisioned local config. See [`babymonitor/README.md`](babymonitor/README.md)
+for the `stream` command and its options.
 
 ## Scope / authorized use
 
@@ -38,9 +44,11 @@ The Baby Monitor+ is a **re-skinned Tuya Smart (ThingClips) IPC camera** app, so
 Tuya account auth and the streaming stack is Tuya's — a known quantity also documented by
 the public RE community. Two parts carry the project:
 
-- **Video — Tuya P2P with selectable signaling.** The camera's proven path is signaled via
-  cloud MQTT (message code **302**); the APK also carries the same envelope locally as
-  authenticated Tuya `IPC_LAN_302` frame type 32 on TCP 6668. Signaling is
+- **Video — Tuya P2P with selectable signaling.** The same message-code **302**
+  envelope is proven over either cloud MQTT or key-proven Tuya
+  `IPC_LAN_302` frame type 32 on TCP 6668. LAN mode supplies a private, local
+  RFC 5389 STUN responder so the camera creates and advertises its UDP host
+  candidate without public STUN/TURN. Signaling is
   standard WebRTC shape (SDP + trickle-ICE); the **media is not DTLS-SRTP** but Tuya's own
   KCP / AES-128-CBC + HMAC-SHA1 framing, with the media key carried in the SDP. See
   [`re/streaming_mode.md`](re/streaming_mode.md) and [`re/webrtc_session.md`](re/webrtc_session.md).
@@ -49,11 +57,12 @@ the public RE community. Two parts carry the project:
   login is the APK-faithful `token.get → password.login → email-MFA` flow. See
   [`re/tuya_cloud_auth.md`](re/tuya_cloud_auth.md) and [`re/tuya_sign_static.md`](re/tuya_sign_static.md).
 
-The recovered transport matches independent public Tuya WebRTC projects field-for-field,
-and the whole chain — login → device discovery → signaling → ICE → media decrypt — is
-implemented and confirmed on a live run against the owner's camera for cloud MQTT. The
-LAN carrier is implemented and offline-validated but still needs owner-device validation;
-TCP 6668 carries signaling, while A/V remains direct ICE/KCP UDP.
+The recovered transport matches independent public Tuya WebRTC projects
+field-for-field. Both carriers are live-proven against the owner's camera. In the
+LAN test, a kernel egress allowlist denied every destination except loopback and
+the camera, yet a fresh run produced decodable 1920×1080 H.264 plus audio. TCP
+6668 carries only signaling; A/V remains direct ICE/KCP UDP. Initial pairing—and
+recovery if a reset rotates `localKey`—is not yet cloud-free.
 
 ## The Rust client
 

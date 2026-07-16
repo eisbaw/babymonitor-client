@@ -350,6 +350,35 @@ pub fn encode_server_query(txid: [u8; 12], software: Option<&str>) -> Vec<u8> {
     buf
 }
 
+/// Encode the Binding **Success** returned by a plain STUN server query.
+///
+/// Unlike [`encode_binding_success`], this response carries no
+/// `MESSAGE-INTEGRITY`: the discovery request is unauthenticated and has no
+/// short-term ICE credential.  It reflects the requester's source address in
+/// `XOR-MAPPED-ADDRESS` and appends the RFC 5389 fingerprint.
+///
+/// This is used by the LAN-local STUN responder in the live client.  Advertising
+/// that responder in a camera offer makes the camera create an ICE socket and
+/// enumerate its host candidate without contacting a public STUN/TURN service.
+#[must_use]
+pub fn encode_server_binding_success(txid: [u8; 12], mapped: SocketAddr) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(48);
+    buf.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes()); // patched after attributes
+    buf.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+    buf.extend_from_slice(&txid);
+    push_attr(
+        &mut buf,
+        ATTR_XOR_MAPPED_ADDRESS,
+        &encode_xor_mapped_address(mapped, &txid),
+    );
+    let fp = fingerprint(&buf);
+    push_attr(&mut buf, ATTR_FINGERPRINT, &fp.to_be_bytes());
+    let len_after = (buf.len() - HEADER_LEN) as u16;
+    buf[2..4].copy_from_slice(&len_after.to_be_bytes());
+    buf
+}
+
 /// Encode a Binding **Success** response: echo `txid`, carry XOR-MAPPED-ADDRESS =
 /// `mapped` (the requester's source address as we observed it), then append
 /// MESSAGE-INTEGRITY (HMAC-SHA1 keyed by `integrity_key`) and FINGERPRINT.
@@ -743,6 +772,26 @@ mod tests {
         assert!(msg.attr(ATTR_FINGERPRINT).is_some());
         assert!(msg.attr(ATTR_USERNAME).is_none());
         assert!(msg.attr(ATTR_MESSAGE_INTEGRITY).is_none());
+    }
+
+    #[test]
+    fn server_binding_success_reflects_source_without_credentials() {
+        let txid = *b"serverquery1";
+        let source: SocketAddr = "192.0.2.44:54321".parse().unwrap();
+        let response = encode_server_binding_success(txid, source);
+        let msg = StunMessage::decode(&response).unwrap();
+
+        assert!(msg.is_binding_success());
+        assert_eq!(msg.txid, txid);
+        assert_eq!(msg.xor_mapped_address().unwrap(), Some(source));
+        assert!(msg.attr(ATTR_MESSAGE_INTEGRITY).is_none());
+        assert!(msg.attr(ATTR_FINGERPRINT).is_some());
+
+        let fp_off = find_attr_offset(&response, ATTR_FINGERPRINT)
+            .unwrap()
+            .unwrap();
+        let embedded = u32::from_be_bytes(response[fp_off + 4..fp_off + 8].try_into().unwrap());
+        assert_eq!(fingerprint(&response[..fp_off]), embedded);
     }
 
     // ── Binding Success responder (consent reply; RFC 7675 keepalive) ──────

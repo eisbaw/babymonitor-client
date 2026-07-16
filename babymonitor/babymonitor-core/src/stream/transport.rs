@@ -500,8 +500,8 @@ pub struct LiveSignalingParams<'a> {
     /// Bounded receive budget for the camera answer (phase 1).
     pub max_polls: usize,
     /// Extra polls AFTER the answer to collect the camera's trickled candidates
-    /// (phase 2). The answer SDP carries none — cap3/cap4 — so this window is where
-    /// the host candidate actually arrives.
+    /// (phase 2). The answer SDP carries none; the TASK-0126 live LAN run proves
+    /// this window is where the separate host candidate may arrive.
     pub trickle_polls: usize,
     /// Sleep between empty non-blocking polls — paces the live `rumqttc` eventloop
     /// so it does not busy-spin (offline callers use [`Duration::ZERO`]).
@@ -518,8 +518,9 @@ pub struct LiveSignalingParams<'a> {
 /// → [`MqttSignalingSession::negotiate_with_trickle`] (publish the offer + local
 /// candidates once over MQTT, receive + parse the answer, then keep collecting the
 /// camera's trickled `candidate` messages). The trickle phase is required: the
-/// camera's answer SDP carries no `a=candidate:` lines (cap3/cap4), so its host
-/// candidate only arrives as separate 302 `candidate` messages after the answer.
+/// camera's answer SDP carries no `a=candidate:` lines, while the TASK-0126 LAN
+/// run proves its host candidate arrives as a separate 302 `candidate` message
+/// after the answer.
 /// Build `config` from session-derived creds with [`BrokerConfig::from_credentials`].
 ///
 /// This opens a real socket, so it is **never** exercised in the offline tests —

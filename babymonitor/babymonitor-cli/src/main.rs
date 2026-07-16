@@ -38,6 +38,8 @@
 // (TASK-0117, `gui::close_requested`). `deny` still keeps unsafe out everywhere else.
 #![deny(unsafe_code)]
 
+#[cfg(feature = "live")]
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -117,6 +119,14 @@ enum Command {
     /// for `vlc`/`mpv`/`ffplay`. The live path is honestly gated; `--replay-annexb`
     /// runs the depacketize -> mux/serve path OFFLINE (no camera). See its --help.
     Stream(stream::StreamArgs),
+    /// Provision the LAN-only stream cache from already-captured private owner
+    /// artifacts. This verifies Tuya LAN 3.3/3.4/3.5 locally and never opens REST
+    /// or MQTT sockets.
+    #[cfg(feature = "live")]
+    Lan {
+        #[command(subcommand)]
+        action: LanAction,
+    },
     /// (gui feature) Open an SDL2 window for N seconds to prove the in-app GUI
     /// render stack works (TASK-0115). No camera, no decode.
     #[cfg(feature = "gui")]
@@ -125,6 +135,38 @@ enum Command {
         #[arg(default_value = "3")]
         secs: u64,
     },
+}
+
+/// Local camera setup commands. These are network-gated with the `live` feature,
+/// but they contact only the caller-selected camera endpoint.
+#[cfg(feature = "live")]
+#[derive(Debug, Subcommand)]
+enum LanAction {
+    /// Build a mode-0600 LAN config from private cached owner artifacts.
+    Provision(LanProvisionArgs),
+}
+
+/// Inputs for one local, cryptographically verified LAN-config provisioning probe.
+#[cfg(feature = "live")]
+#[derive(Debug, Args)]
+struct LanProvisionArgs {
+    /// Camera address on the current LAN. Omit to use Tuya UDP discovery matched
+    /// to the cached device id. Neither path performs cloud discovery.
+    #[arg(long)]
+    camera_ip: Option<IpAddr>,
+
+    /// Tuya LAN control port exposed by the camera.
+    #[arg(long, default_value_t = 6668)]
+    port: u16,
+
+    /// Private directory containing tuya_device_list.json,
+    /// tuya_session.json, and tuya_rtc_config.json.
+    #[arg(long, default_value = "secrets")]
+    secrets_dir: PathBuf,
+
+    /// Destination config. Defaults to the private per-user LAN config store.
+    #[arg(long, value_name = "FILE")]
+    output: Option<PathBuf>,
 }
 
 /// `auth` subcommands.
@@ -231,6 +273,8 @@ fn main() -> ExitCode {
         Some(Command::Auth { action }) => run_auth(action, json),
         Some(Command::Devices { action }) => run_devices(action, json),
         Some(Command::Stream(args)) => stream::run_stream(&args, json),
+        #[cfg(feature = "live")]
+        Some(Command::Lan { action }) => run_lan(action, json),
         #[cfg(feature = "gui")]
         Some(Command::GuiSelftest { secs }) => {
             gui::selftest(secs).map(|_| ()).map_err(Error::Transport)
@@ -242,6 +286,37 @@ fn main() -> ExitCode {
         Err(e) => {
             report_error(&e, json);
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Provision the durable LAN cache without contacting Tuya REST or MQTT.
+#[cfg(feature = "live")]
+fn run_lan(action: LanAction, json: bool) -> Result<(), Error> {
+    match action {
+        LanAction::Provision(args) => {
+            let outcome = stream_live::provision_lan_config(
+                args.camera_ip,
+                args.port,
+                &args.secrets_dir,
+                args.output.as_deref(),
+            )?;
+            if json {
+                println!(
+                    "{{\"command\":\"lan provision\",\"configured\":true,\"protocol\":{},\"config_path\":{},\"cloud_contacted\":false}}",
+                    json_str(outcome.hgw_version),
+                    json_str(&outcome.config_path.display().to_string())
+                );
+            } else {
+                println!("lan provision: camera and localKey verified locally.");
+                println!("protocol: Tuya LAN {}", outcome.hgw_version);
+                println!(
+                    "config: {} (mode 0600; camera address, identifiers, and keys withheld)",
+                    outcome.config_path.display()
+                );
+                println!("cloud: not contacted (cached owner artifacts only)");
+            }
+            Ok(())
         }
     }
 }

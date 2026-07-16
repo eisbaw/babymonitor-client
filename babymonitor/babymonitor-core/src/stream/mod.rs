@@ -5,8 +5,9 @@
 //!
 //! - cloud MQTT uses [`mqtt_crypto`] message-2.2 framing and the live
 //!   [`transport`] adapter;
-//! - local mode uses authenticated Tuya 3.4/3.5 commands 3/4/5 plus
-//!   `IPC_LAN_302` frame type 32 in [`tuya_lan`] and [`lan_transport`].
+//! - local mode uses Tuya 3.3/3.4/3.5 `IPC_LAN_302` frame type 32 in
+//!   [`tuya_lan`] and [`lan_transport`], with [`lan_discovery`] resolving a
+//!   DHCP-assigned endpoint by matching the camera's cached device id.
 //!
 //! [`session`] owns the transport-neutral negotiation and strict trace/session
 //! correlation. [`sdp`] carries the ICE credentials and media AES key. The media
@@ -18,12 +19,14 @@
 //! feature. Cloud mode needs an authorized session/runtime record; LAN mode needs
 //! an already paired camera's owner-provisioned IP, device ID, sender ID,
 //! localKey, and Hgw version. Offline tests exercise both carrier state machines
-//! and the media codecs without fabricating an owner-camera result. A real
-//! WAN-blocked LAN frame remains the explicit TASK-0126 live proof.
+//! and the media codecs without fabricating an owner-camera result. TASK-0126
+//! live-proved a frame-32 -> ICE/KCP stream with every client WAN destination
+//! denied and only the camera's private address allowed.
 
 pub mod connect;
 pub mod frame;
 pub mod lan_config;
+pub mod lan_discovery;
 pub mod lan_transport;
 pub mod media;
 pub mod mqtt_auth;
@@ -71,7 +74,8 @@ pub struct StreamCredentials {
     pub skill: String,
     /// Cloud `P2pConfig.p2pKey`. Empty and unused in LAN mode. **SECRET**.
     pub p2p_key: String,
-    /// Cloud STUN/TURN server JSON. LAN mode uses `[]` and host-direct ICE.
+    /// Cloud STUN/TURN server JSON. LAN credentials keep this empty;
+    /// `negotiate_lan` injects an ephemeral LAN-local STUN entry directly.
     pub ices: String,
     /// Cloud session descriptor. Empty/unused in LAN mode. **SECRET**.
     pub session: String,

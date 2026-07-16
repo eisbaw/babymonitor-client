@@ -16,6 +16,15 @@
 > (TASK-0085 fixed the KCP ACK-loop starvation). Secrets remain referenced by `secrets/` location
 > only.
 
+> **LAN UPDATE — TASK-0126 (2026-07-16).** The same SCD921 now streams with
+> signaling entirely over key-proven `IPC_LAN_302` frame type 32 on TCP 6668.
+> The Rust client advertises a numeric LAN-local RFC 5389 responder instead of
+> cloud ICE servers; the camera trickles a host candidate and media continues over
+> direct ICE/KCP UDP. A fresh run succeeded under a kernel egress allowlist that
+> denied every destination except loopback and the camera. This proves cloud-free
+> runtime for cached paired-device metadata, not factory pairing or localKey
+> recovery after reset.
+
 The end-to-end, implementable spec for the Tuya WebRTC-over-MQTT live A/V session
 the SCD921 uses, so the Rust stream client (TASK-0034) can be built against it.
 This goes **deeper than** `re/streaming_mode.md` (the transport verdict + 302
@@ -60,6 +69,13 @@ messages. The SDP carries standard WebRTC ICE/DTLS-SRTP attributes **plus a
 Tuya-custom `m=application` section with an `a=aes-key:<hex>` line** that conveys
 the media AES key.
 
+That paragraph describes the original cloud carrier. In LAN mode the client
+loads previously provisioned `devId`, sender ID, `localKey`, Hgw version, and
+camera media password from its mode-0600 config; it mints the per-run SDP/ICE/media
+values locally. The 302 envelope rides TCP 6668 and `msg.token` contains only the
+client's numeric LAN-local STUN responder. No REST, DNS, MQTT, public STUN, or TURN
+endpoint is constructed.
+
 **(Superseded 2026-06-28, v0.1.0-live-stream — the media plane below replaces the
 old "after the DTLS-SRTP handshake" claim.)** The SCD921's live A/V does **NOT**
 ride a DTLS-SRTP handshake or webrtc-rs SRTP tracks. After ICE connectivity the
@@ -79,7 +95,9 @@ self-contained Rust client (custom ICE + KCP + AES-128-CBC/HMAC-SHA1 media over
 `rumqttc` 302 signaling, **NO webrtc-rs media path**) decodes the live keyframe
 end-to-end (§9). The runtime-gated inputs (token, p2pId/p2pKey, ices,
 connect_session, localKey, and the camera password for conv=0 auth) are still
-required — see §5b, §9.
+required for the cloud path — see §5b, §9. LAN runtime instead needs the cached
+device/sender IDs, `localKey`, Hgw version, and camera password; the client mints
+the remaining session material.
 
 ---
 
@@ -372,11 +390,22 @@ PKCS7) + per-datagram 20-byte HMAC-SHA1**, the live media crypto (§3d/banner),
 ### 3d. ICE / DTLS-SRTP (standard WebRTC, webrtc-rs handles)
 - **ICE:** `imm_p2p_ice_session_create` + `…_add_remote_candidate` +
   `…_add_remote_userinfo` + `…_get_handshake_info`; trickle via `a=ice-options:trickle`
-  and the `candidate` 302 messages. STUN/TURN endpoints come from the runtime
-  `P2pConfig.ices` (and `tcpRelay`/`udpRelay`) — confirmed by the runtime error
+  and the `candidate` 302 messages. In cloud mode STUN/TURN endpoints come from
+  runtime `P2pConfig.ices` (and `tcpRelay`/`udpRelay`) — confirmed by the runtime error
   `Invalid STUN server or server not configured (IMM_P2P_ESTUNINSERVER)`: the
   servers are **not static**, they are configured at session setup from the cloud
-  `ices` list. (confidence: confirmed — the string + the bean field.)
+  `ices` list. In LAN mode, Ghidra
+  `re/ghidra/ice_gather_from_tokens.c` (`libThingP2PSDK.so@0x152108`) proves an
+  empty token list creates no camera ICE socket and that a numeric STUN entry
+  creates the socket before emitting host candidates. The authorized TASK-0126
+  frame-32 run independently live-proved the resulting host-candidate trickle;
+  Java's LAN frame-32 carrier is independently visible in
+  `decompiled/jadx/sources/com/thingclips/smart/p2p/utils/P2PMQTTServiceManager.java`.
+  The camera sent zero Binding queries in those runs; RFC 5389
+  Binding/XOR-MAPPED response behavior is only loopback/unit-proven, and camera
+  srflx media selection remains unproven.
+  (confidence: confirmed for token→socket→host candidate; bounded as stated for
+  Binding/srflx.)
 - **DTLS-SRTP:** bundled **static mbedTLS** inside `libThingP2PSDK.so`
   (`mbedtls_ssl_conf_dtls_srtp_protection_profiles`, cert `CN=Cert,O=WebRTC,C=US`,
   `imm_p2p_misc_generate_cert`/`_calculate_cert_fingerprint`). The fingerprint is

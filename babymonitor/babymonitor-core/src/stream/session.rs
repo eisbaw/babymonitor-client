@@ -2,7 +2,7 @@
 //! (`re/webrtc_session.md` §5).
 //!
 //! [`SignalingSession`] drives one selected [`SignalingTransport`]. MQTT wraps
-//! the JSON in message-2.2 through [`MqttSignalingTransport`]; authenticated LAN
+//! the JSON in message-2.2 through [`MqttSignalingTransport`]; key-proven LAN
 //! frame type 32 implements the same trait in `lan_transport`. Offline tests use
 //! injected carriers, while the production CLI supplies real MQTT or TCP I/O.
 //!
@@ -468,6 +468,19 @@ impl SignalingFlow {
                 .map_or(true, |session| session == self.sessionid)
     }
 
+    /// Whether an inbound envelope also has the strict reversed route required
+    /// by camera-local signaling. LAN frames must name the configured camera as
+    /// sender, the configured account/sender id as recipient, and `path:lan`.
+    /// Cloud compatibility remains trace/session based because older MQTT
+    /// envelopes may omit routing fields.
+    #[must_use]
+    pub fn correlates_route(&self, env: &SignalingEnvelope, path: SignalingPath) -> bool {
+        path != SignalingPath::Lan
+            || (env.header.from.as_deref() == Some(self.to.as_str())
+                && env.header.to.as_deref() == Some(self.from.as_str())
+                && env.header.path == Some(SignalingPath::Lan))
+    }
+
     /// Build one outbound offer for the selected carrier.
     pub fn offer_envelope(
         &mut self,
@@ -574,9 +587,9 @@ pub enum InboundSignal {
 /// messages.
 ///
 /// This pairing matters because the camera's answer SDP carries **no**
-/// `a=candidate:` lines (cap3 + cap4 ground truth: 0 candidates in the answer
-/// SDP). The camera trickles its host/srflx candidates as separate `candidate`
-/// messages — some interleaved before the answer, most AFTER it — so
+/// `a=candidate:` lines (cap3 plus the TASK-0126 live LAN run). That live run
+/// proves the camera trickles its host candidate as a separate `candidate`
+/// message, which may arrive before or after the answer, so
 /// `remote_candidates`, NOT the answer SDP, is the remote candidate set the media
 /// transport selects a host candidate from. A driver that required candidates in
 /// the answer SDP would fail every real session even on a LAN.
@@ -602,17 +615,17 @@ pub struct InboundEnvelope {
 
 /// Transport-neutral carrier for Tuya 302 signaling envelopes.
 ///
-/// Implementations own their wire framing and authentication.  The session
+/// Implementations own their wire framing and security checks. The session
 /// layer emits exactly one envelope using [`path`](Self::path); it never clones
 /// an envelope onto a second carrier.
 pub trait SignalingTransport {
     /// Header path placed on every outbound envelope for this carrier.
     fn path(&self) -> SignalingPath;
 
-    /// Authenticate/frame and send one raw signaling JSON document.
+    /// Protect/frame and send one raw signaling JSON document.
     fn send_json(&mut self, json: &[u8]) -> Result<(), Error>;
 
-    /// Receive one authenticated/unframed signaling JSON document, if ready.
+    /// Receive one validated/unframed signaling JSON document, if ready.
     fn try_recv_json(&mut self) -> Result<Option<InboundEnvelope>, Error>;
 
     /// Frames rejected before yielding JSON. The default suits transports whose
@@ -826,10 +839,11 @@ impl<T: SignalingTransport> SignalingSession<T> {
                 return Ok(None);
             }
         };
-        if !self.flow.correlates(&env) {
+        let path = self.transport.path();
+        if !self.flow.correlates(&env) || !self.flow.correlates_route(&env, path) {
             if diag {
                 eprintln!(
-                    "302 diag: ignored stale/unrelated {:?} from '{source}' (session/trace mismatch)",
+                    "302 diag: ignored stale/unrelated {:?} from '{source}' (correlation/route mismatch)",
                     env.header.r#type
                 );
             }
@@ -881,8 +895,8 @@ impl<T: SignalingTransport> SignalingSession<T> {
     /// Phase 2 (trickle window): after the answer, keep polling up to
     /// `trickle_polls` more times, collecting the remote `candidate` messages the
     /// camera trickles AFTER the answer. This is essential: the answer SDP carries
-    /// no `a=candidate:` lines (cap3/cap4), so the host candidate the media
-    /// transport needs *only* arrives here. A `disconnect` ends the window early.
+    /// no `a=candidate:` lines, and the TASK-0126 live LAN run delivers the host
+    /// candidate separately in this window. A `disconnect` ends the window early.
     ///
     /// `poll_interval` is slept after an empty (non-blocking) poll to pace the live
     /// carrier; offline tests pass [`Duration::ZERO`] (a no-op sleep)
@@ -973,7 +987,7 @@ impl<T: SignalingTransport> SignalingSession<T> {
         }
 
         // Phase 2: the trickle window — collect the candidates the camera sends
-        // AFTER the answer (the answer SDP itself carries none; cap3/cap4). Stop as
+        // AFTER the answer (the answer SDP itself carries none). Stop as
         // soon as `stop_when` is satisfied (a usable host candidate is in hand).
         for _ in 0..trickle_polls {
             match self.poll_inbound()? {
@@ -1367,6 +1381,27 @@ mod tests {
         assert!(matches!(flow.ingest(&env), Err(Error::Transport(_))));
     }
 
+    #[test]
+    fn lan_correlation_requires_reversed_route_and_lan_path() {
+        let flow = SignalingFlow::new("USER", "DEV", "SESS", "trace-1");
+        let mut env = answer_env(
+            "v=0\r\nm=application 9 tuya 6001\r\na=ice-ufrag:SYN0\r\na=ice-pwd:SYNTHICEPWD0000000000000\r\na=aes-key:00112233445566778899aabbccddeeff\r\n",
+        );
+
+        assert!(!flow.correlates_route(&env, SignalingPath::Lan));
+        env.header.path = Some(SignalingPath::Lan);
+        assert!(flow.correlates_route(&env, SignalingPath::Lan));
+        env.header.from = Some("SYNTH_OTHER_DEVICE".to_string());
+        assert!(!flow.correlates_route(&env, SignalingPath::Lan));
+
+        // Preserve compatibility for MQTT envelopes whose route fields may be
+        // absent or provider-normalized; trace/session correlation still bites.
+        env.header.from = None;
+        env.header.to = None;
+        env.header.path = None;
+        assert!(flow.correlates_route(&env, SignalingPath::Mqtt));
+    }
+
     // ── MqttSignalingSession (transport-coupled orchestrator) ──────────────
     // These drive the publish/poll/answer wiring through the in-memory
     // FakeTransport — NO broker — proving the live rumqttc path's logic offline.
@@ -1615,8 +1650,9 @@ mod tests {
         );
     }
 
-    // negotiate_with_trickle(): the camera's host candidate arrives as TRICKLED
-    // 302 `candidate` messages (the answer SDP carries none — cap3/cap4). Phase 2
+    // negotiate_with_trickle(): model the TASK-0126 live behavior where the
+    // camera host candidate arrives as a separate 302 `candidate` message and the
+    // answer SDP carries none. Phase 2
     // must collect the post-answer candidates; retransmitted duplicates are
     // deduped, the empty end-of-candidates sentinel is filtered, and a candidate
     // interleaved BEFORE the answer is collected too.

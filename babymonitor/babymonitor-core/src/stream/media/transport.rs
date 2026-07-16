@@ -375,7 +375,7 @@ impl UdpMediaTransport {
     pub fn connect_peer(&mut self, peer: SocketAddr) -> Result<(), Error> {
         self.socket
             .connect(peer)
-            .map_err(|e| Error::Transport(format!("connect media UDP to {peer}: {e}")))?;
+            .map_err(|e| Error::Transport(format!("connect media UDP peer: {e}")))?;
         self.peer = Some(peer);
         Ok(())
     }

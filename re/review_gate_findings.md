@@ -53,11 +53,14 @@ named public references that change the implementation targets.
 - Note (2026-06-28, v0.1.0-live-stream): this TUTK/IOTC-PPCS P2P route is the road-not-taken — the
   transport verdict (F2) selected the MQTT/KCP path. F3's substantive feasibility claims are unaffected.
 
-### F4 — LAN port-6668 local protocol is datapoint-only (control/sensors), NOT AV (confidence: confirmed)
-- tinytuya/localtuya LAN protocol (TCP 6668, AES with per-device local key) carries **DPs** — on/off,
-  settings, sensor values — not video. Not a shortcut for streaming, but may simplify the **M8
-  control plane** (nightlight, lullaby, temp/humidity) without cloud. The local key comes from the
-  cloud device-list (task 13). Triage in Wave 2, not Wave 1.
+### F4 — Superseded: TCP 6668 carries both datapoints and local P2P signaling, not A/V media (confidence: confirmed)
+- The original review correctly observed that ordinary tinytuya/localtuya commands carry DPs,
+  but incorrectly generalized that to every command on the port. The SCD921 also accepts
+  `IPC_LAN_302` command/frame type 32 on TCP 6668, carrying the same offer/answer/candidate
+  signaling envelope as cloud MQTT. TASK-0126 live-proved that carrier with all non-camera egress
+  denied. Video and audio still do **not** travel on TCP 6668: after signaling, they use direct
+  ICE/KCP UDP. Tuya 3.3 uses `localKey` AES-ECB plus CRC32; the endpoint is key-proven by a fresh,
+  correlated decrypted answer rather than by treating an open port or CRC as authentication.
 
 ### F5 — Datacenter is selected at runtime from the login response, not static from assets (confidence: likely)
 - `assets/thing_domains_v1` gives candidate domains; the actual datacenter is chosen by country/region

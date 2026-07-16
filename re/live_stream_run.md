@@ -86,13 +86,38 @@ legacy PPCS transport and is out of scope.
 
 From that device record, note the camera's `devId`, `localKey`, and `pv`.
 
-### LAN-only signaling (experimental, owner-device validation pending)
+### LAN-only signaling (live-proven, paired-device runtime)
+
+**Evidence/confidence: confirmed for explicit-endpoint runtime; APK-derived and
+offline-tested for UDP discovery.** The framing evidence is committed under
+`re/ghidra/tuya_lan_*.c` (from `libnetwork-android.so@0x262eb4` and adjacent
+functions); the ICE token/socket/candidate control flow is in
+`re/ghidra/ice_gather_from_tokens.c`, `ice_gather_complete.c`, and
+`emit_candidate_signal.c` (from `libThingP2PSDK.so@0x152108`). The independent
+Java carrier source is
+`decompiled/jadx/sources/com/thingclips/smart/p2p/utils/P2PMQTTServiceManager.java`;
+TASK-0126 records the authorized live run. The camera did not answer the new UDP
+discovery probe during that run, so discovery interoperability is not claimed
+live; the explicit-IP path still required the same TCP/localKey proof.
 
 `stream --signaling lan` bypasses SessionStore, REST, and MQTT entirely. It loads
-stable metadata from `$XDG_CONFIG_HOME/philips-babymonitor/lan.json` (or
-`--lan-config FILE`), authenticates TCP 6668 with Tuya commands 3/4/5, and sends
-the offer/candidates as `IPC_LAN_302` frame type 32. The file must be mode 0600;
-group/world-readable files and symlinks are rejected.
+cached metadata from `$XDG_CONFIG_HOME/philips-babymonitor/lan.json` (or
+`--lan-config FILE`) and sends the offer/candidates as `IPC_LAN_302` frame type
+32 on TCP 6668. Tuya 3.4/3.5 authenticate with commands 3/4/5; legacy 3.3 uses
+AES-ECB/PKCS7 + CRC32 and is accepted only after a fresh, correlated signaling
+answer decrypts under `localKey`. The file must be mode 0600; group/world-readable
+files and symlinks are rejected.
+
+Provision the store from private, already captured owner records. Omit
+`--camera-ip` to use Tuya UDP discovery; if the camera is not advertising, supply
+its current LAN address explicitly. Discovery is only a forgeable endpoint hint;
+both paths still require a fresh correlated signaling answer that decrypts under
+the cached `localKey` before saving:
+
+```sh
+babymonitor-cli lan provision [--camera-ip <camera-LAN-address>]
+babymonitor-cli stream --signaling lan
+```
 
 ```json
 {
@@ -101,24 +126,43 @@ group/world-readable files and symlinks are rejected.
   "device_id": "<devId>",
   "sender_id": "<stable account uid used as header.from>",
   "local_key": "<16-byte localKey>",
-  "hgw_version": "3.5",
+  "hgw_version": "3.3",
   "media_auth_password": "<optional camera-info password>"
 }
 ```
 
-The hardware-gateway version is `HgwBean.version` (`3.4` or `3.5`), not the
-device-list MQTT payload `pv=2.2`. ICE credentials, media keys, trace IDs, and
-session IDs are minted per run and are never stored here. The optional media
-password is a cached provisioning value; its stability across `rtc.config`
-refreshes is not yet proven, so refresh the local config if media authentication
-starts failing. `--signaling auto` tries LAN first and prints an explicit
-diagnostic before cloud fallback; `--signaling lan` never falls back.
+The hardware-gateway version is `HgwBean.version` (`3.3`, `3.4`, or `3.5`), not the
+device-list MQTT payload `pv=2.2`. The current route/candidate implementation is
+IPv4-only and rejects IPv6 configs up front. Cache lifetimes are deliberately
+bounded: `camera_ip` is DHCP/lease-bound, Hgw version is firmware-bound,
+device/sender IDs are account-bound, `localKey` is reset/re-pair-bound, and the
+media password is `rtc.config`-bound. A stale endpoint/version fails closed; rerun
+local `lan provision` using the cached owner records/key. ICE credentials,
+candidates, media keys, trace/session IDs, local STUN/TCP sockets, and the media
+socket are per-run and never stored. `--signaling auto` tries LAN first and prints
+an explicit diagnostic before cloud fallback; `--signaling lan` never falls back.
+
+The camera native library creates its UDP ICE socket only while iterating
+`msg.token` STUN/TURN entries (`re/ghidra/ice_gather_from_tokens.c`). Sending
+`token:[]` is syntactically valid but yields only the empty end-of-candidates
+sentinel (`ice_gather_complete.c` / `emit_candidate_signal.c`). LAN mode therefore
+starts a small RFC 5389 responder on the client and advertises exactly one numeric
+route-selected IPv4 interface `stun:` URL. This made the camera trickle its host
+candidate without DNS, public STUN, TURN, or cloud. The live runs sent zero STUN
+Binding queries: URL-driven socket creation and host trickle are live-proven;
+Binding/XOR-MAPPED response behavior remains loopback/unit-proven. TCP 6668 and
+the responder are retained until media teardown; TCP is not polled after
+negotiation. The 47–103 second runs do not prove long-session heartbeat,
+renegotiation, or reconnect behavior. H.264/audio use the ICE/KCP UDP path.
 
 This supports a cloud-free **process startup for an already paired,
-pre-provisioned camera**, subject to TASK-0126's owner-device proof with WAN/MQTT
-blocked. It is not cloud-free factory-reset or pairing support: an account move,
-reset, or re-pair may rotate the `localKey`, and local reacquisition of that key
-has not been implemented yet.
+pre-provisioned camera**. TASK-0126 live-proved it twice against an already-running
+camera with a fresh client process: the second run executed
+under `IPAddressDeny=any`, allowing only loopback and the camera LAN address, and
+still produced 1920×1080 H.264 at 15 fps plus audio. It is not cloud-free
+factory-reset or pairing support: an account move, reset, or re-pair may rotate
+the `localKey`, and local reacquisition of that key has not been implemented yet.
+Camera cold-power persistence has not yet been tested.
 
 ---
 
@@ -278,18 +322,19 @@ These are real gaps; do not assume they "just work":
    Remote / NAT-traversed access needs a real TURN client
    (`stream::media::transport::allocate_turn_relay` returns a loud error today).
 
-5. **srflx is loopback-validated only.** The STUN Binding / XOR-MAPPED-ADDRESS
-   round-trip is proven over a localhost responder, not against the SDP `stun:`
-   server (TASK-0075). Host-direct does not need it.
+5. **The local STUN URL is live-proven; its Binding response and srflx path are
+   loopback-only.** Advertising the numeric local URL made the camera open its
+   socket and emit a host candidate, but the live runs logged zero Binding
+   queries. The responder's XOR-MAPPED-ADDRESS round-trip is unit-proven on
+   loopback; camera-side srflx generation/selection remains unproven and was not
+   needed for host-direct media.
 
-6. **Inbound-trickle handling — partially reconciled** (Superseded 2026-06-28,
-   v0.1.0-live-stream). The client now **self-trickles its OWN host candidate and
-   binds the media socket early** (§4 step 6), which is what got the live path
-   connected against the SCD921 — so the earlier "the driver only selects the host
-   candidate from the answer SDP" framing no longer fully holds. Still open: surfacing
-   the camera's **inbound** trickle candidates (`poll_inbound`) is not exercised; the
-   live SCD921 supplied a usable host candidate in/with the answer, so this did not
-   block, but a camera that only trickles its host candidate later would need it.
+6. **Inbound trickle is live-proven.** The client binds early and trickles its own
+   host candidate. With the LAN-local STUN token present, the SCD921 sends its host
+   candidate as a separate key-proven frame-32 `candidate` envelope; the answer
+   SDP itself remains `c=0.0.0.0`, `m=... 9`, with no candidate. The session keeps
+   polling after the answer, consumes that non-empty candidate, then filters the
+   camera's empty end-of-candidates sentinel.
 
 **Follow-up tasks:** TASK-0083 (live media transport) is **DONE**. Open:
 TASK-0085 (decouple the ACK loop from the blocking sink — the blocker), TASK-0086

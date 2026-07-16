@@ -85,13 +85,18 @@ user's own account and device only.
 
 ## Streaming hypothesis (updated post-review)
 
-**RESOLVED (v0.1.0-live-stream)** — the transport is decided and proven end-to-end against the real
-SCD921. The validated path is a **HYBRID** (signaling over Tuya cloud MQTT; media over P2P/ICE UDP),
-closest to candidate 1 below but with **KCP** media framing rather than raw WebRTC media:
+**RESOLVED (v0.1.0-live-stream; LAN carrier live-proven by TASK-0126)** — the
+transport is decided and proven end-to-end against the real SCD921. Signaling is
+selectable: Tuya cloud MQTT or key-proven `IPC_LAN_302` on TCP 6668. Media is
+direct P2P/ICE UDP in either case, with **KCP** framing rather than raw WebRTC media:
 
-- **WebRTC-style "302" signaling over Tuya MQTT** (payloads AES-ECB sealed with the device localKey)
+- **WebRTC-style "302" signaling over Tuya MQTT or local frame type 32** (sealed with the device localKey)
   → **ICE** (host-candidate trickle, no USE-CANDIDATE, tolerates ICMP ECONNREFUSED)
   → **conv=0** media-start/auth → **conv=1** video over **KCP**.
+- LAN mode supplies a numeric RFC 5389 responder on the client LAN; a kernel
+  allowlist denying all non-camera destinations still produced live A/V. This is
+  cloud-free runtime for a paired/configured camera, not cloud-free pairing or
+  localKey recovery after reset.
 - Media is **per-segment AES-128-CBC (inline-IV, PKCS7)** + a **per-datagram 20-byte
   HMAC-SHA1(media_key16)** → **H.264**. Explicitly **NOT DTLS-SRTP**.
 - conv ids: 0 = control, 1 = video, 2 = downstream audio (16 kHz mono S16LE, inferred).

@@ -46,7 +46,7 @@ exists to byte-diff the credential output against.
 
 That paragraph describes the captured APK exchange. The Rust live driver now
 selects one real carrier: cloud mode emits only `path:"mqtt"` through MQTT, while
-LAN mode emits only `path:"lan"` through authenticated local frame type 32. It no
+LAN mode emits only `path:"lan"` through key-proven local frame type 32. It no
 longer sends a LAN-labelled duplicate through the MQTT socket.
 
 ---
@@ -307,12 +307,30 @@ logged decrypted plaintext only, no raw frame): the AES→base64→outer-frame l
 (`stream::session::SignalingSession`): the engine-free generic layer publishes
 the offer + trickle candidates once over its selected carrier and parses inbound
 JSON into `InboundSignal` (Answer / RemoteCandidate / Disconnect). MQTT framing
-lives in `MqttSignalingTransport`; authenticated local frame type 32 lives in
+lives in `MqttSignalingTransport`; key-proven local frame type 32 lives in
 `Lan302Transport`. `negotiate()` runs the full offer→trickle→answer exchange and
 returns the camera `ParsedAnswer` (media aes-key + ICE ufrag/pwd + relays). The
 cloud entry point is `stream::transport::connect_and_negotiate`; LAN is selected
 by `babymonitor-cli stream --signaling lan`. Offline tests exercise both paths
 without a broker or camera.
+
+**LAN carrier live validation (TASK-0126, 2026-07-16; confidence: confirmed by
+the authorized run plus committed native evidence):** the owner's SCD921 was
+key-proven as Tuya LAN 3.3, then returned a fresh answer and a separate non-empty
+host candidate over key-proven `IPC_LAN_302` frame type 32. The first probe's
+`msg.token:[]` produced `Answer → candidate:"" → Disconnect`; Ghidra
+`re/ghidra/ice_gather_from_tokens.c` (`libThingP2PSDK.so@0x152108`) plus
+`ice_gather_complete.c` pins the missing socket/candidate cause; the independent
+Java LAN-carrier path is in
+`decompiled/jadx/sources/com/thingclips/smart/p2p/utils/P2PMQTTServiceManager.java`.
+The fixed client advertises an RFC 5389 responder bound to its route-selected
+IPv4 interface and receives the camera host candidate without public STUN/TURN.
+The live runs logged zero Binding queries, so the responder reply remains
+loopback/unit-proven rather than camera-live-proven. A fresh run under a kernel
+egress allowlist permitting only loopback and the camera still produced decodable
+1920×1080 H.264 plus audio. Thus TCP 6668 is the LAN signaling carrier; the
+negotiated media remains direct ICE/KCP UDP. This was a fresh client against an
+already-running paired camera; cold camera restart remains untested.
 
 **Open / live-gated:**
 - The **TLS:8883 broker connect + MQTT-302 signaling round-trip** (AC#1/AC#3) is now

@@ -39,7 +39,7 @@ pub struct LanDeviceConfig {
     pub sender_id: String,
     /// Device localKey.  Secret; never printed by `Debug`.
     pub local_key: String,
-    /// `HgwBean.version`, currently supported values 3.4 and 3.5.
+    /// `HgwBean.version`, currently supported values 3.3, 3.4, and 3.5.
     pub hgw_version: String,
     /// Optional cached camera-info password used to derive conv=0 media auth.
     /// Its stability across reset/config refresh is unproven.
@@ -50,9 +50,18 @@ pub struct LanDeviceConfig {
 impl LanDeviceConfig {
     /// Validate all load-bearing values without exposing secret contents.
     pub fn validate(&self) -> Result<(), Error> {
-        if self.camera_ip.is_unspecified() || self.camera_ip.is_multicast() {
+        let IpAddr::V4(camera_ip) = self.camera_ip else {
             return Err(Error::StreamConfig(
-                "LAN camera_ip must be a concrete unicast address".to_string(),
+                "LAN camera_ip must be IPv4; the current ICE/media route is IPv4-only".to_string(),
+            ));
+        };
+        if camera_ip.is_unspecified()
+            || camera_ip.is_multicast()
+            || camera_ip.is_loopback()
+            || camera_ip.is_broadcast()
+        {
+            return Err(Error::StreamConfig(
+                "LAN camera_ip must be a concrete non-loopback IPv4 unicast address".to_string(),
             ));
         }
         if self.port == 0 {
@@ -75,7 +84,7 @@ impl LanDeviceConfig {
         Ok(())
     }
 
-    /// Authenticated camera endpoint.
+    /// Key-proven camera endpoint.
     #[must_use]
     pub const fn socket_addr(&self) -> SocketAddr {
         SocketAddr::new(self.camera_ip, self.port)
@@ -96,8 +105,8 @@ impl std::fmt::Debug for LanDeviceConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("LanDeviceConfig")
-            .field("camera_ip", &self.camera_ip)
-            .field("port", &self.port)
+            .field("camera_ip", &"[REDACTED]")
+            .field("port", &"[REDACTED]")
             .field("device_id", &"[REDACTED]")
             .field("sender_id", &"[REDACTED]")
             .field("local_key", &"[REDACTED]")
@@ -448,6 +457,14 @@ mod tests {
             hgw_version: "3.5".to_string(),
             media_auth_password: Some("SYNTH_MEDIA_PASSWORD".to_string()), // secret-scan:allow synthetic
         }
+    }
+
+    #[test]
+    fn validate_rejects_ipv6_before_media_route_setup() {
+        let mut config = synthetic_config();
+        config.camera_ip = "2001:db8::10".parse().unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("IPv4-only"));
     }
 
     fn temp_store(label: &str) -> (PathBuf, LanConfigStore) {

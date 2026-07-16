@@ -68,6 +68,7 @@ test-regions:
 # End-to-end gate (default/live tests + lint + formatting + offline integration).
 [group('test')]
 e2e: build test test-live lint fmt-check stub-grep assert-offline test-bmp-decode test-regions stream-validate
+    cd re/scripts && python3 test_camera_surface_probe.py
 
 # Offline-validate the `stream` mux/serve path (TASK-0070/0073): synthesize an
 # Annex-B H.264 sample + a 16 kHz mono S16LE downstream-audio sample, replay them

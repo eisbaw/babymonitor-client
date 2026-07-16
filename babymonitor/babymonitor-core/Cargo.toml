@@ -36,3 +36,4 @@ cbc.workspace = true
 hmac.workspace = true
 sha1.workspace = true
 aes-gcm.workspace = true
+zeroize.workspace = true

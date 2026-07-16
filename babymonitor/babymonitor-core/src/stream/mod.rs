@@ -83,6 +83,7 @@ pub mod session;
 pub mod signaling;
 pub mod topics;
 pub mod transport;
+pub mod tuya_lan;
 
 use crate::Error;
 

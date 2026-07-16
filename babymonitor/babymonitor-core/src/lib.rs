@@ -123,6 +123,12 @@ pub enum Error {
     #[error("stream transport error: {0}")]
     Transport(String),
 
+    /// The authenticated Tuya LAN protocol failed: malformed 3.4/3.5 framing,
+    /// an authentication/tag mismatch, an invalid session-key handshake, or an
+    /// unsupported hardware-gateway protocol version.
+    #[error("Tuya LAN protocol error: {0}")]
+    LanProtocol(String),
+
     /// The standard-WebRTC engine seam (webrtc-rs) failed.
     #[error("webrtc engine error: {0}")]
     WebRtcEngine(String),

@@ -45,6 +45,8 @@ use std::process::ExitCode;
 
 use babymonitor_core::device::{self, CameraView, DeviceBean, DeviceList};
 use babymonitor_core::session::SessionStore;
+#[cfg(feature = "live")]
+use babymonitor_core::stream::lan_config::LanConfigStore;
 use babymonitor_core::Error;
 use clap::{Args, Parser, Subcommand};
 
@@ -127,6 +129,14 @@ enum Command {
         #[command(subcommand)]
         action: LanAction,
     },
+    /// Experimental/WIP: read Tuya OTA metadata and optionally download an offered package.
+    /// Candidate data/downloads are not live-confirmed; this never starts an upgrade.
+    #[cfg(feature = "live")]
+    #[command(name = "firmwareWIP")]
+    FirmwareWip {
+        #[command(subcommand)]
+        action: FirmwareWipAction,
+    },
     /// (gui feature) Open an SDL2 window for N seconds to prove the in-app GUI
     /// render stack works (TASK-0115). No camera, no decode.
     #[cfg(feature = "gui")]
@@ -167,6 +177,40 @@ struct LanProvisionArgs {
     /// Destination config. Defaults to the private per-user LAN config store.
     #[arg(long, value_name = "FILE")]
     output: Option<PathBuf>,
+}
+
+/// Read-only firmware acquisition commands.
+#[cfg(feature = "live")]
+#[derive(Debug, Subcommand)]
+enum FirmwareWipAction {
+    /// Query OTA metadata into a new immutable acquisition directory without
+    /// downloading package bytes.
+    Info(FirmwareArgs),
+    /// Query metadata and download every offered OTA package into
+    /// `<SECRETS_DIR>/firmware/`, without sending an upgrade command.
+    Download(FirmwareArgs),
+}
+
+/// Inputs shared by read-only OTA metadata and download operations.
+#[cfg(feature = "live")]
+#[derive(Debug, Args)]
+struct FirmwareArgs {
+    /// Private directory holding app-signing material. Each run is published as
+    /// a new provenance directory below `<SECRETS_DIR>/firmware/`.
+    #[arg(long, default_value = "secrets")]
+    secrets_dir: PathBuf,
+
+    /// Extracted base APK used to derive the app certificate ingredient.
+    #[arg(
+        long,
+        default_value = "extracted/xapk/com.philips.ph.babymonitorplus.apk"
+    )]
+    apk: PathBuf,
+
+    /// Secure LAN config containing the already key-proven camera device ID.
+    /// Defaults to `$XDG_CONFIG_HOME/philips-babymonitor/lan.json`.
+    #[arg(long, value_name = "FILE")]
+    lan_config: Option<PathBuf>,
 }
 
 /// `auth` subcommands.
@@ -275,6 +319,8 @@ fn main() -> ExitCode {
         Some(Command::Stream(args)) => stream::run_stream(&args, json),
         #[cfg(feature = "live")]
         Some(Command::Lan { action }) => run_lan(action, json),
+        #[cfg(feature = "live")]
+        Some(Command::FirmwareWip { action }) => run_firmware_wip(action, json),
         #[cfg(feature = "gui")]
         Some(Command::GuiSelftest { secs }) => {
             gui::selftest(secs).map(|_| ()).map_err(Error::Transport)
@@ -288,6 +334,154 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Query or download OTA candidates without invoking any mutation endpoint.
+#[cfg(feature = "live")]
+fn run_firmware_wip(action: FirmwareWipAction, json: bool) -> Result<(), Error> {
+    let (args, download) = match action {
+        FirmwareWipAction::Info(args) => (args, false),
+        FirmwareWipAction::Download(args) => (args, true),
+    };
+    let lan_store = match args.lan_config {
+        Some(path) => LanConfigStore::new(path),
+        None => LanConfigStore::default_path()?,
+    };
+    let lan_config = lan_store.load()?;
+    let session_store = SessionStore::default_path()?;
+    let outcome = live::fetch_firmware_candidates(
+        &args.secrets_dir,
+        &args.apk,
+        &session_store,
+        &lan_config.device_id,
+        download,
+    )
+    .map_err(|error| Error::Firmware(error.to_string()))?;
+
+    if json {
+        let records = outcome
+            .records
+            .iter()
+            .map(|record| {
+                let mut value = serde_json::json!({
+                    "source": record.source,
+                    "channel": record.channel,
+                    "server_current_version": record.server_current_version,
+                    "server_offered_version": record.server_offered_version,
+                    "can_upgrade": record.can_upgrade,
+                    "upgrade_status": record.upgrade_status,
+                    "package_url_present": record.package_url_present,
+                    "integrity_metadata_present": record.integrity_metadata_present,
+                    "download_eligible": record.download_eligible,
+                    "expected_bytes": record.expected_bytes,
+                });
+                if let Some(diff_ota) = record.diff_ota {
+                    value
+                        .as_object_mut()
+                        .expect("firmware record JSON is an object")
+                        .insert("diff_ota".into(), serde_json::Value::Bool(diff_ota));
+                }
+                value
+            })
+            .collect::<Vec<_>>();
+        let downloads = outcome
+            .downloads
+            .iter()
+            .map(|download| {
+                serde_json::json!({
+                    "path": download.path,
+                    "bytes": download.bytes,
+                    "md5_verified": download.md5_verified,
+                    "server_signature_present": download.server_signature_present,
+                    "server_signature_verified": download.server_signature_verified,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::json!({
+                "command": if download { "firmwareWIP download" } else { "firmwareWIP info" },
+                "upgrade_request_sent": false,
+                "acquisition_path": outcome.acquisition_path,
+                "manifest_path": outcome.manifest_path,
+                "metadata_paths": outcome.metadata_paths,
+                "records": records,
+                "downloads": downloads,
+                "notices": outcome.notices,
+            })
+        );
+    } else {
+        println!(
+            "firmwareWIP {}: read-only OTA metadata query completed; no upgrade request was sent.",
+            if download { "download" } else { "info" }
+        );
+        println!("acquisition: {}", outcome.acquisition_path.display());
+        println!("manifest: {}", outcome.manifest_path.display());
+        for metadata_path in &outcome.metadata_paths {
+            println!(
+                "metadata: {} (mode 0600; URLs and hashes withheld)",
+                metadata_path.display()
+            );
+        }
+        if !outcome
+            .records
+            .iter()
+            .any(|record| record.package_url_present)
+        {
+            println!("OTA packages: none currently offered");
+        }
+        for (index, record) in outcome.records.iter().enumerate() {
+            println!(
+                "firmware channel #{index}: source={} channel={} server_current={} server_offered={} can_upgrade={} upgrade_status={} package_url_present={} integrity_metadata_present={} download_eligible={} expected_bytes={} diff_ota={}",
+                record.source,
+                record.channel,
+                record
+                    .server_current_version
+                    .as_deref()
+                    .unwrap_or("unknown"),
+                record
+                    .server_offered_version
+                    .as_deref()
+                    .unwrap_or("unknown"),
+                record
+                    .can_upgrade
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                record
+                    .upgrade_status
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                record.package_url_present,
+                record.integrity_metadata_present,
+                record.download_eligible,
+                record
+                    .expected_bytes
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                record
+                    .diff_ota
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+            );
+        }
+        for downloaded in &outcome.downloads {
+            println!(
+                "downloaded: {} ({} bytes; md5_verified={}; server_signature_present={}; server_signature_verified={})",
+                downloaded.path.display(),
+                downloaded.bytes,
+                downloaded.md5_verified,
+                downloaded.server_signature_present,
+                downloaded.server_signature_verified,
+            );
+        }
+        for notice in &outcome.notices {
+            println!("notice: {notice}");
+        }
+        if download && outcome.downloads.is_empty() {
+            println!("downloads: none (Tuya supplied no OTA package URL)");
+        }
+    }
+    Ok(())
 }
 
 /// Provision the durable LAN cache without contacting Tuya REST or MQTT.
@@ -922,5 +1116,19 @@ mod tests {
     #[test]
     fn json_str_escapes() {
         assert_eq!(json_str("a\"b"), "\"a\\\"b\"");
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn firmware_wip_is_the_only_exposed_firmware_command_name() {
+        let parsed = Cli::try_parse_from(["babymonitor-cli", "firmwareWIP", "info"])
+            .expect("the explicit WIP command must parse");
+        assert!(matches!(
+            parsed.command,
+            Some(Command::FirmwareWip {
+                action: FirmwareWipAction::Info(_)
+            })
+        ));
+        assert!(Cli::try_parse_from(["babymonitor-cli", "firmware", "info"]).is_err());
     }
 }

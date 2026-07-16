@@ -476,7 +476,7 @@ mod tests {
             "babymonitor-lan-config-{label}-{}-{unique}",
             std::process::id()
         ));
-        fs::create_dir(&dir).unwrap();
+        create_private_test_directory(&dir);
         let store = LanConfigStore::new(dir.join("lan.json"));
         (dir, store)
     }
@@ -490,13 +490,22 @@ mod tests {
             "babymonitor-lan-config-{label}-{}-{unique}",
             std::process::id()
         ));
-        fs::create_dir(&base).unwrap();
+        create_private_test_directory(&base);
         let dedicated = base.join(CONFIG_DIR);
         let store = LanConfigStore {
             path: dedicated.join(CONFIG_FILE),
             directory_policy: DirectoryPolicy::Dedicated,
         };
         (base, dedicated, store)
+    }
+
+    fn create_private_test_directory(path: &Path) {
+        fs::create_dir(path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
     }
 
     #[test]

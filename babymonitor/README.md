@@ -61,12 +61,90 @@ Offline (no camera, no network) the same decode/mux path is exercised by
 | `devices list --live` (`--features live`) | signed `device.list` with the stored `sid` → finds the SCD921 |
 | `devices list` / `devices show <id>` | offline against a **fixture body** (`--fixture <file>`; defaults to the synthetic fixture) |
 | `lan provision` (`--features live`) | build a secure local config and prove its endpoint/protocol/localKey without REST or MQTT |
+| `firmwareWIP info` / `firmwareWIP download` (`--features live`) | explicitly experimental: owner metadata query is live-confirmed only in a no-offer state; candidate/CDN download is loopback-tested only; neither command sends an upgrade-confirm request |
 | `stream` (`--features live`) | full live A/V → MPEG-TS over HTTP, raw stdout, **or an in-app GUI window** |
 
 Every command supports `--json`. **Secret/PII fields** (`localKey`, `secKey`,
 `p2pKey`, `initStr`, session/relay descriptors, …) are **redacted by default**;
 `--show-secrets` opts in (and prints a stderr warning) — intended only for your
 own authorized/synthetic data.
+
+## Read-only firmware acquisition (WIP)
+
+The deliberately named `firmwareWIP` command follows the exact update-check path used by the current app.
+It requires the owner's stored cloud session and the key-proven device ID in the
+private LAN config. It does not call Tuya's separate confirm/start endpoint:
+
+```sh
+# Inspect server-reported versions and whether the metadata includes a package URL.
+nix-shell --run 'cargo run --manifest-path babymonitor/Cargo.toml \
+    -p babymonitor-cli --features live -- firmwareWIP info'
+
+# If a URL is present, fetch it into private files under <SECRETS_DIR>/firmware/.
+nix-shell --run 'cargo run --manifest-path babymonitor/Cargo.toml \
+    -p babymonitor-cli --features live -- firmwareWIP download'
+```
+
+The authorized live validation exercised both metadata endpoints. Each returned two
+no-offer records with a server-reported `currentVersion`; neither returned an offered
+version, URL, size, hash, or signature, so no real package/CDN request was made. The
+streaming downloader and integrity checks are covered by a literal-loopback HTTP fixture
+only. Do not interpret that test as a successful real firmware acquisition. The hardened
+path was not queried live again: the owner session available during that validation had
+expired and was rejected, so the 2026-07-16 no-offer result remains the latest live evidence.
+
+Before any firmware request, the client loads the session through the hardened store. On
+Unix the session file is opened with `O_NOFOLLOW`, must be a regular file with mode exactly
+`0600`, and must live under a real, non-symlink parent that is not group- or world-writable.
+A validated parent directory descriptor is retained for the whole load/save/clear transaction;
+file inspection, temporary creation, rename, unlink, and fsync are basename-relative, so an
+ancestor-path swap cannot redirect session secrets after validation.
+A session that is expired or within the two-minute refresh buffer is rejected before network
+work. The persisted `mobileApiUrl` must parse as the exact app-evidenced HTTPS gateway shape
+(allowed host, port 443, and `/` or `/api.json`); there is no regional fallback. Firmware
+and atop clients disable redirects, and an atop metadata response is rejected if its
+declared or streamed body exceeds 2 MiB.
+
+After a successful metadata query, each `info` or `download` invocation stages a unique
+private `<SECRETS_DIR>/firmware/acquisition-.../` directory (mode `0700` with mode-`0600`
+files on Unix). The private manifest records the validated HTTPS gateway/request shape,
+SHA-256 of the device ID
+(never the raw ID), endpoint/action/version/request-field provenance, raw primary and
+optional legacy response filenames, `upgrade_request_sent: false`, and per-channel metadata.
+Its `completed` and optional `failure_class` fields distinguish success from a rejected URL
+or integrity preflight, transport/HTTP, size, MD5, or storage failure. A successful package
+also records actual size, MD5, and SHA-256; server `sign` presence is recorded while
+`signature_verified` remains false because the algorithm/key are unknown.
+
+A package-stage failure still publishes the raw response(s) and failure manifest. The
+unverified package partial is removed; if an earlier sibling package in the same acquisition
+already passed its size and MD5 checks, that verified sibling is retained and referenced.
+The acquisition likewise retains opened descriptors for its private parent and staging
+directory. Child creation, writes, verified-package installation, cleanup, publication, and
+fsync are descriptor-relative. On Linux, publication uses
+`renameat2(RENAME_NOREPLACE)`, so an existing acquisition or package is never replaced and a
+successful publish is durable. Acquisition publication fails closed on non-Linux platforms
+rather than claiming portable no-clobber behavior.
+
+Public summaries deliberately separate `package_url_present` (a non-empty server field),
+`integrity_metadata_present` (a non-empty MD5 field, not necessarily valid), and
+`download_eligible` (production HTTPS URL plus a valid 32-hex-digit MD5). Eligibility does
+not promise a successful transfer or bypass the 512 MiB, HTTP-status, declared-size, or
+post-download MD5 checks. Public current/offered versions are shown only when they pass a
+strict version-token validator; other server strings are redacted as unknown/null. Artifact
+filenames use only the record index and locally derived source/channel labels, never a
+server-supplied version. The only HTTP download allowance is a test-only policy restricted
+to literal loopback addresses. Sensitive URLs, hashes, signatures, device IDs, and account
+material remain out of terminal output and must stay gitignored.
+
+The two observed APIs did not expose bytes for the server-reported current version. That
+result does not rule out an undiscovered archive surface, and it is not a readback of the
+camera's flash. Obtaining the exact installed bytes still requires device-shell access or a
+physical flash dump.
+
+The queried v1.1/v1.2 APIs deserialize `BLEUpgradeBean`/`UpgradeInfoBean`, which do not
+define `diffOta`. A separate direct-AP model does define that flag, demonstrating that Tuya
+has a delta-capable path, but not that a future candidate from these queried APIs is a delta.
 
 ## Live A/V stream (`stream`)
 

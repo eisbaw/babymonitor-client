@@ -40,7 +40,9 @@
 //! candidate is wrong and we STOP before ever attempting `password.login`.
 
 use std::collections::BTreeMap;
-use std::io::ErrorKind;
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{AeadInPlace, KeyInit};
@@ -58,6 +60,9 @@ use rsa::pkcs8::DecodePublicKey;
 use rsa::{BigUint, Pkcs1v15Encrypt, RsaPublicKey};
 use serde::Deserialize;
 
+pub mod firmware;
+pub use firmware::fetch_firmware_candidates;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants (non-secret; runtime-resolvable but seeded for the EU region)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -70,6 +75,20 @@ const EU_ATOP_HOST: &str = "a1.tuyaeu.com";
 
 /// The atop request path on the mobile gateway.
 const ATOP_PATH: &str = "/api.json";
+
+/// App-evidenced `mobileApiUrl` hosts from the decrypted region table
+/// (`re/regions_decrypt.md`). Session data is untrusted input: post-login calls
+/// fail closed unless its gateway is one of these exact hosts.
+const ALLOWED_MOBILE_ATOP_HOSTS: [&str; 4] = [
+    "a1.tuyaeu.com",
+    "a1-us.iotbing.com",
+    "a1-in.iotbing.com",
+    "a1.iot334.com",
+];
+
+/// Atop envelopes are small JSON documents. Bound the body before parsing or
+/// persisting it so a malformed/malicious gateway cannot exhaust memory.
+const MAX_ATOP_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Country code for Denmark (the `countryCode` postData field + region arg).
 const COUNTRY_CODE_DK: &str = "45";
@@ -328,7 +347,6 @@ fn default_brand() -> String {
 /// Resolved live config: secrets + the offline-computed cert hash + a stable
 /// per-install deviceId. Carries secrets; constructed once, never logged.
 struct LiveConfig {
-    creds: LoginCreds,
     material: SigningKeyMaterial,
     bmp_token: String,
     app_version: String,
@@ -473,7 +491,6 @@ fn read_secret_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, Live
 /// `secrets_dir` is the `secrets/` directory; `apk_path` is the extracted APK the
 /// cert hash is computed from (offline, no device). No value is logged.
 fn load_config(secrets_dir: &Path, apk_path: &Path) -> Result<LiveConfig, LiveError> {
-    let creds: LoginCreds = read_secret_json(&secrets_dir.join("tuya_login.json"))?;
     let appkey: AppKey = read_secret_json(&secrets_dir.join("tuya_appkey.json"))?;
 
     let bmp_token = std::fs::read_to_string(secrets_dir.join("bmp_token.txt"))
@@ -539,7 +556,6 @@ fn load_config(secrets_dir: &Path, apk_path: &Path) -> Result<LiveConfig, LiveEr
     let device_id = load_or_create_device_id(secrets_dir, &android)?;
 
     Ok(LiveConfig {
-        creds,
         material,
         bmp_token,
         app_version,
@@ -618,9 +634,7 @@ fn load_or_create_device_id(
     rng.fill_bytes(&mut rand_a);
     rng.fill_bytes(&mut rand_b);
     let device_id = generate_phone_util_device_id(&android.brand, &android.model, &rand_a, &rand_b);
-    std::fs::write(&path, &device_id)
-        .map_err(|e| LiveError::Config(format!("write {}: {e}", path.display())))?;
-    restrict_permissions(&path);
+    atomic_write_private(&path, device_id.as_bytes(), false)?;
     Ok(device_id)
 }
 
@@ -984,6 +998,40 @@ struct AtopResponse {
     raw: serde_json::Value,
 }
 
+#[derive(Debug)]
+enum BoundedBodyReadError {
+    DeclaredTooLarge,
+    StreamTooLarge,
+    Io(std::io::Error),
+}
+
+/// Read at most `max_bytes`, checking both an optional declared length and the
+/// bytes that actually arrive. The streamed check is authoritative because
+/// chunked responses have no `Content-Length`, and a peer can misdeclare it.
+fn read_bounded_body<R: Read>(
+    mut reader: R,
+    declared_length: Option<u64>,
+    max_bytes: usize,
+) -> Result<Vec<u8>, BoundedBodyReadError> {
+    if declared_length.is_some_and(|length| length > max_bytes as u64) {
+        return Err(BoundedBodyReadError::DeclaredTooLarge);
+    }
+
+    let initial_capacity = declared_length.unwrap_or_default().min(max_bytes as u64) as usize;
+    let mut body = Vec::with_capacity(initial_capacity);
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        let bytes_read = reader.read(&mut chunk).map_err(BoundedBodyReadError::Io)?;
+        if bytes_read == 0 {
+            return Ok(body);
+        }
+        if bytes_read > max_bytes.saturating_sub(body.len()) {
+            return Err(BoundedBodyReadError::StreamTooLarge);
+        }
+        body.extend_from_slice(&chunk[..bytes_read]);
+    }
+}
+
 /// POST a signed atop request and parse the response envelope.
 ///
 /// The SDK posts to `/api.json` with no query string; `ApiParams.getRequestBody()`
@@ -997,6 +1045,32 @@ fn send_atop(
     params: &BTreeMap<String, String>,
     wire_post_data: Option<&str>,
     ecode: Option<&str>,
+) -> Result<AtopResponse, LiveError> {
+    send_atop_with_debug_capture(client, host, cfg, params, wire_post_data, ecode, true)
+}
+
+/// Firmware acquisitions carry their raw endpoint responses inside the staged
+/// provenance directory. Suppress the global last-call debug file so a failed
+/// acquisition cannot leave partial response material outside that directory.
+fn send_atop_without_debug_capture(
+    client: &reqwest::blocking::Client,
+    host: &str,
+    cfg: &LiveConfig,
+    params: &BTreeMap<String, String>,
+    wire_post_data: Option<&str>,
+    ecode: Option<&str>,
+) -> Result<AtopResponse, LiveError> {
+    send_atop_with_debug_capture(client, host, cfg, params, wire_post_data, ecode, false)
+}
+
+fn send_atop_with_debug_capture(
+    client: &reqwest::blocking::Client,
+    host: &str,
+    cfg: &LiveConfig,
+    params: &BTreeMap<String, String>,
+    wire_post_data: Option<&str>,
+    ecode: Option<&str>,
+    capture_debug: bool,
 ) -> Result<AtopResponse, LiveError> {
     let url = format!("https://{host}{ATOP_PATH}");
 
@@ -1026,31 +1100,47 @@ fn send_atop(
         .send()
         .map_err(|e| LiveError::Network(format!("POST {url}: {}", scrub_url_secrets(&e))))?;
     let status = resp.status();
-    let text = resp
-        .text()
-        .map_err(|e| LiveError::Network(format!("read body: {}", scrub_url_secrets(&e))))?;
+    let declared_length = resp.content_length();
+    let body = read_bounded_body(resp, declared_length, MAX_ATOP_RESPONSE_BYTES).map_err(
+        |error| match error {
+            BoundedBodyReadError::DeclaredTooLarge => LiveError::Protocol(format!(
+                "atop response Content-Length exceeds the {MAX_ATOP_RESPONSE_BYTES}-byte limit (HTTP {status})"
+            )),
+            BoundedBodyReadError::StreamTooLarge => LiveError::Protocol(format!(
+                "atop response body exceeds the {MAX_ATOP_RESPONSE_BYTES}-byte limit (HTTP {status})"
+            )),
+            BoundedBodyReadError::Io(error) => LiveError::Network(format!(
+                "read bounded atop body: {:?}",
+                error.kind()
+            )),
+        },
+    )?;
+    let text = String::from_utf8(body)
+        .map_err(|_| LiveError::Protocol(format!("non-UTF-8 atop response (HTTP {status})")))?;
 
     // Diagnostic capture to secrets/ ONLY (the request envelope carries the
     // appKey/sign — both secret-by-policy — so it must never hit stdout/logs).
     // This is the single source of truth for debugging a routing/sign rejection
     // without ever echoing a value. Overwritten each call (last-call wins).
-    {
+    if capture_debug {
         let mut form_param_keys = Vec::new();
         if wire_post_data.is_some() {
             form_param_keys.push("postData".to_string());
         }
         form_param_keys.extend(params.keys().cloned());
-        let dbg = serde_json::json!({
+        let debug_capture = serde_json::json!({
             "host": host,
             "form_param_keys": form_param_keys,
             "http_status": status.as_u16(),
             "response_body": text,
         });
-        let path = cfg.secrets_dir.join("tuya_live_debug.json");
-        if let Ok(bytes) = serde_json::to_vec_pretty(&dbg) {
-            let _ = std::fs::write(&path, bytes);
-            restrict_permissions(&path);
-        }
+        let debug_bytes = serde_json::to_vec_pretty(&debug_capture)
+            .map_err(|error| LiveError::Config(format!("serialize atop debug capture: {error}")))?;
+        atomic_write_private(
+            &cfg.secrets_dir.join("tuya_live_debug.json"),
+            &debug_bytes,
+            true,
+        )?;
     }
 
     let outer: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
@@ -1303,9 +1393,10 @@ fn do_token_get(
     client: &reqwest::blocking::Client,
     host: &str,
     cfg: &LiveConfig,
+    creds: &LoginCreds,
 ) -> Result<TokenBean, LiveError> {
     // postData: countryCode + username(email) + isUid=false (§2 step 1).
-    let post_data = token_get_post_data(COUNTRY_CODE_DK, &cfg.creds.email);
+    let post_data = token_get_post_data(COUNTRY_CODE_DK, &creds.email);
 
     let (envelope, body) =
         build_signed_envelope(cfg, TOKEN_GET_ACTION, TOKEN_GET_VERSION, &post_data)?;
@@ -1421,14 +1512,15 @@ fn do_password_login(
     client: &reqwest::blocking::Client,
     host: &str,
     cfg: &LiveConfig,
+    creds: &LoginCreds,
     token: &TokenBean,
     mfa_code: &str,
 ) -> Result<LoginResult, LiveError> {
-    let enc_password = rsa_encrypt_password(token, &cfg.creds.password)?;
+    let enc_password = rsa_encrypt_password(token, &creds.password)?;
 
     let post_data = password_login_post_data(
         COUNTRY_CODE_DK,
-        &cfg.creds.email,
+        &creds.email,
         &enc_password,
         &token.token,
         mfa_code,
@@ -1509,15 +1601,12 @@ fn do_mfa_code_get(
     client: &reqwest::blocking::Client,
     host: &str,
     cfg: &LiveConfig,
+    creds: &LoginCreds,
     token: &TokenBean,
 ) -> Result<serde_json::Value, LiveError> {
-    let enc_password = rsa_encrypt_password(token, &cfg.creds.password)?;
-    let post_data = mfa_code_get_post_data(
-        COUNTRY_CODE_DK,
-        &cfg.creds.email,
-        &enc_password,
-        &token.token,
-    );
+    let enc_password = rsa_encrypt_password(token, &creds.password)?;
+    let post_data =
+        mfa_code_get_post_data(COUNTRY_CODE_DK, &creds.email, &enc_password, &token.token);
     let (envelope, body) =
         build_signed_envelope(cfg, MFA_CODE_GET_ACTION, MFA_CODE_GET_VERSION, &post_data)?;
     let resp = send_atop(client, host, cfg, &envelope, Some(&body), None)?;
@@ -1538,9 +1627,8 @@ fn do_mfa_code_get(
 ///   instruction (it does NOT hang and NEVER fabricates a code).
 ///
 /// The code value is a secret-by-policy account credential: it is never logged.
-fn read_mfa_code(cfg: &LiveConfig) -> Result<Option<String>, LiveError> {
-    let Some(rel) = cfg
-        .creds
+fn read_mfa_code(creds: &LoginCreds) -> Result<Option<String>, LiveError> {
+    let Some(rel) = creds
         .twofa_code_file
         .as_deref()
         .map(str::trim)
@@ -1572,8 +1660,8 @@ fn read_mfa_code(cfg: &LiveConfig) -> Result<Option<String>, LiveError> {
 
 /// The path to the MFA-code file, for the operator-facing "put the code here"
 /// instruction. NOT a secret (a path); returns a placeholder if unset.
-fn mfa_code_file_hint(cfg: &LiveConfig) -> String {
-    cfg.creds
+fn mfa_code_file_hint(creds: &LoginCreds) -> String {
+    creds
         .twofa_code_file
         .clone()
         .unwrap_or_else(|| "secrets/tuya_2fa.txt".to_string())
@@ -1592,24 +1680,9 @@ fn capture_to_secrets(
     let path = cfg.secrets_dir.join(name);
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|e| LiveError::Config(format!("serialize {name}: {e}")))?;
-    std::fs::write(&path, bytes)
-        .map_err(|e| LiveError::Config(format!("write {}: {e}", path.display())))?;
-    restrict_permissions(&path);
+    atomic_write_private(&path, &bytes, true)?;
     Ok(())
 }
-
-#[cfg(unix)]
-fn restrict_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(meta) = std::fs::metadata(path) {
-        let mut perms = meta.permissions();
-        perms.set_mode(0o600);
-        let _ = std::fs::set_permissions(path, perms);
-    }
-}
-
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) {}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PROBE-ONLY path (TASK-0048 Stage B): ONE token.get to ONE host, then STOP.
@@ -1638,6 +1711,7 @@ pub fn run_token_get_probe(
     corrupt_sign: bool,
 ) -> Result<ProbeOutcome, LiveError> {
     let cfg = load_config(secrets_dir, apk_path)?;
+    let creds: LoginCreds = read_secret_json(&secrets_dir.join("tuya_login.json"))?;
     eprintln!("probe: config loaded (all secret values withheld).");
 
     // Non-account reachability check first (NOT a signed call).
@@ -1650,6 +1724,7 @@ pub fn run_token_get_probe(
     );
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(user_agent)
         .build()
         .map_err(|e| LiveError::Network(format!("build http client: {e}")))?;
@@ -1660,7 +1735,7 @@ pub fn run_token_get_probe(
     // and we must NOT treat a server error as a hard failure that hides the code.
     let post_data = serde_json::json!({
         "countryCode": COUNTRY_CODE_DK,
-        "username": cfg.creds.email,
+        "username": creds.email,
         "isUid": false,
     })
     .to_string();
@@ -1728,16 +1803,50 @@ pub fn run_token_get_probe(
 /// Resolve the atop host for the injected session. The login `User` carries
 /// `domain.mobileApiUrl` (persisted as [`Session::mobile_api_base`]); that is the
 /// authoritative gateway for every subsequent call (`re/tuya_cloud_auth.md` §4).
-/// We parse its host; if it is empty/unparseable we fall back to the EU gateway.
-/// NOT a secret (region-revealing only).
-fn host_from_mobile_api_base(mobile_api_base: &str) -> String {
+/// Session data is untrusted, so the URL must be HTTPS, carry no credentials or
+/// query/fragment, use only `/` or `/api.json`, and name an exact host observed
+/// in the app's decrypted region table. Invalid input fails closed; there is no
+/// implicit regional fallback. NOT a secret (region-revealing only).
+pub(super) fn host_from_mobile_api_base(mobile_api_base: &str) -> Result<String, LiveError> {
     // reqwest re-exports the `url` crate as `reqwest::Url`, so we parse without
     // adding a separate dependency (this fn is live-feature-only anyway).
-    reqwest::Url::parse(mobile_api_base)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_string))
-        .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| EU_ATOP_HOST.to_string())
+    let url = reqwest::Url::parse(mobile_api_base).map_err(|_| {
+        LiveError::Config("session mobileApiUrl is not a valid absolute URL".into())
+    })?;
+    if url.scheme() != "https" {
+        return Err(LiveError::Config(
+            "session mobileApiUrl must use HTTPS".into(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(LiveError::Config(
+            "session mobileApiUrl must not contain userinfo".into(),
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(LiveError::Config(
+            "session mobileApiUrl must not contain a query or fragment".into(),
+        ));
+    }
+    if url.port().is_some_and(|port| port != 443) {
+        return Err(LiveError::Config(
+            "session mobileApiUrl must not use a non-443 port".into(),
+        ));
+    }
+    if !matches!(url.path(), "/" | ATOP_PATH) {
+        return Err(LiveError::Config(
+            "session mobileApiUrl path must be / or /api.json".into(),
+        ));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| LiveError::Config("session mobileApiUrl must contain a DNS host".into()))?;
+    if !ALLOWED_MOBILE_ATOP_HOSTS.contains(&host) {
+        return Err(LiveError::Config(
+            "session mobileApiUrl host is not app-evidenced".into(),
+        ));
+    }
+    Ok(host.to_string())
 }
 
 /// Drive `device.list` using a SEPARATELY-CAPTURED session injected into the
@@ -1778,7 +1887,7 @@ pub fn run_injected_device_list(
     eprintln!("live: config + injected session loaded (all secret values withheld).");
 
     // The injected session pins the gateway (User.domain.mobileApiUrl).
-    let host = host_from_mobile_api_base(&session.mobile_api_base);
+    let host = host_from_mobile_api_base(&session.mobile_api_base)?;
 
     // Non-account reachability check (NOT a signed call).
     probe_host(&host)?;
@@ -1790,6 +1899,7 @@ pub fn run_injected_device_list(
     );
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(user_agent)
         .build()
         .map_err(|e| LiveError::Network(format!("build http client: {e}")))?;
@@ -1856,7 +1966,7 @@ pub fn fetch_rtc_config(
         })?;
 
     let cfg = load_config(secrets_dir, apk_path)?;
-    let host = host_from_mobile_api_base(&session.mobile_api_base);
+    let host = host_from_mobile_api_base(&session.mobile_api_base)?;
     probe_host(&host)?;
     eprintln!(
         "live: rtc.config.get — host {host} reachable; fetching camera config (values withheld)."
@@ -1868,6 +1978,7 @@ pub fn fetch_rtc_config(
     );
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(user_agent)
         .build()
         .map_err(|e| LiveError::Network(format!("build http client: {e}")))?;
@@ -1894,6 +2005,543 @@ pub fn fetch_rtc_config(
     }
     eprintln!("live: rtc.config.get OK (camera config captured to secrets/tuya_rtc_config.json).");
     Ok(resp.result)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PrivateEntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+/// A validated private directory held open for an entire transaction. All
+/// child operations are basename-relative, preventing an ancestor-path swap
+/// from redirecting credentials, captures, or firmware bytes after validation.
+pub(super) struct PinnedPrivateDirectory {
+    path: PathBuf,
+    #[cfg(unix)]
+    file: File,
+    #[cfg(test)]
+    fail_next_sync: std::cell::Cell<bool>,
+}
+
+impl PinnedPrivateDirectory {
+    pub(super) fn open(path: &Path, make_private: bool) -> Result<Self, LiveError> {
+        #[cfg(unix)]
+        {
+            let fd = rustix::fs::open(
+                path,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(private_errno_to_io)
+            .map_err(|error| {
+                LiveError::Config(format!(
+                    "open private directory {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let file = File::from(fd);
+            let metadata = file.metadata().map_err(|error| {
+                LiveError::Config(format!("inspect private directory descriptor: {error}"))
+            })?;
+            if !metadata.is_dir() {
+                return Err(LiveError::Config(
+                    "private directory descriptor is not a directory".into(),
+                ));
+            }
+            if make_private {
+                rustix::fs::fchmod(&file, rustix::fs::Mode::RWXU)
+                    .map_err(private_errno_to_io)
+                    .map_err(|error| {
+                        LiveError::Config(format!("set private directory mode to 0700: {error}"))
+                    })?;
+            }
+            Ok(Self {
+                path: path.to_path_buf(),
+                file,
+                #[cfg(test)]
+                fail_next_sync: std::cell::Cell::new(false),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+                LiveError::Config(format!(
+                    "inspect private directory {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(LiveError::Config(
+                    "private directory path must be a real directory, not a symlink".into(),
+                ));
+            }
+            let _ = make_private;
+            Ok(Self {
+                path: path.to_path_buf(),
+                #[cfg(test)]
+                fail_next_sync: std::cell::Cell::new(false),
+            })
+        }
+    }
+
+    pub(super) fn create_child_directory(
+        &self,
+        name: &OsStr,
+    ) -> Result<PinnedPrivateDirectory, LiveError> {
+        #[cfg(unix)]
+        {
+            rustix::fs::mkdirat(&self.file, name, rustix::fs::Mode::RWXU)
+                .map_err(private_errno_to_io)
+                .map_err(|error| {
+                    LiveError::Config(format!("create private child directory: {error}"))
+                })?;
+            self.sync()?;
+            let child = self
+                .open_child_directory(name, true)?
+                .ok_or_else(|| LiveError::Config("new private child disappeared".into()))?;
+            child.sync()?;
+            Ok(child)
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(name);
+            std::fs::create_dir(&path).map_err(|error| {
+                LiveError::Config(format!("create private child directory: {error}"))
+            })?;
+            Self::open(&path, true)
+        }
+    }
+
+    pub(super) fn ensure_child_directory(
+        &self,
+        name: &OsStr,
+    ) -> Result<PinnedPrivateDirectory, LiveError> {
+        match self.open_child_directory(name, true)? {
+            Some(child) => Ok(child),
+            None => self.create_child_directory(name),
+        }
+    }
+
+    fn open_child_directory(
+        &self,
+        name: &OsStr,
+        make_private: bool,
+    ) -> Result<Option<PinnedPrivateDirectory>, LiveError> {
+        #[cfg(unix)]
+        {
+            let fd = match rustix::fs::openat(
+                &self.file,
+                name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(error) => {
+                    return Err(LiveError::Config(format!(
+                        "open private child directory: {}",
+                        private_errno_to_io(error)
+                    )))
+                }
+            };
+            let file = File::from(fd);
+            if make_private {
+                rustix::fs::fchmod(&file, rustix::fs::Mode::RWXU)
+                    .map_err(private_errno_to_io)
+                    .map_err(|error| {
+                        LiveError::Config(format!("set private child mode to 0700: {error}"))
+                    })?;
+            }
+            Ok(Some(PinnedPrivateDirectory {
+                path: self.path.join(name),
+                file,
+                #[cfg(test)]
+                fail_next_sync: std::cell::Cell::new(false),
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(name);
+            match std::fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(LiveError::Config(format!(
+                    "inspect private child directory: {error}"
+                ))),
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(
+                    LiveError::Config("private child is not a real directory".into()),
+                ),
+                Ok(_) => Self::open(&path, make_private).map(Some),
+            }
+        }
+    }
+
+    pub(super) fn entry_kind(&self, name: &OsStr) -> Result<Option<PrivateEntryKind>, LiveError> {
+        #[cfg(unix)]
+        {
+            let stat =
+                match rustix::fs::statat(&self.file, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(stat) => stat,
+                    Err(rustix::io::Errno::NOENT) => return Ok(None),
+                    Err(error) => {
+                        return Err(LiveError::Config(format!(
+                            "inspect private child entry: {}",
+                            private_errno_to_io(error)
+                        )))
+                    }
+                };
+            let kind = match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
+                rustix::fs::FileType::RegularFile => PrivateEntryKind::File,
+                rustix::fs::FileType::Directory => PrivateEntryKind::Directory,
+                rustix::fs::FileType::Symlink => PrivateEntryKind::Symlink,
+                _ => PrivateEntryKind::Other,
+            };
+            Ok(Some(kind))
+        }
+        #[cfg(not(unix))]
+        {
+            let metadata = match std::fs::symlink_metadata(self.path.join(name)) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(LiveError::Config(format!(
+                        "inspect private child entry: {error}"
+                    )))
+                }
+            };
+            Ok(Some(if metadata.file_type().is_symlink() {
+                PrivateEntryKind::Symlink
+            } else if metadata.is_file() {
+                PrivateEntryKind::File
+            } else if metadata.is_dir() {
+                PrivateEntryKind::Directory
+            } else {
+                PrivateEntryKind::Other
+            }))
+        }
+    }
+
+    pub(super) fn create_new_private_file(&self, name: &OsStr) -> Result<File, LiveError> {
+        #[cfg(unix)]
+        let file = {
+            let fd = rustix::fs::openat(
+                &self.file,
+                name,
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::CREATE
+                    | rustix::fs::OFlags::EXCL
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )
+            .map_err(private_errno_to_io)
+            .map_err(|error| LiveError::Config(format!("create private child file: {error}")))?;
+            File::from(fd)
+        };
+        #[cfg(not(unix))]
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.path.join(name))
+            .map_err(|error| LiveError::Config(format!("create private child file: {error}")))?;
+        set_private_file_permissions(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn unlink_file(&self, name: &OsStr) -> Result<(), LiveError> {
+        #[cfg(unix)]
+        {
+            rustix::fs::unlinkat(&self.file, name, rustix::fs::AtFlags::empty())
+                .map_err(private_errno_to_io)
+                .map_err(|error| LiveError::Config(format!("remove private child file: {error}")))
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::remove_file(self.path.join(name))
+                .map_err(|error| LiveError::Config(format!("remove private child file: {error}")))
+        }
+    }
+
+    pub(super) fn remove_nondirectory_entries(&self) -> Result<(), LiveError> {
+        #[cfg(unix)]
+        {
+            let mut entries = rustix::fs::Dir::read_from(&self.file)
+                .map_err(private_errno_to_io)
+                .map_err(|error| {
+                    LiveError::Config(format!("read private staging directory: {error}"))
+                })?;
+            while let Some(entry) = entries.read() {
+                let entry = entry.map_err(private_errno_to_io).map_err(|error| {
+                    LiveError::Config(format!("read private staging entry: {error}"))
+                })?;
+                let name = entry.file_name();
+                if matches!(name.to_bytes(), b"." | b"..") {
+                    continue;
+                }
+                let stat =
+                    rustix::fs::statat(&self.file, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                        .map_err(private_errno_to_io)
+                        .map_err(|error| {
+                            LiveError::Config(format!("inspect private staging entry: {error}"))
+                        })?;
+                if rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                    == rustix::fs::FileType::Directory
+                {
+                    return Err(LiveError::Config(
+                        "private staging cleanup refuses nested directories".into(),
+                    ));
+                }
+                rustix::fs::unlinkat(&self.file, name, rustix::fs::AtFlags::empty())
+                    .map_err(private_errno_to_io)
+                    .map_err(|error| {
+                        LiveError::Config(format!("remove private staging entry: {error}"))
+                    })?;
+            }
+            self.sync()
+        }
+        #[cfg(not(unix))]
+        {
+            for entry in std::fs::read_dir(&self.path).map_err(|error| {
+                LiveError::Config(format!("read private staging directory: {error}"))
+            })? {
+                let entry = entry.map_err(|error| {
+                    LiveError::Config(format!("read private staging entry: {error}"))
+                })?;
+                let metadata = std::fs::symlink_metadata(entry.path()).map_err(|error| {
+                    LiveError::Config(format!("inspect private staging entry: {error}"))
+                })?;
+                if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    return Err(LiveError::Config(
+                        "private staging cleanup refuses nested directories".into(),
+                    ));
+                }
+                std::fs::remove_file(entry.path()).map_err(|error| {
+                    LiveError::Config(format!("remove private staging entry: {error}"))
+                })?;
+            }
+            Ok(())
+        }
+    }
+
+    pub(super) fn unlink_child_directory(&self, name: &OsStr) -> Result<(), LiveError> {
+        #[cfg(unix)]
+        rustix::fs::unlinkat(&self.file, name, rustix::fs::AtFlags::REMOVEDIR)
+            .map_err(private_errno_to_io)
+            .map_err(|error| {
+                LiveError::Config(format!("remove private child directory: {error}"))
+            })?;
+        #[cfg(not(unix))]
+        std::fs::remove_dir(self.path.join(name)).map_err(|error| {
+            LiveError::Config(format!("remove private child directory: {error}"))
+        })?;
+        Ok(())
+    }
+
+    pub(super) fn rename_noreplace(
+        &self,
+        source: &OsStr,
+        destination: &OsStr,
+    ) -> Result<(), LiveError> {
+        let source_kind = self
+            .entry_kind(source)?
+            .ok_or_else(|| LiveError::Config("private no-clobber source does not exist".into()))?;
+        if matches!(
+            source_kind,
+            PrivateEntryKind::Symlink | PrivateEntryKind::Other
+        ) {
+            return Err(LiveError::Config(
+                "private no-clobber source must be a regular file or directory".into(),
+            ));
+        }
+        if source_kind == PrivateEntryKind::Directory {
+            self.open_child_directory(source, false)?
+                .ok_or_else(|| LiveError::Config("private source directory disappeared".into()))?
+                .sync()?;
+        }
+        #[cfg(target_os = "linux")]
+        rustix::fs::renameat_with(
+            &self.file,
+            source,
+            &self.file,
+            destination,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(private_errno_to_io)
+        .map_err(|error| {
+            LiveError::Config(format!("publish private output without overwrite: {error}"))
+        })?;
+        #[cfg(not(target_os = "linux"))]
+        return Err(LiveError::Config(
+            "atomic no-clobber private publication requires Linux renameat2".into(),
+        ));
+        Ok(())
+    }
+
+    fn rename_replace(&self, source: &OsStr, destination: &OsStr) -> Result<(), LiveError> {
+        #[cfg(unix)]
+        rustix::fs::renameat(&self.file, source, &self.file, destination)
+            .map_err(private_errno_to_io)
+            .map_err(|error| LiveError::Config(format!("publish private output: {error}")))?;
+        #[cfg(not(unix))]
+        std::fs::rename(self.path.join(source), self.path.join(destination))
+            .map_err(|error| LiveError::Config(format!("publish private output: {error}")))?;
+        self.sync()
+    }
+
+    pub(super) fn sync(&self) -> Result<(), LiveError> {
+        #[cfg(test)]
+        if self.fail_next_sync.replace(false) {
+            return Err(LiveError::Config(
+                "injected private directory sync failure".into(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            rustix::fs::fsync(&self.file)
+                .map_err(private_errno_to_io)
+                .map_err(|error| LiveError::Config(format!("sync private directory: {error}")))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_sync_for_test(&self) {
+        self.fail_next_sync.set(true);
+    }
+
+    pub(super) fn atomic_write(
+        &self,
+        name: &OsStr,
+        bytes: &[u8],
+        replace: bool,
+    ) -> Result<(), LiveError> {
+        if replace
+            && matches!(
+                self.entry_kind(name)?,
+                Some(
+                    PrivateEntryKind::Symlink
+                        | PrivateEntryKind::Directory
+                        | PrivateEntryKind::Other
+                )
+            )
+        {
+            return Err(LiveError::Config(
+                "private output target must be absent or a regular non-symlink file".into(),
+            ));
+        }
+        let mut random = [0u8; 8];
+        OsRng.fill_bytes(&mut random);
+        let temporary = OsString::from(format!(
+            ".{}.part-{}",
+            name.to_string_lossy(),
+            hex::encode(random)
+        ));
+        let mut committed = false;
+        let result = (|| -> Result<(), LiveError> {
+            let mut file = self.create_new_private_file(&temporary)?;
+            file.write_all(bytes)
+                .map_err(|error| LiveError::Config(format!("write private output: {error}")))?;
+            file.sync_all()
+                .map_err(|error| LiveError::Config(format!("sync private output: {error}")))?;
+            drop(file);
+            if replace {
+                if matches!(
+                    self.entry_kind(name)?,
+                    Some(
+                        PrivateEntryKind::Symlink
+                            | PrivateEntryKind::Directory
+                            | PrivateEntryKind::Other
+                    )
+                ) {
+                    return Err(LiveError::Config(
+                        "refusing to replace a non-regular private output".into(),
+                    ));
+                }
+                self.rename_replace(&temporary, name)?;
+            } else {
+                self.rename_noreplace(&temporary, name)?;
+            }
+            committed = true;
+            self.sync()
+        })();
+        if result.is_err() && !committed {
+            let _ = self.unlink_file(&temporary);
+        }
+        result
+    }
+}
+
+#[cfg(unix)]
+fn private_errno_to_io(error: rustix::io::Errno) -> std::io::Error {
+    std::io::Error::from_raw_os_error(error.raw_os_error())
+}
+
+fn split_private_path(path: &Path) -> Result<(&Path, &OsStr), LiveError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| LiveError::Config("private path has no parent directory".to_string()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| LiveError::Config("private path has no filename".into()))?;
+    Ok((parent, name))
+}
+
+/// Ensure `path` is a real, mode-0700 private directory using a pinned parent
+/// descriptor for the inspect/create/open transaction.
+#[cfg(test)]
+fn ensure_private_directory(path: &Path) -> Result<(), LiveError> {
+    let (parent_path, name) = split_private_path(path)?;
+    let parent = PinnedPrivateDirectory::open(parent_path, false)?;
+    parent.ensure_child_directory(name).map(|_| ())
+}
+
+/// Create one new private directory without accepting a pre-existing target.
+#[cfg(test)]
+fn create_private_directory(path: &Path) -> Result<(), LiveError> {
+    let (parent_path, name) = split_private_path(path)?;
+    let parent = PinnedPrivateDirectory::open(parent_path, false)?;
+    parent.create_child_directory(name).map(|_| ())
+}
+
+fn atomic_write_private(path: &Path, bytes: &[u8], replace: bool) -> Result<(), LiveError> {
+    let (parent_path, name) = split_private_path(path)?;
+    let parent = PinnedPrivateDirectory::open(parent_path, false)?;
+    parent.atomic_write(name, bytes, replace)
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(file: &std::fs::File) -> Result<(), LiveError> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| LiveError::Config(format!("set private file permissions: {error}")))?;
+    let mode = file
+        .metadata()
+        .map_err(|error| LiveError::Config(format!("verify private output: {error}")))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode != 0o600 {
+        return Err(LiveError::Config(format!(
+            "private output mode is {mode:o}, expected 600"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_file: &std::fs::File) -> Result<(), LiveError> {
+    Ok(())
 }
 
 /// Build + send the signed `rtc.config.get` for one `dev_id`. Split out so the
@@ -2029,6 +2677,7 @@ pub fn run_live_login(
     host_override: Option<&str>,
 ) -> Result<LiveOutcome, LiveError> {
     let cfg = load_config(secrets_dir, apk_path)?;
+    let creds: LoginCreds = read_secret_json(&secrets_dir.join("tuya_login.json"))?;
 
     eprintln!("live: config loaded (all secret values withheld).");
 
@@ -2052,6 +2701,7 @@ pub fn run_live_login(
     );
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(user_agent)
         .build()
         .map_err(|e| LiveError::Network(format!("build http client: {e}")))?;
@@ -2061,7 +2711,7 @@ pub fn run_live_login(
     // and STOP; run 2 has the pasted code and logs in WITHOUT re-emailing. Reading
     // it before any network call also fails fast on a config error (no
     // twofa_code_file). The value is secret-by-policy and never logged.
-    let code = read_mfa_code(&cfg)?;
+    let code = read_mfa_code(&creds)?;
     eprintln!(
         "live: operator MFA code present in file: {} (value withheld).",
         code.is_some()
@@ -2071,7 +2721,7 @@ pub fn run_live_login(
     // A sign rejection here means the candidate signer (master key G, incl.
     // bmp_token) is WRONG → STOP (no password.login, no retry/sweep).
     eprintln!("live: sending token.get (sign oracle; HMAC-SHA256(G, str2))...");
-    let token = match do_token_get(&client, host, &cfg) {
+    let token = match do_token_get(&client, host, &cfg, &creds) {
         Ok(t) => t,
         Err(e @ LiveError::SignRejected { .. }) => {
             eprintln!("live: token.get SIGN REJECTED — candidate signer needs revisiting. STOP.");
@@ -2098,7 +2748,7 @@ pub fn run_live_login(
             "empty"
         }
     );
-    let login = do_password_login(&client, host, &cfg, &token, mfa_code)?;
+    let login = do_password_login(&client, host, &cfg, &creds, &token, mfa_code)?;
 
     match decide_post_login(login, code.is_some()) {
         PostLoginAction::Finish(user) => {
@@ -2109,7 +2759,7 @@ pub fn run_live_login(
             // ── Step 4: the server demands the email code be (re)sent. Email it ─
             // EXACTLY ONCE, then STOP and ask the operator to (re-)run with the
             // code. No unbounded poll/sleep — the two-run model converges.
-            send_mfa_code_then_stop(&client, host, &cfg, code_was_stale)
+            send_mfa_code_then_stop(&client, host, &cfg, &creds, code_was_stale)
         }
     }
 }
@@ -2150,6 +2800,7 @@ fn send_mfa_code_then_stop(
     client: &reqwest::blocking::Client,
     host: &str,
     cfg: &LiveConfig,
+    creds: &LoginCreds,
     code_was_stale: bool,
 ) -> Result<LiveOutcome, LiveError> {
     eprintln!("live: server requires MFA (MFA_NEED_SEND_CODE). Emailing the code ONCE...");
@@ -2160,13 +2811,13 @@ fn send_mfa_code_then_stop(
 
     // (b) a FRESH token.get, then mfa.code.get (mfaCode:"null") → server emails it.
     eprintln!("live: refreshing token.get for mfa.code.get...");
-    let token_mfa = do_token_get(client, host, cfg)?;
-    let mfa_raw = do_mfa_code_get(client, host, cfg, &token_mfa)?;
+    let token_mfa = do_token_get(client, host, cfg, creds)?;
+    let mfa_raw = do_mfa_code_get(client, host, cfg, creds, &token_mfa)?;
     // The mfa.code.get reply ({countryCode,email}) is account-PII → gitignored only.
     capture_to_secrets(cfg, "tuya_2fa_state.json", &mfa_raw)?;
 
     // (c) STOP with the exact operator instruction (embeds the twofa_code_file path).
-    let hint = mfa_code_file_hint(cfg);
+    let hint = mfa_code_file_hint(creds);
     eprintln!("live: {}", mfa_resend_message(&hint, code_was_stale));
     Ok(LiveOutcome::Needs2fa)
 }
@@ -2270,6 +2921,7 @@ fn persist_session(user: &serde_json::Value) -> Result<(), LiveError> {
 fn probe_host(host: &str) -> Result<(), LiveError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| LiveError::Network(format!("build probe client: {e}")))?;
     // A bare GET to the host root with no signed params is not an account call;
@@ -2529,11 +3181,6 @@ mod tests {
     /// synthetic native-shaped 16-hex value.
     fn synthetic_cfg() -> LiveConfig {
         LiveConfig {
-            creds: LoginCreds {
-                email: "user@example.com".into(),
-                password: "pw".into(),
-                twofa_code_file: None,
-            },
             material: SigningKeyMaterial {
                 app_key: "SYNTH_APPKEY_000000".into(),
                 app_secret: "SYNTH_APPSECRET_0000000000000000".into(),
@@ -3240,22 +3887,25 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let code_path = dir.join("code.txt");
 
-        let mut cfg = synthetic_cfg();
+        let mut creds = LoginCreds {
+            email: "user@example.com".into(),
+            password: "pw".into(),
+            twofa_code_file: None,
+        };
         // (a) twofa_code_file unset → Config error (loud, actionable).
-        cfg.creds.twofa_code_file = None;
-        assert!(matches!(read_mfa_code(&cfg), Err(LiveError::Config(_))));
+        assert!(matches!(read_mfa_code(&creds), Err(LiveError::Config(_))));
 
         // (b) file path set but missing → Ok(None) (STOP, no hang).
-        cfg.creds.twofa_code_file = Some(code_path.display().to_string());
-        assert!(matches!(read_mfa_code(&cfg), Ok(None)));
+        creds.twofa_code_file = Some(code_path.display().to_string());
+        assert!(matches!(read_mfa_code(&creds), Ok(None)));
 
         // (c) empty file → Ok(None).
         std::fs::write(&code_path, "   \n").unwrap();
-        assert!(matches!(read_mfa_code(&cfg), Ok(None)));
+        assert!(matches!(read_mfa_code(&creds), Ok(None)));
 
         // (d) non-empty (trimmed) → Ok(Some(code)).
         std::fs::write(&code_path, " 000000 \n").unwrap();
-        assert_eq!(read_mfa_code(&cfg).unwrap().as_deref(), Some("000000"));
+        assert_eq!(read_mfa_code(&creds).unwrap().as_deref(), Some("000000"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3504,6 +4154,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        create_private_directory(&dir).unwrap();
         let store = SessionStore::at(dir.join("session.json"));
         let out =
             run_injected_device_list(Path::new("secrets"), Path::new("nonexistent.apk"), &store)
@@ -3512,17 +4163,212 @@ mod tests {
             matches!(out, InjectedOutcome::NoSession),
             "no injected session must report NoSession (honest blocked), got {out:?}"
         );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
-    // host_from_mobile_api_base parses the gateway host and falls back to EU.
+    // Session routing fails closed: only exact app-evidenced HTTPS gateways and
+    // the two observed base paths are accepted.
     #[test]
-    fn host_from_mobile_api_base_parses_and_falls_back() {
+    fn host_from_mobile_api_base_accepts_only_evidenced_gateways() {
+        for host in ALLOWED_MOBILE_ATOP_HOSTS {
+            assert_eq!(
+                host_from_mobile_api_base(&format!("https://{host}/api.json")).unwrap(),
+                host
+            );
+            assert_eq!(
+                host_from_mobile_api_base(&format!("https://{host}/")).unwrap(),
+                host
+            );
+        }
         assert_eq!(
-            host_from_mobile_api_base("https://a1.tuyaeu.com/api.json"),
-            "a1.tuyaeu.com"
+            host_from_mobile_api_base("https://a1.tuyaeu.com:443/api.json").unwrap(),
+            EU_ATOP_HOST
         );
-        // Empty / unparseable → EU fallback (never panics, never an empty host).
-        assert_eq!(host_from_mobile_api_base(""), EU_ATOP_HOST);
-        assert_eq!(host_from_mobile_api_base("not a url"), EU_ATOP_HOST);
+    }
+
+    #[test]
+    fn host_from_mobile_api_base_rejects_unsafe_or_unknown_urls() {
+        for value in [
+            "",
+            "not a url",
+            "http://a1.tuyaeu.com/api.json",
+            "https://a1.tuyaeu.com:444/api.json",
+            "https://a1.tuyaeu.com/api.json?redirect=evil",
+            "https://a1.tuyaeu.com/api.json#fragment",
+            "https://a1.tuyaeu.com/other",
+            "https://a1.tuyaeu.com//api.json",
+            "https://a1.tuyaeu.com.evil.example/api.json",
+            "https://a1.tuyaeu.com./api.json",
+            "https://127.0.0.1/api.json",
+        ] {
+            assert!(
+                host_from_mobile_api_base(value).is_err(),
+                "unsafe mobileApiUrl unexpectedly accepted: {value}"
+            );
+        }
+        for value in [
+            format!("https://{}{}a1.tuyaeu.com/api.json", "user", '\u{40}'),
+            format!(
+                "https://{}:{}{}a1.tuyaeu.com/api.json",
+                "user", "pass", '\u{40}'
+            ),
+        ] {
+            assert!(
+                host_from_mobile_api_base(&value).is_err(),
+                "mobileApiUrl userinfo unexpectedly accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_body_accepts_exact_limit_and_rejects_declared_oversize() {
+        let body = vec![b'x'; 32];
+        assert_eq!(
+            read_bounded_body(body.as_slice(), Some(32), 32).unwrap(),
+            body
+        );
+        assert!(matches!(
+            read_bounded_body([b'x'; 1].as_slice(), Some(33), 32),
+            Err(BoundedBodyReadError::DeclaredTooLarge)
+        ));
+    }
+
+    #[test]
+    fn bounded_body_rejects_oversized_chunked_stream() {
+        struct ChunkedReader {
+            bytes: Vec<u8>,
+            offset: usize,
+            chunk_size: usize,
+        }
+
+        impl Read for ChunkedReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.offset == self.bytes.len() {
+                    return Ok(0);
+                }
+                let count = self
+                    .chunk_size
+                    .min(buffer.len())
+                    .min(self.bytes.len() - self.offset);
+                buffer[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
+                self.offset += count;
+                Ok(count)
+            }
+        }
+
+        let reader = ChunkedReader {
+            bytes: vec![b'x'; 33],
+            offset: 0,
+            chunk_size: 3,
+        };
+        assert!(matches!(
+            read_bounded_body(reader, None, 32),
+            Err(BoundedBodyReadError::StreamTooLarge)
+        ));
+    }
+
+    fn private_test_directory(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "babymonitor-live-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        ensure_private_directory(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn private_no_clobber_publish_has_exactly_one_concurrent_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let root = private_test_directory("atomic-race");
+        let target = Arc::new(root.join("capture.json"));
+        let barrier = Arc::new(Barrier::new(8));
+        let handles = (0..8)
+            .map(|writer| {
+                let target = Arc::clone(&target);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    atomic_write_private(
+                        target.as_ref(),
+                        format!("writer-{writer}").as_bytes(),
+                        false,
+                    )
+                    .is_ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        let winners = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1, "no-clobber publication must have one winner");
+        assert!(std::fs::read_to_string(target.as_ref())
+            .unwrap()
+            .starts_with("writer-"));
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".part-")
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_replace_rejects_symlink_without_touching_victim() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = private_test_directory("replace-symlink");
+        let victim = root.join("victim");
+        std::fs::write(&victim, b"unchanged").unwrap();
+        let target = root.join("capture.json");
+        symlink(&victim, &target).unwrap();
+        assert!(atomic_write_private(&target, b"private", true).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
+        assert!(std::fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        std::fs::remove_file(&target).unwrap();
+        atomic_write_private(&target, b"private", false).unwrap();
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_private_directory_cannot_be_redirected_by_ancestor_swap() {
+        let container = private_test_directory("descriptor-parent-swap");
+        let visible = container.join("visible");
+        create_private_directory(&visible).unwrap();
+        let pinned = PinnedPrivateDirectory::open(&visible, true).unwrap();
+
+        let moved = container.join("moved");
+        std::fs::rename(&visible, &moved).unwrap();
+        create_private_directory(&visible).unwrap();
+
+        pinned
+            .atomic_write(OsStr::new("capture.json"), b"private", false)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(moved.join("capture.json")).unwrap(),
+            b"private"
+        );
+        assert!(!visible.join("capture.json").exists());
+
+        std::fs::remove_dir_all(container).unwrap();
     }
 }

@@ -106,6 +106,12 @@ pub enum Error {
     #[error("stream config error: {0}")]
     StreamConfig(String),
 
+    /// A read-only firmware metadata/acquisition operation failed. The message
+    /// is redacted and may name a private local provenance path, but never a
+    /// signed URL, device identifier, digest, or server-supplied message.
+    #[error("firmware acquisition error: {0}")]
+    Firmware(String),
+
     /// The SDP `a=aes-key:<hex>` media-key codec failed: malformed hex, an
     /// oversized key (native max 23 bytes), or a missing `a=aes-key`/
     /// `m=application` section (`re/webrtc_session.md` §3c).

@@ -56,6 +56,20 @@ the public RE community. Two parts carry the project:
   (plain MD5 over underscore-joined parts), recovered to byte level from the native libs;
   login is the APK-faithful `token.get → password.login → email-MFA` flow. See
   [`re/tuya_cloud_auth.md`](re/tuya_cloud_auth.md) and [`re/tuya_sign_static.md`](re/tuya_sign_static.md).
+- **Firmware WIP — read-only OTA metadata + unconfirmed candidate downloader.** An authorized live query
+  reached the same primary and legacy metadata APIs used by the app; both returned a
+  no-offer response with server-reported channel versions and no package URL. No newer live
+  query was made after hardening because the session available during that validation had
+  expired; that earlier result remains the live evidence. The separate downloader is
+  implemented without an OTA-confirm call. It rejects expired/near-expiry sessions and non-app-evidenced
+  gateways, caps metadata responses, requires production HTTPS with redirects disabled,
+  and preserves each successful or package-stage failure as a private, provenance-bearing
+  acquisition. Secret/session transactions remain relative to validated, pinned directory
+  descriptors; Linux publication uses durable atomic no-clobber semantics and fails closed
+  where that primitive is unavailable. The transfer path is loopback-tested, but a real
+  offered package/CDN transfer has not yet been observed. This neither provides the camera's
+  installed flash bytes nor rules out an undiscovered archive surface. See
+  [`re/firmware_ota.md`](re/firmware_ota.md).
 
 The recovered transport matches independent public Tuya WebRTC projects
 field-for-field. Both carriers are live-proven against the owner's camera. In the
@@ -70,7 +84,7 @@ recovery if a reset rotates `localKey`—is not yet cloud-free.
 
 - **`babymonitor-core`** — the cloud request signer, the session store, the device/camera
   models, and the WebRTC-over-MQTT protocol layer.
-- **`babymonitor-cli`** — a CLI viewer (`auth`, `devices`, `stream`), human + `--json`
+- **`babymonitor-cli`** — a CLI viewer (`auth`, `devices`, `stream`, `firmwareWIP`), human + `--json`
   output, secret/PII fields redacted by default.
 
 The offline surface (`auth`/`devices` against fixtures, `stream --replay-annexb`) runs

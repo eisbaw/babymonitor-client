@@ -44,6 +44,11 @@ exchange now run **live end-to-end** against the real SCD921 (Superseded 2026-06
 v0.1.0-live-stream / TASK-0083 DONE); the only residual is that no captured CONNECT
 exists to byte-diff the credential output against.
 
+That paragraph describes the captured APK exchange. The Rust live driver now
+selects one real carrier: cloud mode emits only `path:"mqtt"` through MQTT, while
+LAN mode emits only `path:"lan"` through authenticated local frame type 32. It no
+longer sends a LAN-labelled duplicate through the MQTT socket.
+
 ---
 
 ## 1. The outer MQTT 302 frame
@@ -298,15 +303,16 @@ gitignored capture when present + a committed redacted fixture):
 **Round-trip-tested but NOT byte-validated against captured ciphertext** (cap3
 logged decrypted plaintext only, no raw frame): the AES→base64→outer-frame layer.
 
-**Connect orchestration WIRED, offline-validated against a mock transport**
-(`stream::session::MqttSignalingSession`, TASK-0069): the engine-free, transport-
-generic layer that frames+publishes the offer + trickle candidates over `mqtt`+`lan`
-and decrypts+parses inbound 302 frames into `InboundSignal` (Answer / RemoteCandidate
-/ Disconnect). `negotiate()` runs the full offer→trickle→answer exchange and returns
-the camera `ParsedAnswer` (media aes-key + ICE ufrag/pwd + relays). The live entry
-point is `stream::transport::connect_and_negotiate` (RumqttcTransport::connect →
-subscribe device 302 topic → negotiate). Nine offline tests exercise publish/poll/
-answer/timeout/disconnect through a fake in-memory transport with NO broker.
+**Connect orchestration WIRED, offline-validated against injected transports**
+(`stream::session::SignalingSession`): the engine-free generic layer publishes
+the offer + trickle candidates once over its selected carrier and parses inbound
+JSON into `InboundSignal` (Answer / RemoteCandidate / Disconnect). MQTT framing
+lives in `MqttSignalingTransport`; authenticated local frame type 32 lives in
+`Lan302Transport`. `negotiate()` runs the full offer→trickle→answer exchange and
+returns the camera `ParsedAnswer` (media aes-key + ICE ufrag/pwd + relays). The
+cloud entry point is `stream::transport::connect_and_negotiate`; LAN is selected
+by `babymonitor-cli stream --signaling lan`. Offline tests exercise both paths
+without a broker or camera.
 
 **Open / live-gated:**
 - The **TLS:8883 broker connect + MQTT-302 signaling round-trip** (AC#1/AC#3) is now

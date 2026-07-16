@@ -1,5 +1,6 @@
-//! The MQTT **302** signaling envelope codec — the *inner* (decrypted) JSON
-//! (`re/webrtc_session.md` §2 + the cap3 ground-truth `signaling_plaintext.jsonl`).
+//! The **302** signaling envelope codec — the inner JSON after MQTT or LAN
+//! carrier framing/authentication (`re/webrtc_session.md` §2 + the cap3
+//! ground-truth `signaling_plaintext.jsonl`).
 //!
 //! # cap3 correction (the real wire shape)
 //!
@@ -23,7 +24,7 @@
 //! top level). A `candidate` message is `{header, msg:{candidate:"a=candidate:…"}}`.
 //!
 //! The offer/answer SDP rides in `msg.sdp`; the offerer's gathered ICE candidates
-//! ride as separate `candidate` messages over `path:"mqtt"` AND `path:"lan"`.
+//! ride as separate `candidate` messages on the explicitly selected carrier.
 //!
 //! # Grounding
 //!
@@ -58,8 +59,9 @@ pub enum SignalingType {
 
 /// The signaling path a 302 message rides (`header.path`).
 ///
-/// The offer + each candidate are sent over **both** `mqtt` (cloud relay) and
-/// `lan` (local discovery) in cap3; the answer comes back over `mqtt`.
+/// Captures may contain both `mqtt` (cloud relay) and `lan` (local) copies. A
+/// live [`super::session::SignalingSession`] emits exactly one copy using its
+/// selected carrier's path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SignalingPath {
@@ -279,9 +281,8 @@ impl SignalingEnvelope {
     }
 }
 
-/// Inputs to build an `offer`/`candidate` envelope. The routing ids + SDP/ICE
-/// come from the session; `path` is set per emit (the offer + each candidate are
-/// emitted once per [`SignalingPath`]).
+/// Inputs to build an `offer` envelope. The routing ids + SDP/ICE come from the
+/// session; `path` is set when the selected carrier emits the envelope.
 #[derive(Debug, Clone)]
 pub struct OfferEnvelopeArgs {
     /// `header.from` — the app/user id.

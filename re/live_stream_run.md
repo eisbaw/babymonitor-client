@@ -86,6 +86,40 @@ legacy PPCS transport and is out of scope.
 
 From that device record, note the camera's `devId`, `localKey`, and `pv`.
 
+### LAN-only signaling (experimental, owner-device validation pending)
+
+`stream --signaling lan` bypasses SessionStore, REST, and MQTT entirely. It loads
+stable metadata from `$XDG_CONFIG_HOME/philips-babymonitor/lan.json` (or
+`--lan-config FILE`), authenticates TCP 6668 with Tuya commands 3/4/5, and sends
+the offer/candidates as `IPC_LAN_302` frame type 32. The file must be mode 0600;
+group/world-readable files and symlinks are rejected.
+
+```json
+{
+  "camera_ip": "192.0.2.10",
+  "port": 6668,
+  "device_id": "<devId>",
+  "sender_id": "<stable account uid used as header.from>",
+  "local_key": "<16-byte localKey>",
+  "hgw_version": "3.5",
+  "media_auth_password": "<optional camera-info password>"
+}
+```
+
+The hardware-gateway version is `HgwBean.version` (`3.4` or `3.5`), not the
+device-list MQTT payload `pv=2.2`. ICE credentials, media keys, trace IDs, and
+session IDs are minted per run and are never stored here. The optional media
+password is a cached provisioning value; its stability across `rtc.config`
+refreshes is not yet proven, so refresh the local config if media authentication
+starts failing. `--signaling auto` tries LAN first and prints an explicit
+diagnostic before cloud fallback; `--signaling lan` never falls back.
+
+This supports a cloud-free **process startup for an already paired,
+pre-provisioned camera**, subject to TASK-0126's owner-device proof with WAN/MQTT
+blocked. It is not cloud-free factory-reset or pairing support: an account move,
+reset, or re-pair may rotate the `localKey`, and local reacquisition of that key
+has not been implemented yet.
+
 ---
 
 ## 3. (Optional) the runtime bundle — now AUTO-BUILT in-process (TASK-0078)

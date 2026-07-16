@@ -1,5 +1,5 @@
-//! `babymonitor-cli stream` — drive the live A/V pipeline (login → device
-//! discovery → MQTT 302 signaling → media RX/decode) and re-mux the decoded
+//! `babymonitor-cli stream` — drive the live A/V pipeline (selected cloud-MQTT or
+//! authenticated LAN frame-32 signaling → media RX/decode) and re-mux the decoded
 //! Annex-B H.264 into **MPEG-TS served over HTTP** so a standard player connects:
 //!
 //! ```text
@@ -71,6 +71,17 @@ pub enum OutputMode {
     Window,
 }
 
+/// Carrier used for live 302 offer/answer/candidate signaling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SignalingMode {
+    /// Existing Tuya cloud MQTT carrier (behavior-compatible default).
+    Cloud,
+    /// Authenticated camera-local TCP frame-32 carrier; never uses cloud APIs.
+    Lan,
+    /// Try LAN first, then explicitly diagnose and fall back to cloud on error.
+    Auto,
+}
+
 /// Arguments for `babymonitor-cli stream`.
 #[derive(Debug, Args)]
 #[command(
@@ -87,6 +98,16 @@ pub enum OutputMode {
         \x20 babymonitor-cli stream --replay-annexb sample.264 --output stdout | mpv -"
 )]
 pub struct StreamArgs {
+    /// Signaling carrier for the live stream. `lan` is fail-closed and never
+    /// opens REST/MQTT; `auto` is the only mode permitted to fall back.
+    #[arg(long, value_enum, default_value = "cloud")]
+    pub signaling: SignalingMode,
+
+    /// Secure LAN metadata file. Defaults to the per-user
+    /// `$XDG_CONFIG_HOME/philips-babymonitor/lan.json` store.
+    #[arg(long, value_name = "FILE")]
+    pub lan_config: Option<PathBuf>,
+
     /// HTTP port for `--output http` (serves `http://127.0.0.1:<port>/stream.ts`).
     #[arg(long, default_value_t = DEFAULT_PORT)]
     pub port: u16,
@@ -155,8 +176,8 @@ pub fn run_stream(args: &StreamArgs, _json: bool) -> Result<(), Error> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// LIVE dispatch under `--features live`: hand off to the assembled
-/// [`crate::stream_live`] driver (login → discovery → MQTT signaling → ICE →
-/// media → MPEG-TS), which reaches the real broker/camera sockets and is honestly
+/// [`crate::stream_live`] driver (selected signaling carrier → ICE → media →
+/// MPEG-TS), which reaches the real broker/camera sockets and is honestly
 /// gated when no session / runtime bundle is injected.
 #[cfg(feature = "live")]
 fn run_live(args: &StreamArgs) -> Result<(), Error> {
@@ -169,6 +190,18 @@ fn run_live(args: &StreamArgs) -> Result<(), Error> {
 /// socket-driving driver.)
 #[cfg(not(feature = "live"))]
 fn run_live(args: &StreamArgs) -> Result<(), Error> {
+    if args.signaling == SignalingMode::Lan {
+        let config = args
+            .lan_config
+            .as_ref()
+            .map_or("the per-user LAN config", |path| {
+                path.to_str().unwrap_or("the selected LAN config")
+            });
+        eprintln!("stream (live): signaling mode=lan; cloud auth/REST/MQTT are disabled.");
+        eprintln!("  LAN metadata: {config}");
+        eprintln!("blocked: this binary was built without the `live` feature needed to open camera/media sockets.");
+        return Err(Error::StreamPending);
+    }
     let store = SessionStore::default_path()?;
     let have_session = store.load()?.is_some();
 
@@ -185,7 +218,8 @@ fn run_live(args: &StreamArgs) -> Result<(), Error> {
         "  stage 2  discovery:  needs the session's DeviceList + per-camera CameraInfoBean (p2pId/p2pKey/ices)"
     );
     eprintln!(
-        "  stage 3  signaling:  MQTT 302 offer/answer over the TLS broker (CONNECT password is native-derived, re/mqtt_signaling.md)"
+        "  stage 3  signaling:  {:?} (cloud uses MQTT; auto diagnoses LAN-first fallback)",
+        args.signaling
     );
     eprintln!(
         "  stage 4  media:      MediaEngine — suite-3 AES-128-CBC + 20B HMAC-SHA1 / KCP / fixed-12B RTP / H.264 + S16LE audio (re/media_decode_spec.md, cap4-validated)"

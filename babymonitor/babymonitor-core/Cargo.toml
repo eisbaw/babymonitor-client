@@ -37,3 +37,6 @@ hmac.workspace = true
 sha1.workspace = true
 aes-gcm.workspace = true
 zeroize.workspace = true
+# Secure config reads require the platform's real O_NOFOLLOW value; handwritten
+# raw constants differ by Unix ABI/architecture.
+libc = "=0.2.186"

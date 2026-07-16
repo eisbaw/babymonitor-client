@@ -38,8 +38,9 @@ The Baby Monitor+ is a **re-skinned Tuya Smart (ThingClips) IPC camera** app, so
 Tuya account auth and the streaming stack is Tuya's — a known quantity also documented by
 the public RE community. Two parts carry the project:
 
-- **Video — WebRTC-over-MQTT.** The camera streams over Tuya's own WebRTC, signaled via
-  MQTT (message code **302**) and chosen at runtime by the cloud `p2pType`. Signaling is
+- **Video — Tuya P2P with selectable signaling.** The camera's proven path is signaled via
+  cloud MQTT (message code **302**); the APK also carries the same envelope locally as
+  authenticated Tuya `IPC_LAN_302` frame type 32 on TCP 6668. Signaling is
   standard WebRTC shape (SDP + trickle-ICE); the **media is not DTLS-SRTP** but Tuya's own
   KCP / AES-128-CBC + HMAC-SHA1 framing, with the media key carried in the SDP. See
   [`re/streaming_mode.md`](re/streaming_mode.md) and [`re/webrtc_session.md`](re/webrtc_session.md).
@@ -50,8 +51,9 @@ the public RE community. Two parts carry the project:
 
 The recovered transport matches independent public Tuya WebRTC projects field-for-field,
 and the whole chain — login → device discovery → signaling → ICE → media decrypt — is
-implemented and confirmed on a live run against the owner's camera. (The LAN protocol on
-TCP 6668 is datapoint-only and is not an A/V source.)
+implemented and confirmed on a live run against the owner's camera for cloud MQTT. The
+LAN carrier is implemented and offline-validated but still needs owner-device validation;
+TCP 6668 carries signaling, while A/V remains direct ICE/KCP UDP.
 
 ## The Rust client
 

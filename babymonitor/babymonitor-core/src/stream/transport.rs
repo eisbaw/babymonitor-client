@@ -34,7 +34,8 @@ use rumqttc::{Client, Connection, Event, MqttOptions, Packet, QoS, RecvTimeoutEr
 
 use crate::stream::mqtt_auth::MqttCredentials;
 use crate::stream::session::{
-    Inbound302, MqttSignalingSession, MqttTransport, NegotiationOutcome, SignalingFlow,
+    Inbound302, MqttSignalingSession, MqttSignalingTransport, MqttTransport, NegotiationOutcome,
+    SignalingFlow,
 };
 use crate::stream::signaling::OfferEnvelopeArgs;
 use crate::Error;
@@ -515,8 +516,8 @@ pub struct LiveSignalingParams<'a> {
 /// Composes the live wiring end-to-end:
 /// [`RumqttcTransport::connect`] (opens the socket + subscribes to the 302 topic)
 /// → [`MqttSignalingSession::negotiate_with_trickle`] (publish the offer + local
-/// candidates over `mqtt`+`lan`, receive + parse the answer, then keep collecting
-/// the camera's trickled `candidate` messages). The trickle phase is required: the
+/// candidates once over MQTT, receive + parse the answer, then keep collecting the
+/// camera's trickled `candidate` messages). The trickle phase is required: the
 /// camera's answer SDP carries no `a=candidate:` lines (cap3/cap4), so its host
 /// candidate only arrives as separate 302 `candidate` messages after the answer.
 /// Build `config` from session-derived creds with [`BrokerConfig::from_credentials`].
@@ -536,13 +537,13 @@ pub fn connect_and_negotiate(
     params: LiveSignalingParams<'_>,
 ) -> Result<NegotiationOutcome, Error> {
     let mut transport = RumqttcTransport::connect(config)?;
-    let mut session = MqttSignalingSession::new(
+    let carrier = MqttSignalingTransport::new(
         &mut transport,
-        params.flow,
         params.local_key.to_vec(),
         params.dev_id,
         params.pv,
     );
+    let mut session = MqttSignalingSession::new(carrier, params.flow);
     session.negotiate_with_trickle(
         params.offer_args,
         params.local_candidates,

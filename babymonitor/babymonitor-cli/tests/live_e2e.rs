@@ -102,33 +102,25 @@ fn live_login_then_device_list_finds_scd921() {
 /// the offline suite; never opens an MQTT/WebRTC socket in `just e2e`/CI.
 ///
 /// CURRENT (stream-pending) behaviour, asserted honestly when run with
-/// `--ignored`: the offline session driver surfaces [`Error::StreamPending`] because
-/// (a) every runtime credential (token/p2pId/p2pKey/ices/session/localKey/pv)
-/// rides an authenticated session that this harness does not yet establish, so it
-/// cannot fetch the device's `CameraInfoBean`/`P2pConfig`, (b) the 302 localKey-AES
-/// frame is now fully implemented + byte-pinned by cap5 (the binary message-2.2
-/// frame — `stream::mqtt_crypto::build_302_frame`), but this offline driver opens
-/// no broker socket, and (c) the WebRTC media engine (webrtc-rs) is a follow-up
-/// (TASK-0037). It makes NO network call and renders NO fabricated frame.
+/// `--ignored`: this older, injected core seam deliberately stops after building
+/// and publishing an offer; it never opens a real socket. The production CLI now
+/// has real cloud-MQTT and authenticated LAN carriers plus the ICE/KCP media
+/// engine, but proving those requires the owner's camera and credentials rather
+/// than replacing this negative test with a fake answer/frame.
 ///
-/// FUTURE (once auth unblocks + a real SCD921 returns p2pType=4): replace the
-/// engine/transport fakes with the real `RumqttcTransport` (TLS feature on) + the
-/// webrtc-rs engine, load `StreamCredentials` from `secrets/`, and assert ≥1
-/// decoded video frame is received (`engine.recv_frame()` yields a
-/// [`FrameKind::VideoKeyframe`]) — asserting SHAPE only, never echoing payload or
-/// the per-session media key.
+/// FUTURE owner-device gold oracle: invoke the production CLI live path with
+/// owner-provisioned material and assert ≥1 decoded video frame, while never
+/// echoing payload, device identity, localKey, or the per-session media key.
 ///
 /// ## Authorized scope / manual setup
 /// Same contract as the login harness above: ONLY the user's own account + their
 /// own SCD921; creds from `secrets/` (gitignored), never a tracked file; single
 /// shot, `--test-threads=1`. Nothing here prints a secret.
 #[test]
-#[ignore = "live A/V stream: needs an authenticated session from fresh auth \
-            live-login or an injected captured session (TASK-0022). It also needs \
-            the 302 envelope variant/framing binding + webrtc-rs engine (TASK-0037) \
-            and a live SCD921 returning p2pType=4. Run manually with --ignored \
-            --test-threads=1. Today it asserts the honest stream-pending state, \
-            not a fabricated stream."]
+#[ignore = "owner-device gold oracle: requires the user's camera plus authorized \
+            cloud or pre-provisioned LAN credentials. Run manually with --ignored \
+            --test-threads=1; this injected offline seam intentionally asserts \
+            StreamPending rather than fabricating a frame."]
 fn live_webrtc_session_renders_first_frame() {
     // A panicking engine/transport: if the (gated) driver ever reached real I/O
     // these would explode, proving no live path runs while stream-pending.
@@ -187,16 +179,15 @@ fn live_webrtc_session_renders_first_frame() {
     // HONEST assertion: the live stream is blocked. We assert StreamPending
     // rather than a stream we cannot produce. This goes RED the day someone makes
     // it pretend to stream without auth + the media engine — the negative-feedback
-    // property we want.
+    // property we want for this deliberately offline seam.
     match result {
         Err(Error::StreamPending) => {
-            // Expected today. When auth (TASK-0035) + the media engine (TASK-0037)
-            // land, replace the fakes with the real transport/engine and assert
-            // ≥1 decoded frame.
+            // Expected: production live I/O belongs in the owner-device oracle,
+            // not in this injected no-network seam.
         }
         other => panic!(
-            "live stream expected stream-pending (auth + webrtc-rs not landed); got {other:?}. \
-             If streaming now works, update this harness to assert a real decoded frame."
+            "offline session seam expected StreamPending; got {other:?}. If this seam's \
+             contract changed, update the test without substituting a fabricated frame."
         ),
     }
 }

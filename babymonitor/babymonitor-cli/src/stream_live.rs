@@ -5,11 +5,9 @@
 //! `babymonitor-core` building blocks:
 //!
 //! ```text
-//! 1 auth        load the on-disk Session (sid/uid/ecode)            [offline-real]
-//! 2 discovery   SCD921 devId + localKey + pv + p2pType(=4 WebRTC)   [owner-injected]
-//! 3 mqtt creds  derive_credentials (clientId/username/password)     [offline-real]
-//! 4 broker      RumqttcTransport TLS connect (live-tls, 8883)       [LIVE I/O]
-//! 5 signaling   302 offer -> trickle -> answer (MqttSignalingSession) [LIVE I/O]
+//! 1 carrier     explicit cloud / lan / auto selection
+//! 2 bootstrap   cloud session+rtc.config OR secure stable LAN config
+//! 3 signaling   MQTT message-2.2 OR authenticated LAN frame type 32
 //! 6 ICE         host-direct UDP + connectivity check                [LIVE I/O]
 //! 7 media       MediaEngine pump: suite-3 AES-128-CBC + 20B HMAC-SHA1
 //!               / KCP / fixed-12B RTP -> H.264 (conv 1) + S16LE audio (conv 2)
@@ -18,25 +16,24 @@
 //!
 //! # Honest gating (never a fabricated stream)
 //!
-//! Stages 4–6 are the **unreachable live I/O** in this static-analysis sandbox:
-//! there is no Tuya broker and no camera. The driver does NOT mock them with a
-//! fake that pretends to stream — it reaches the real socket calls
+//! Signaling and ICE are live I/O: this sandbox has no camera. The driver does
+//! not substitute a fake stream — it reaches the real socket calls
 //! ([`connect_and_negotiate`], [`mtransport::connect_host_direct`]) and surfaces
-//! the honest failure. The runtime credentials those stages need (stage 2 + the
-//! per-session MQTT/P2P secrets) come from the owner's live session, injected as a
-//! gitignored `secrets/stream_runtime.json` bundle (the project's token-injectable
-//! discipline). Absent that bundle, the driver returns [`Error::StreamPending`]
-//! with a precise account of what is missing and which live API yields it.
+//! the honest failure. Cloud mode uses the owner's authorized session plus its
+//! runtime record; LAN mode bypasses SessionStore/REST/MQTT and uses the secure
+//! owner-provisioned LAN config. Neither path fabricates an answer or media frame.
 //!
 //! The media→output back half (stages 7–8) is the SAME code the offline
 //! `--replay-annexb`/cap4 path proves byte-exact; only the live socket front half
 //! is environmentally gated.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use babymonitor_core::session::{Session, SessionStore};
+use babymonitor_core::stream::lan_config::{LanConfigStore, LanDeviceConfig};
+use babymonitor_core::stream::lan_transport::{Lan302ConnectConfig, Lan302Transport};
 use babymonitor_core::stream::media::audio;
 use babymonitor_core::stream::media::control::{self, MEDIA_START_AUTH_USERNAME};
 use babymonitor_core::stream::media::h264::H264Depacketizer;
@@ -49,7 +46,8 @@ use babymonitor_core::stream::mqtt_auth::{derive_credentials, MqttAuthInputs};
 use babymonitor_core::stream::rtc_config::RtcConfig;
 use babymonitor_core::stream::sdp::{build_offer_sdp, OfferSdpParams};
 use babymonitor_core::stream::session::{
-    NegotiationOutcome, OsRandom, RandomSource, SignalingFlow,
+    has_usable_host_candidate, NegotiationOutcome, OsRandom, RandomSource, SignalingFlow,
+    SignalingSession,
 };
 use babymonitor_core::stream::signaling::ParsedAnswer;
 use babymonitor_core::stream::topics;
@@ -60,7 +58,9 @@ use babymonitor_core::stream::StreamCredentials;
 use babymonitor_core::Error;
 use serde::Deserialize;
 
-use crate::stream::{OutputMode, StreamArgs};
+use crate::stream::{OutputMode, SignalingMode, StreamArgs};
+
+type LiveLanSignalingSession = SignalingSession<Lan302Transport<TcpStream>>;
 
 /// Default path of the owner-injected runtime bundle (gitignored).
 const RUNTIME_BUNDLE: &str = "secrets/stream_runtime.json";
@@ -208,6 +208,228 @@ fn default_json_object() -> String {
 /// - [`Error::Transport`]/[`Error::StreamConfig`] from a real live step (broker
 ///   connect, signaling, ICE) when the owner runs it for real and a step fails.
 pub fn run_live_stream(args: &StreamArgs) -> Result<(), Error> {
+    let prepared = select_signaling_carrier(
+        args.signaling,
+        || prepare_lan_stream(args),
+        || prepare_cloud_stream(args),
+    )?;
+    // Auto fallback is intentionally over at this boundary: once either carrier
+    // has delivered an answer, ICE/media/output errors never start a second cloud
+    // negotiation behind the user's back.
+    finish_negotiated_stream(args, prepared)
+}
+
+/// Route the live pipeline without constructing the unselected backend.  In
+/// particular, `Lan` never invokes the cloud closure, which is the fail-closed
+/// no-REST/no-MQTT guarantee exercised by offline counter tests.
+fn select_signaling_carrier<T, L, C>(mode: SignalingMode, lan: L, cloud: C) -> Result<T, Error>
+where
+    L: FnOnce() -> Result<T, Error>,
+    C: FnOnce() -> Result<T, Error>,
+{
+    match mode {
+        SignalingMode::Lan => {
+            eprintln!("stream (live): signaling mode=lan (cloud fallback disabled).");
+            lan()
+        }
+        SignalingMode::Cloud => {
+            eprintln!("stream (live): signaling mode=cloud.");
+            cloud()
+        }
+        SignalingMode::Auto => {
+            eprintln!("stream (live): signaling mode=auto; trying authenticated LAN first.");
+            match lan() {
+                Ok(value) => Ok(value),
+                Err(lan_error) => {
+                    eprintln!(
+                        "stream (live): LAN attempt failed ({lan_error}); auto mode is explicitly falling back to Tuya cloud MQTT."
+                    );
+                    cloud()
+                }
+            }
+        }
+    }
+}
+
+struct LanPrepared<M, G> {
+    creds: StreamCredentials,
+    session_handles: SessionHandles,
+    media_transport: M,
+    outcome: NegotiationOutcome,
+    signaling_guard: G,
+}
+
+/// Every external operation available to LAN preparation. Keeping this seam
+/// intentionally LAN-only lets tests exercise the actual bootstrap while
+/// proving it has no REST or MQTT dependency to invoke.
+trait LanPreparationIo {
+    type MediaTransport;
+    type SignalingGuard;
+
+    fn load_config(&mut self, args: &StreamArgs) -> Result<(LanDeviceConfig, PathBuf), Error>;
+    fn bind_media(&mut self) -> Result<(Self::MediaTransport, u16), Error>;
+    fn gather_candidates(&mut self, config: &LanDeviceConfig, local_port: u16) -> Vec<String>;
+    fn negotiate(
+        &mut self,
+        config: &LanDeviceConfig,
+        offer: &Offer,
+        local_candidates: &[String],
+    ) -> Result<(NegotiationOutcome, Self::SignalingGuard), Error>;
+}
+
+struct LiveLanPreparationIo;
+
+impl LanPreparationIo for LiveLanPreparationIo {
+    type MediaTransport = mtransport::UdpMediaTransport;
+    type SignalingGuard = LiveLanSignalingSession;
+
+    fn load_config(&mut self, args: &StreamArgs) -> Result<(LanDeviceConfig, PathBuf), Error> {
+        // Deliberately no SessionStore and no REST helper: the complete LAN
+        // bootstrap comes from the owner-provisioned local config.
+        let store = match &args.lan_config {
+            Some(path) => LanConfigStore::new(path),
+            None => LanConfigStore::default_path()?,
+        };
+        let path = store.path().to_path_buf();
+        Ok((store.load()?, path))
+    }
+
+    fn bind_media(&mut self) -> Result<(Self::MediaTransport, u16), Error> {
+        let transport =
+            mtransport::UdpMediaTransport::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
+        let port = transport.local_addr()?.port();
+        Ok((transport, port))
+    }
+
+    fn gather_candidates(&mut self, config: &LanDeviceConfig, local_port: u16) -> Vec<String> {
+        gather_local_host_candidates(
+            &config.camera_ip.to_string(),
+            config.port,
+            local_port,
+            &OsRandom,
+        )
+    }
+
+    fn negotiate(
+        &mut self,
+        config: &LanDeviceConfig,
+        offer: &Offer,
+        local_candidates: &[String],
+    ) -> Result<(NegotiationOutcome, Self::SignalingGuard), Error> {
+        negotiate_lan(config, offer, local_candidates)
+    }
+}
+
+fn prepare_lan_stream_with<I: LanPreparationIo>(
+    args: &StreamArgs,
+    io: &mut I,
+) -> Result<LanPrepared<I::MediaTransport, I::SignalingGuard>, Error> {
+    let (config, config_path) = io.load_config(args)?;
+    eprintln!(
+        "stream (live): LAN metadata loaded from {} (identifiers and keys redacted).",
+        config_path.display()
+    );
+
+    let creds = build_lan_stream_credentials(&config);
+    let session_handles = SessionHandles::mint(&config.device_id)?;
+    let offer = build_offer(&creds, &session_handles)?;
+
+    let (media_transport, local_port) = io.bind_media()?;
+    let local_candidates = io.gather_candidates(&config, local_port);
+
+    eprintln!(
+        "stream (live): connecting authenticated Tuya LAN {} carrier at camera port {}; no REST or MQTT sockets will be opened.",
+        config.hgw_version,
+        config.port
+    );
+    let (outcome, signaling_guard) = io.negotiate(&config, &offer, &local_candidates)?;
+    Ok(LanPrepared {
+        creds,
+        session_handles,
+        media_transport,
+        outcome,
+        signaling_guard,
+    })
+}
+
+fn prepare_lan_stream(args: &StreamArgs) -> Result<PreparedStream, Error> {
+    let prepared = prepare_lan_stream_with(args, &mut LiveLanPreparationIo)?;
+    Ok(PreparedStream {
+        creds: prepared.creds,
+        session_handles: prepared.session_handles,
+        media_transport: prepared.media_transport,
+        outcome: prepared.outcome,
+        lan_signaling: Some(prepared.signaling_guard),
+    })
+}
+
+fn build_lan_stream_credentials(config: &LanDeviceConfig) -> StreamCredentials {
+    StreamCredentials {
+        // LAN frame-32 signaling does not consume cloud rtc.config token/session
+        // material.  Empty values are intentional and never passed to the cloud
+        // StreamCredentials::validate path.
+        token: String::new(),
+        p2p_id: config.sender_id.clone(),
+        dev_id: config.device_id.clone(),
+        skill: "{}".to_string(),
+        p2p_key: String::new(),
+        ices: "[]".to_string(),
+        session: "{}".to_string(),
+        tcp_relay: String::new(),
+        log: String::new(),
+        local_key: config.local_key.clone(),
+        pv: config.hgw_version.clone(),
+        // Cached owner-provisioned value, not assumed stable across reset/account
+        // changes. StreamCredentials zeroizes this clone (and local_key) on Drop.
+        media_auth_password: config.media_auth_password.clone().unwrap_or_default(),
+    }
+}
+
+fn negotiate_lan(
+    config: &LanDeviceConfig,
+    offer: &Offer,
+    local_candidates: &[String],
+) -> Result<(NegotiationOutcome, LiveLanSignalingSession), Error> {
+    let connect = Lan302ConnectConfig {
+        address: config.socket_addr(),
+        version: config.protocol_version()?,
+        device_id: config.device_id.clone(),
+        local_key: config.lan_key()?,
+    };
+    let carrier = Lan302Transport::connect_tcp(&connect)?;
+    let offer_args = offer
+        .flow
+        .make_offer_args(offer.sdp.clone(), Vec::new(), None, None);
+    let mut session = SignalingSession::new(carrier, offer.flow.clone());
+    let outcome = session.negotiate_with_trickle(
+        &offer_args,
+        local_candidates,
+        MAX_ANSWER_POLLS,
+        TRICKLE_POLLS,
+        SIGNALING_POLL_INTERVAL,
+        has_usable_host_candidate,
+    )?;
+    Ok((outcome, session))
+}
+
+struct PreparedStream {
+    creds: StreamCredentials,
+    session_handles: SessionHandles,
+    media_transport: mtransport::UdpMediaTransport,
+    outcome: NegotiationOutcome,
+    /// Keep the authenticated LAN socket alive through the media lifetime, as
+    /// the APK keeps its hardware listener registered until explicit teardown.
+    /// TASK-0126 will determine whether active polling/heartbeats are also needed.
+    lan_signaling: Option<LiveLanSignalingSession>,
+}
+
+fn while_signaling_alive<G, T>(signaling_guard: G, run_media: impl FnOnce() -> T) -> T {
+    let result = run_media();
+    drop(signaling_guard);
+    result
+}
+
+fn prepare_cloud_stream(args: &StreamArgs) -> Result<PreparedStream, Error> {
     // ── Stage 1: auth (load the on-disk session) ───────────────────────────
     let store = SessionStore::default_path()?;
     let Some(session) = store.load()? else {
@@ -287,7 +509,7 @@ pub fn run_live_stream(args: &StreamArgs) -> Result<(), Error> {
     // root-cause fix (TASK-0083): the camera must learn OUR address to open a path
     // back to us (the real app sends its host candidate; we previously sent none).
     let rng = OsRandom;
-    let mut transport =
+    let transport =
         mtransport::UdpMediaTransport::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
     let local_port = transport.local_addr()?.port();
     let local_candidates =
@@ -302,6 +524,25 @@ pub fn run_live_stream(args: &StreamArgs) -> Result<(), Error> {
     );
 
     let outcome = negotiate(&broker, &creds, &offer, &local_candidates)?;
+    Ok(PreparedStream {
+        creds,
+        session_handles,
+        media_transport: transport,
+        outcome,
+        lan_signaling: None,
+    })
+}
+
+/// Common ICE/media/output tail after either signaling carrier has produced an
+/// answer and trickled candidates.
+fn finish_negotiated_stream(args: &StreamArgs, prepared: PreparedStream) -> Result<(), Error> {
+    let PreparedStream {
+        creds,
+        session_handles,
+        media_transport: mut transport,
+        outcome,
+        lan_signaling,
+    } = prepared;
     let answer = &outcome.answer;
     eprintln!(
         "stream (live): answer received — remote ICE creds + media key extracted; {} trickled candidate(s) collected.",
@@ -353,7 +594,12 @@ pub fn run_live_stream(args: &StreamArgs) -> Result<(), Error> {
     // (RFC 5389 backoff) until validated, refresh consent ~every 5 s, and answer the
     // camera's inbound checks so neither side's consent-to-send expires mid-stream.
     let mut keepalive = PathKeepalive::new(ice, &host)?;
-    pump_to_output(args, &mut engine, &mut transport, &mut keepalive)
+    // The APK keeps its hardware response listener registered until explicit
+    // teardown. Hold the authenticated TCP carrier through the same lifetime;
+    // dropping it here closes it only after the media pump has ended.
+    while_signaling_alive(lan_signaling, || {
+        pump_to_output(args, &mut engine, &mut transport, &mut keepalive)
+    })
 }
 
 /// Mint the per-session local handles (ICE ufrag/pwd, media key, the unix-second
@@ -1467,7 +1713,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 // ── Honest gate reporters ────────────────────────────────────────────────────
 
-fn stream_pending_no_session() -> Result<(), Error> {
+fn stream_pending_no_session<T>() -> Result<T, Error> {
     eprintln!(
         "stream (live): NO session on disk. Stage 1 (auth) is the project's known block: the \
          from-scratch cloud login hits the server-side identity gate (ILLEGAL_CLIENT_ID). Inject a \
@@ -2120,6 +2366,190 @@ fn now_nanos() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    fn synthetic_stream_args(signaling: SignalingMode) -> StreamArgs {
+        StreamArgs {
+            signaling,
+            lan_config: Some(PathBuf::from("/synthetic/lan.json")),
+            port: 8554,
+            output: OutputMode::Stdout,
+            ts_out: None,
+            replay_annexb: None,
+            replay_audio: None,
+            audio_rate: audio::DOWNSTREAM_SAMPLE_RATE_HZ,
+            mtu: 1200,
+            diag_topics: false,
+        }
+    }
+
+    #[test]
+    fn lan_mode_never_constructs_cloud_backend() {
+        let lan_calls = Cell::new(0);
+        let cloud_calls = Cell::new(0);
+        let selected = select_signaling_carrier(
+            SignalingMode::Lan,
+            || {
+                lan_calls.set(lan_calls.get() + 1);
+                Ok("lan")
+            },
+            || {
+                cloud_calls.set(cloud_calls.get() + 1);
+                Ok("cloud")
+            },
+        )
+        .unwrap();
+        assert_eq!(selected, "lan");
+        assert_eq!(lan_calls.get(), 1);
+        assert_eq!(cloud_calls.get(), 0, "no REST/MQTT backend constructed");
+    }
+
+    struct SpyLanPreparationIo {
+        config: Option<LanDeviceConfig>,
+        calls: Vec<&'static str>,
+        cloud_calls: usize,
+    }
+
+    impl LanPreparationIo for SpyLanPreparationIo {
+        type MediaTransport = ();
+        type SignalingGuard = ();
+
+        fn load_config(&mut self, args: &StreamArgs) -> Result<(LanDeviceConfig, PathBuf), Error> {
+            assert_eq!(args.signaling, SignalingMode::Lan);
+            self.calls.push("load_config");
+            Ok((
+                self.config.take().expect("one injected config"),
+                PathBuf::from("/synthetic/lan.json"),
+            ))
+        }
+
+        fn bind_media(&mut self) -> Result<(Self::MediaTransport, u16), Error> {
+            self.calls.push("bind_media");
+            Ok(((), 54_321))
+        }
+
+        fn gather_candidates(&mut self, config: &LanDeviceConfig, local_port: u16) -> Vec<String> {
+            self.calls.push("gather_candidates");
+            assert_eq!(
+                config.camera_ip,
+                "192.0.2.10".parse::<std::net::IpAddr>().unwrap()
+            );
+            assert_eq!(local_port, 54_321);
+            vec!["a=candidate:1 1 UDP 2130706431 192.0.2.20 54321 typ host\r\n".to_string()]
+        }
+
+        fn negotiate(
+            &mut self,
+            config: &LanDeviceConfig,
+            offer: &Offer,
+            local_candidates: &[String],
+        ) -> Result<(NegotiationOutcome, Self::SignalingGuard), Error> {
+            self.calls.push("negotiate_lan_302");
+            assert_eq!(offer.flow.to(), config.device_id);
+            assert_eq!(local_candidates.len(), 1);
+            Ok((
+                NegotiationOutcome {
+                    answer: ParsedAnswer {
+                        remote_ufrag: "REMOTE".to_string(),
+                        remote_pwd: "REMOTE_PASSWORD".to_string(),
+                        media_key: vec![0x11; 16],
+                        ice_servers: Vec::new(),
+                        tcp_token: None,
+                        sdp: "v=0\r\n".to_string(),
+                    },
+                    remote_candidates: vec![
+                        "a=candidate:2 1 UDP 1 192.0.2.10 6000 typ host\r\n".to_string()
+                    ],
+                },
+                (),
+            ))
+        }
+    }
+
+    #[test]
+    fn actual_lan_preparation_has_only_injected_local_io() {
+        let mut io = SpyLanPreparationIo {
+            config: Some(LanDeviceConfig {
+                camera_ip: "192.0.2.10".parse().unwrap(),
+                port: 6668,
+                device_id: "SYNTH_DEVICE".to_string(),
+                sender_id: "SYNTH_SENDER".to_string(),
+                local_key: "0123456789abcdef".to_string(), // secret-scan:allow synthetic
+                hgw_version: "3.5".to_string(),
+                media_auth_password: None,
+            }),
+            calls: Vec::new(),
+            cloud_calls: 0,
+        };
+        let prepared =
+            prepare_lan_stream_with(&synthetic_stream_args(SignalingMode::Lan), &mut io).unwrap();
+
+        assert_eq!(
+            io.calls,
+            vec![
+                "load_config",
+                "bind_media",
+                "gather_candidates",
+                "negotiate_lan_302"
+            ]
+        );
+        assert_eq!(io.cloud_calls, 0, "LAN preparation has no cloud I/O seam");
+        assert!(prepared.creds.token.is_empty());
+        assert_eq!(prepared.outcome.answer.remote_ufrag, "REMOTE");
+    }
+
+    struct DropProbe(Rc<Cell<bool>>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    #[test]
+    fn signaling_guard_outlives_media_operation() {
+        let dropped = Rc::new(Cell::new(false));
+        let guard = DropProbe(Rc::clone(&dropped));
+        let value = while_signaling_alive(guard, || {
+            assert!(!dropped.get(), "LAN signaling closed before media ended");
+            42
+        });
+        assert_eq!(value, 42);
+        assert!(dropped.get(), "LAN signaling closes after media returns");
+    }
+
+    #[test]
+    fn cloud_and_auto_routing_are_explicit_and_bounded_to_preparation() {
+        let lan_calls = Cell::new(0);
+        let cloud_calls = Cell::new(0);
+        let cloud = select_signaling_carrier(
+            SignalingMode::Cloud,
+            || {
+                lan_calls.set(lan_calls.get() + 1);
+                Ok("lan")
+            },
+            || {
+                cloud_calls.set(cloud_calls.get() + 1);
+                Ok("cloud")
+            },
+        )
+        .unwrap();
+        assert_eq!(cloud, "cloud");
+        assert_eq!((lan_calls.get(), cloud_calls.get()), (0, 1));
+
+        let fallback = select_signaling_carrier(
+            SignalingMode::Auto,
+            || Err(Error::Transport("synthetic LAN preparation failure".into())),
+            || {
+                cloud_calls.set(cloud_calls.get() + 1);
+                Ok("cloud-after-diagnosed-fallback")
+            },
+        )
+        .unwrap();
+        assert_eq!(fallback, "cloud-after-diagnosed-fallback");
+        assert_eq!(cloud_calls.get(), 2);
+    }
 
     // SYNTHETIC 16-byte localKey for the test fixtures (CLAUDE.md). Injected into
     // the JSON via a placeholder so the raw-string source line never carries a

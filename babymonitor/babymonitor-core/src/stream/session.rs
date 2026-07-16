@@ -1,20 +1,15 @@
-//! The session state machine + the engine/transport trait seams + the
-//! (#[ignore]d) live driver (`re/webrtc_session.md` §5).
+//! Transport-neutral Tuya 302 signaling state machine and carrier seams
+//! (`re/webrtc_session.md` §5).
 //!
-//! This ties the Tuya-custom protocol pieces together into a driveable session
-//! lifecycle, WITHOUT pulling in the standard-WebRTC media stack (webrtc-rs) or a
-//! live MQTT broker. The media engine and the MQTT transport are **trait seams**
-//! ([`WebRtcEngine`], [`MqttTransport`]) so:
-//! - the offline tests drive the state machine through a fake transport / engine;
-//! - the real webrtc-rs engine + rumqttc transport plug in WITHOUT changing the
-//!   protocol layer (the webrtc-rs wiring is a filed follow-up, TASK-0037).
+//! [`SignalingSession`] drives one selected [`SignalingTransport`]. MQTT wraps
+//! the JSON in message-2.2 through [`MqttSignalingTransport`]; authenticated LAN
+//! frame type 32 implements the same trait in `lan_transport`. Offline tests use
+//! injected carriers, while the production CLI supplies real MQTT or TCP I/O.
 //!
-//! # The driver is honestly gated (TASK-0034 AC#2)
-//! [`LiveSessionDriver::run`] returns [`crate::Error::StreamPending`]: it cannot
-//! actually stream because every runtime input rides an authenticated session
-//! that this core module does not establish, the 302 envelope framing is pending,
-//! and the media engine is a follow-up. This is the signer's discipline: never a
-//! fake stream, never `todo!()`.
+//! [`LiveSessionDriver`] is an older injected core seam retained for focused
+//! state-machine tests; it intentionally returns [`crate::Error::StreamPending`]
+//! after publishing. The complete signaling→ICE/KCP→media live path is the CLI's
+//! `stream_live` driver, not this deliberately socket-free helper.
 
 use std::time::Duration;
 
@@ -169,12 +164,12 @@ pub struct Inbound302 {
     pub payload: Vec<u8>,
 }
 
-/// The standard-WebRTC engine seam (webrtc-rs's job — a filed follow-up).
+/// Legacy injected engine seam used by [`LiveSessionDriver`] state-machine tests.
 ///
-/// The protocol layer hands the engine the negotiated SDP / media key and pulls
-/// de-paid frames; the engine owns the PeerConnection / ICE / DTLS-SRTP / SRTP /
-/// RTP-depacketize. No implementation ships in this static-only build — see the
-/// module-level webrtc-rs decision.
+/// It models the older standard-WebRTC-shaped driver without selecting a concrete
+/// engine. The production CLI does not await a webrtc-rs implementation: it uses
+/// [`crate::stream::media::MediaEngine`] for the camera's custom ICE/KCP/AES media
+/// protocol after [`SignalingSession`] completes.
 pub trait WebRtcEngine {
     /// Create the local OFFER SDP (standard sections). The Tuya `a=aes-key`
     /// application line is spliced in by [`crate::stream::sdp::inject_aes_key`].
@@ -267,13 +262,13 @@ impl<'a, T: MqttTransport, E: WebRtcEngine> LiveSessionDriver<'a, T, E> {
 
     /// Drive the LIVE session: build the `connect_v2` control JSON + the Tuya
     /// `imm` offer SDP, wrap the offer in the binary message-2.2 302 frame
-    /// (AES-ECB/localKey, cap5-pinned), and **publish it over both the `mqtt` and
-    /// `lan` paths** through the transport seam. Then return
+    /// (AES-ECB/localKey, cap5-pinned), and publish it once through the MQTT
+    /// transport seam. Then return
     /// [`Error::StreamPending`].
     ///
     /// # Honest gating
-    /// The 302 build + publish path is now real (the offline test sees the two
-    /// offer frames published through a fake transport). What remains genuinely
+    /// The 302 build + publish path is now real (the offline test sees the one
+    /// offer frame published through a fake transport). What remains genuinely
     /// gated, so this returns [`Error::StreamPending`] rather than a stream:
     /// 1. **The live broker.** [`super::transport::RumqttcTransport`] needs the
     ///    Tuya MQTT CONNECT creds, whose password is native-derived
@@ -312,8 +307,8 @@ impl<'a, T: MqttTransport, E: WebRtcEngine> LiveSessionDriver<'a, T, E> {
             rtpmap_param: 330,
         })?;
 
-        // 3. Build the offer envelopes (mqtt + lan) and publish each as a 302
-        //    frame (the binary message-2.2 frame, cap5-pinned) via the shared
+        // 3. Build one MQTT offer and publish it as a 302 frame (the binary
+        //    message-2.2 frame, cap5-pinned) via the shared
         //    [`MqttSignalingSession`] orchestrator — the same transport-coupled
         //    layer the live `rumqttc` path uses.
         let flow = SignalingFlow::new(
@@ -325,13 +320,13 @@ impl<'a, T: MqttTransport, E: WebRtcEngine> LiveSessionDriver<'a, T, E> {
         let ices = parse_ice_servers(&self.creds.ices);
         let args = flow.make_offer_args(offer_sdp, ices, None, None);
         {
-            let mut session = MqttSignalingSession::new(
+            let carrier = MqttSignalingTransport::new(
                 &mut *self.transport,
-                flow,
                 self.creds.local_key.as_bytes().to_vec(),
                 self.creds.dev_id.clone(),
                 self.creds.pv.clone(),
             );
+            let mut session = MqttSignalingSession::new(carrier, flow);
             session.publish_offer(&args)?;
         }
         self.state = SessionState::Connecting;
@@ -385,8 +380,8 @@ impl<'a, T: MqttTransport, E: WebRtcEngine> LiveSessionDriver<'a, T, E> {
 }
 
 /// The pure signaling **state machine** (`re/webrtc_session.md` §2c + cap3): it
-/// owns the routing ids + lifecycle and produces the outbound 302 envelopes
-/// (offer over `mqtt`+`lan`, then trickle candidates over both paths) and ingests
+/// owns the routing ids + lifecycle and produces outbound 302 envelopes for the
+/// carrier selected by [`SignalingSession`], then ingests
 /// the inbound `answer`, emitting the [`ParsedAnswer`] the media engine consumes.
 ///
 /// This is engine- and transport-free, so the offline tests drive the full
@@ -456,17 +451,44 @@ impl SignalingFlow {
         &self.trace_id
     }
 
-    /// Build the outbound `offer` envelopes — one per [`SignalingPath`]
-    /// (`mqtt` then `lan`), as cap3 sends the offer over both. Advances the
-    /// state to [`SessionState::Connecting`].
+    /// Whether an inbound envelope belongs to this active negotiation.
     ///
-    /// `args` is reused for both paths (only `header.path` differs).
-    pub fn offer_envelopes(&mut self, args: &OfferEnvelopeArgs) -> [SignalingEnvelope; 2] {
+    /// The APK keys its P2P state map by `trace_id`, so an exact trace match is
+    /// mandatory. `sessionid` is a second per-run correlation value: peers may
+    /// omit it, but a present value must also match. This prevents an
+    /// uncorrelated or delayed answer/candidate from being applied to the current
+    /// media session.
+    #[must_use]
+    pub fn correlates(&self, env: &SignalingEnvelope) -> bool {
+        env.header.trace_id.as_deref() == Some(self.trace_id.as_str())
+            && env
+                .header
+                .sessionid
+                .as_deref()
+                .map_or(true, |session| session == self.sessionid)
+    }
+
+    /// Build one outbound offer for the selected carrier.
+    pub fn offer_envelope(
+        &mut self,
+        args: &OfferEnvelopeArgs,
+        path: SignalingPath,
+    ) -> SignalingEnvelope {
         self.state = SessionState::Connecting;
-        [
-            SignalingEnvelope::offer(args, SignalingPath::Mqtt),
-            SignalingEnvelope::offer(args, SignalingPath::Lan),
-        ]
+        SignalingEnvelope::offer(args, path)
+    }
+
+    /// Build one outbound candidate for the selected carrier.
+    #[must_use]
+    pub fn candidate_envelope(&self, line: &str, path: SignalingPath) -> SignalingEnvelope {
+        SignalingEnvelope::candidate(
+            &self.from,
+            &self.to,
+            &self.sessionid,
+            &self.trace_id,
+            line,
+            path,
+        )
     }
 
     /// Build the [`OfferEnvelopeArgs`] for this flow from a built SDP + the cloud
@@ -503,23 +525,6 @@ impl SignalingFlow {
             tcp_token,
             log,
         }
-    }
-
-    /// Build the outbound trickle `candidate` envelopes for one ICE candidate
-    /// line — one per [`SignalingPath`] (`mqtt`+`lan`), matching cap3. An empty
-    /// `line` is the valid end-of-candidates sentinel.
-    #[must_use]
-    pub fn candidate_envelopes(&self, line: &str) -> [SignalingEnvelope; 2] {
-        [SignalingPath::Mqtt, SignalingPath::Lan].map(|path| {
-            SignalingEnvelope::candidate(
-                &self.from,
-                &self.to,
-                &self.sessionid,
-                &self.trace_id,
-                line,
-                path,
-            )
-        })
     }
 
     /// Ingest an inbound 302 envelope. An `answer` advances to
@@ -580,45 +585,155 @@ pub struct NegotiationOutcome {
     /// The parsed camera answer (remote ICE creds + media key + relay descriptors).
     pub answer: ParsedAnswer,
     /// The remote ICE candidate lines (`a=candidate:…`) trickled over 302, in
-    /// arrival order and de-duplicated (the camera re-sends each over `mqtt`+`lan`).
+    /// arrival order and de-duplicated (a carrier may retransmit one).
     /// The empty end-of-candidates sentinel is filtered out.
     pub remote_candidates: Vec<String>,
 }
 
-/// A 302 signaling session bound to an [`MqttTransport`]: the engine-free
-/// orchestrator that frames + publishes the offer/candidates and decrypts +
-/// parses inbound 302 frames into [`InboundSignal`]s.
+/// One already-unwrapped signaling envelope received from a carrier.
+#[derive(Debug, Clone)]
+pub struct InboundEnvelope {
+    /// Carrier-specific source label used only by diagnostics (the MQTT broker
+    /// topic or the stable label `lan`).
+    pub source: Option<String>,
+    /// Raw `{header,msg}` JSON, with the carrier's framing/authentication removed.
+    pub json: Vec<u8>,
+}
+
+/// Transport-neutral carrier for Tuya 302 signaling envelopes.
 ///
-/// This is the transport-coupled layer shared by the live `rumqttc` path
-/// ([`super::transport::connect_and_negotiate`]) and the offline mock-transport
-/// tests. It owns a [`SignalingFlow`] (routing ids + lifecycle) plus the device
-/// `localKey`/`dev_id`/`pv` needed to wrap each envelope in the binary
-/// message-2.2 302 frame ([`super::mqtt_crypto::build_302_frame`], cap5-pinned).
+/// Implementations own their wire framing and authentication.  The session
+/// layer emits exactly one envelope using [`path`](Self::path); it never clones
+/// an envelope onto a second carrier.
+pub trait SignalingTransport {
+    /// Header path placed on every outbound envelope for this carrier.
+    fn path(&self) -> SignalingPath;
+
+    /// Authenticate/frame and send one raw signaling JSON document.
+    fn send_json(&mut self, json: &[u8]) -> Result<(), Error>;
+
+    /// Receive one authenticated/unframed signaling JSON document, if ready.
+    fn try_recv_json(&mut self) -> Result<Option<InboundEnvelope>, Error>;
+
+    /// Frames rejected before yielding JSON. The default suits transports whose
+    /// authentication failure is returned as an error; MQTT overrides it because
+    /// unrelated protocols share its topic.
+    fn rejected_before_json(&self) -> usize {
+        0
+    }
+}
+
+/// Message-2.2 framing adapter that preserves the existing MQTT carrier seam.
 ///
-/// The transport is a generic seam, so the full publish → poll → answer flow is
-/// exercised offline against a fake in-memory transport with NO broker (see the
-/// `session.rs` tests), and the identical code drives the live broker unchanged.
-pub struct MqttSignalingSession<'a, T: MqttTransport> {
+/// `MqttTransport` remains deliberately low-level (encrypted broker payloads),
+/// while this adapter presents the same raw-JSON contract as the local frame-32
+/// carrier.  This is the boundary that prevents a `path:"lan"` envelope from
+/// accidentally being published to MQTT again.
+pub struct MqttSignalingTransport<'a, T: MqttTransport> {
     transport: &'a mut T,
-    flow: SignalingFlow,
     local_key: Vec<u8>,
     dev_id: String,
     pv: String,
-    /// Per-publish `s`(sequence) / `o`(order) counters for the message-2.2 frame.
-    /// The camera dedups `(devId,s,o)` over a 5 s window (`qdddqdp.java:725`), so
-    /// each publish needs a tuple distinct from any *recent* one — for this device,
-    /// across *any* concurrent/retried session, and across separate CLI runs. We
-    /// seed both from independent OS entropy (64-bit tuple entropy ⇒ collision is
-    /// negligible even on a sub-second reconnect) and increment per frame.
     seq: u32,
     order: u32,
-    /// Inbound 302 frames that actually arrived on our topic (decodable or not).
-    inbound_seen: usize,
-    /// Of those, ones we could NOT decode as a 302 under this `local_key`/`pv`.
-    /// If every arrived frame is undecodable, the failure is a wrong localKey/pv —
-    /// surfaced as a distinct error rather than a generic "camera silent".
     inbound_undecodable: usize,
 }
+
+impl<'a, T: MqttTransport> MqttSignalingTransport<'a, T> {
+    /// Wrap an injected low-level MQTT carrier.
+    #[must_use]
+    pub fn new(
+        transport: &'a mut T,
+        local_key: Vec<u8>,
+        dev_id: impl Into<String>,
+        pv: impl Into<String>,
+    ) -> Self {
+        let (seq, order) = seed_so();
+        Self {
+            transport,
+            local_key,
+            dev_id: dev_id.into(),
+            pv: pv.into(),
+            seq,
+            order,
+            inbound_undecodable: 0,
+        }
+    }
+
+    fn next_so(&mut self) -> (u32, u32) {
+        let current = (self.seq, self.order);
+        self.seq = self.seq.wrapping_add(1);
+        self.order = self.order.wrapping_add(1);
+        current
+    }
+}
+
+impl<T: MqttTransport> SignalingTransport for MqttSignalingTransport<'_, T> {
+    fn path(&self) -> SignalingPath {
+        SignalingPath::Mqtt
+    }
+
+    fn send_json(&mut self, json: &[u8]) -> Result<(), Error> {
+        let (sequence, order) = self.next_so();
+        let frame = crate::stream::mqtt_crypto::build_302_frame(
+            json,
+            &self.local_key,
+            &self.pv,
+            sequence,
+            order,
+            now_unix(),
+        )?;
+        self.transport.publish_302(&self.dev_id, &self.pv, &frame)
+    }
+
+    fn try_recv_json(&mut self) -> Result<Option<InboundEnvelope>, Error> {
+        let Some(inbound) = self.transport.try_recv_302()? else {
+            return Ok(None);
+        };
+        let json = match crate::stream::mqtt_crypto::parse_302_frame(
+            &inbound.payload,
+            &self.local_key,
+            &self.pv,
+        ) {
+            Ok(json) => json,
+            Err(error) => {
+                self.inbound_undecodable += 1;
+                if crate::stream::transport::diag_enabled() {
+                    let topic = inbound.topic.as_deref().unwrap_or("<unknown>");
+                    eprintln!(
+                        "302 diag: inbound on topic='{topic}' is not a decodable 302 frame ({error}); skipped"
+                    );
+                }
+                return Ok(None);
+            }
+        };
+        Ok(Some(InboundEnvelope {
+            source: inbound.topic,
+            json,
+        }))
+    }
+
+    fn rejected_before_json(&self) -> usize {
+        self.inbound_undecodable
+    }
+}
+
+/// A 302 signaling session bound to one [`SignalingTransport`]: the engine-free
+/// orchestrator that publishes one offer/candidate per selected carrier and
+/// parses inbound JSON into [`InboundSignal`]s. MQTT message-2.2 and local Tuya
+/// frame-32 authentication live entirely in their carrier adapters.
+pub struct SignalingSession<T: SignalingTransport> {
+    transport: T,
+    flow: SignalingFlow,
+    /// Inbound JSON documents yielded by the selected carrier.
+    inbound_seen: usize,
+    /// Of those, documents that were not valid signaling envelopes.
+    inbound_undecodable: usize,
+}
+
+/// Cloud compatibility alias: the same transport-neutral session over the
+/// message-2.2 MQTT adapter.
+pub type MqttSignalingSession<'a, T> = SignalingSession<MqttSignalingTransport<'a, T>>;
 
 /// Seed the `(s, o)` counters from independent OS entropy so no two sessions for
 /// the same device alias a `(devId,s,o)` tuple inside the camera's 5 s dedup
@@ -638,38 +753,16 @@ fn seed_so() -> (u32, u32) {
     }
 }
 
-impl<'a, T: MqttTransport> MqttSignalingSession<'a, T> {
-    /// Construct a session from an injected transport + flow + the device
-    /// framing material (`local_key` = the 16-byte device localKey, `dev_id` =
-    /// the `gwId`/publish target, `pv` = the device protocol version).
-    pub fn new(
-        transport: &'a mut T,
-        flow: SignalingFlow,
-        local_key: Vec<u8>,
-        dev_id: impl Into<String>,
-        pv: impl Into<String>,
-    ) -> Self {
-        let (seq, order) = seed_so();
+impl<T: SignalingTransport> SignalingSession<T> {
+    /// Construct a session over exactly one selected carrier.
+    #[must_use]
+    pub fn new(transport: T, flow: SignalingFlow) -> Self {
         Self {
             transport,
             flow,
-            local_key,
-            dev_id: dev_id.into(),
-            pv: pv.into(),
-            seq,
-            order,
             inbound_seen: 0,
             inbound_undecodable: 0,
         }
-    }
-
-    /// Take the next `(s, o)` tuple for a publish and advance the counters. Each
-    /// MQTT publish must carry a distinct tuple (camera 5 s dedup).
-    fn next_so(&mut self) -> (u32, u32) {
-        let so = (self.seq, self.order);
-        self.seq = self.seq.wrapping_add(1);
-        self.order = self.order.wrapping_add(1);
-        so
     }
 
     /// The current signaling lifecycle state.
@@ -678,107 +771,74 @@ impl<'a, T: MqttTransport> MqttSignalingSession<'a, T> {
         self.flow.state()
     }
 
-    /// Frame one envelope (the binary message-2.2 frame: pv+crc+s+o+AES-ECB/localKey)
-    /// and publish it on the device's signaling channel through the transport seam.
+    /// Serialize and send one envelope through the selected carrier.
     fn publish_envelope(&mut self, env: &SignalingEnvelope) -> Result<(), Error> {
-        let inner = env.to_json()?;
-        let (s, o) = self.next_so();
-        let frame = crate::stream::mqtt_crypto::build_302_frame(
-            &inner,
-            &self.local_key,
-            &self.pv,
-            s,
-            o,
-            now_unix(),
-        )?;
-        self.transport.publish_302(&self.dev_id, &self.pv, &frame)
+        self.transport.send_json(&env.to_json()?)
     }
 
-    /// Publish the `offer` over BOTH paths (`mqtt` then `lan`), as cap3 sends it.
+    /// Publish the `offer` once over the selected carrier.
     /// Advances the flow to [`SessionState::Connecting`].
     ///
     /// # Errors
     /// [`Error::SignalingParse`]/[`Error::SdpAesKey`] on framing, or
     /// [`Error::Transport`] on a publish failure.
     pub fn publish_offer(&mut self, args: &OfferEnvelopeArgs) -> Result<(), Error> {
-        for env in self.flow.offer_envelopes(args) {
-            self.publish_envelope(&env)?;
-        }
-        Ok(())
+        let env = self.flow.offer_envelope(args, self.transport.path());
+        self.publish_envelope(&env)
     }
 
-    /// Publish one trickle `candidate` line over BOTH paths (`mqtt`+`lan`). An
+    /// Publish one trickle `candidate` line once over the selected carrier. An
     /// empty `line` is the valid end-of-candidates sentinel (cap3).
     ///
     /// # Errors
     /// As [`publish_offer`](Self::publish_offer).
     pub fn publish_candidate(&mut self, line: &str) -> Result<(), Error> {
-        for env in self.flow.candidate_envelopes(line) {
-            self.publish_envelope(&env)?;
-        }
-        Ok(())
+        let env = self.flow.candidate_envelope(line, self.transport.path());
+        self.publish_envelope(&env)
     }
 
-    /// Poll the transport for the next inbound 302 frame, decrypt + parse it, and
+    /// Poll the selected carrier for the next authenticated 302 JSON, parse it, and
     /// classify it as an [`InboundSignal`]. Non-blocking: `Ok(None)` when nothing
     /// is pending (or an empty-sentinel candidate arrived).
     ///
     /// # Errors
     /// - [`Error::Transport`] on a transport receive failure or an unexpected
     ///   inbound `offer` (the client is the offerer).
-    /// - [`Error::SignalingParse`]/[`Error::StreamConfig`]/[`Error::SdpAesKey`]
-    ///   on a malformed frame / wrong localKey / a malformed answer SDP.
+    /// - [`Error::SignalingParse`]/[`Error::SdpAesKey`] on a malformed answer.
     pub fn poll_inbound(&mut self) -> Result<Option<InboundSignal>, Error> {
-        let Some(inbound) = self.transport.try_recv_302()? else {
+        let Some(inbound) = self.transport.try_recv_json()? else {
             return Ok(None);
         };
-        // A frame actually arrived on a topic we accept. Count it so a timeout can
-        // distinguish "no frames at all" (camera silent) from "frames arrived but
-        // none decoded" (wrong localKey/pv).
+        // Count carrier-authenticated JSON so a timeout can distinguish a silent
+        // camera from unrelated/invalid inbound data.
         self.inbound_seen += 1;
         let diag = crate::stream::transport::diag_enabled();
-        let topic = inbound.topic.as_deref().unwrap_or("<unknown>");
-
-        // Decrypt the localKey-AES 302 frame. The camera multiplexes OTHER Tuya
-        // message protocols on `smart/mb/in/<devId>` (observed live: `protocol:23`
-        // status/heartbeat frames, plus user pushes on sibling topics in diag mode).
-        // A frame we cannot decode as a 302 is simply not our answer — SKIP it and
-        // keep polling rather than aborting the whole negotiation. (Validated live:
-        // the camera's real `Answer`/`Candidate` frames interleave with protocol-23
-        // frames on the same topic.)
-        let inner = match crate::stream::mqtt_crypto::parse_302_frame(
-            &inbound.payload,
-            &self.local_key,
-            &self.pv,
-        ) {
-            Ok(inner) => inner,
-            Err(e) => {
-                self.inbound_undecodable += 1;
-                if diag {
-                    eprintln!(
-                        "302 diag: inbound on topic='{topic}' is NOT a decodable 302 frame ({e}); skipped"
-                    );
-                }
-                return Ok(None);
-            }
-        };
-        let env = match SignalingEnvelope::from_json(&inner) {
+        let source = inbound.source.as_deref().unwrap_or("<local>");
+        let env = match SignalingEnvelope::from_json(&inbound.json) {
             Ok(env) => env,
             Err(e) => {
                 self.inbound_undecodable += 1;
                 if diag {
                     eprintln!(
-                        "302 diag: inbound on topic='{topic}' decrypted but is NOT a 302 envelope ({e}); skipped"
+                        "302 diag: inbound from '{source}' is not a signaling envelope ({e}); skipped"
                     );
                 }
                 return Ok(None);
             }
         };
+        if !self.flow.correlates(&env) {
+            if diag {
+                eprintln!(
+                    "302 diag: ignored stale/unrelated {:?} from '{source}' (session/trace mismatch)",
+                    env.header.r#type
+                );
+            }
+            return Ok(None);
+        }
         if diag {
-            // TASK-0080 AC#3: log the EXACT topic + header.type of every accepted
-            // 302 (body withheld) so the live run reveals WHERE the camera answers.
+            // Log carrier source + header.type, never the body.
             eprintln!(
-                "302 diag: ACCEPTED 302 on topic='{topic}' header.type={:?} (body withheld)",
+                "302 diag: accepted 302 from '{source}' header.type={:?} (body withheld)",
                 env.header.r#type
             );
         }
@@ -814,7 +874,7 @@ impl<'a, T: MqttTransport> MqttSignalingSession<'a, T> {
     /// ICE candidates ([`NegotiationOutcome`]) — the robust live path (TASK-0077).
     ///
     /// Phase 1 (answer wait): publish the `offer`, then each local `candidate`
-    /// plus the end-of-candidates sentinel (all over `mqtt`+`lan`), then poll up to
+    /// plus the end-of-candidates sentinel over the selected carrier, then poll up to
     /// `answer_polls` times for the camera `answer`, collecting any remote
     /// `candidate` that arrives interleaved before it.
     ///
@@ -825,7 +885,7 @@ impl<'a, T: MqttTransport> MqttSignalingSession<'a, T> {
     /// transport needs *only* arrives here. A `disconnect` ends the window early.
     ///
     /// `poll_interval` is slept after an empty (non-blocking) poll to pace the live
-    /// `rumqttc` transport; offline tests pass [`Duration::ZERO`] (a no-op sleep)
+    /// carrier; offline tests pass [`Duration::ZERO`] (a no-op sleep)
     /// so they run instantly against a pre-loaded fake transport.
     ///
     /// Transport-generic, so the offline tests run the whole exchange — including
@@ -877,23 +937,28 @@ impl<'a, T: MqttTransport> MqttSignalingSession<'a, T> {
                 None => sleep_nonzero(poll_interval),
             }
         }
+        let carrier_undecodable = self.transport.rejected_before_json();
+        // JSON yielded by the carrier is already counted in `self.inbound_seen`;
+        // add only frames the carrier rejected before it could yield JSON.
+        let total_seen = self.inbound_seen + carrier_undecodable;
+        let total_undecodable = self.inbound_undecodable + carrier_undecodable;
         let answer = match answer {
             Some(a) => a,
-            // Distinguish a genuinely-silent camera from a wrong-key misconfig: if
-            // frames DID arrive on our topic but none decoded as a 302 under this
-            // localKey/pv, that is the diagnostic, not "camera silent".
-            None if self.inbound_seen > 0 && self.inbound_seen == self.inbound_undecodable => {
+            // Distinguish a silent camera from rejected carrier frames (for MQTT,
+            // commonly a wrong localKey/pv). LAN authentication failures surface
+            // directly before this loop.
+            None if total_seen > 0 && total_seen == total_undecodable => {
                 return Err(Error::Transport(format!(
-                    "received {} frame(s) on the 302 topic but NONE decoded as a 302 under the \
+                    "received {} frame(s) on the selected 302 carrier but NONE decoded as a 302 under the \
                      configured localKey/pv — likely a wrong localKey or pv (not camera-silent)",
-                    self.inbound_seen
+                    total_seen
                 )));
             }
             None => {
                 return Err(Error::Transport(format!(
                     "no answer received within {answer_polls} polls (camera silent; \
                      {} inbound frame(s) seen, {} undecodable)",
-                    self.inbound_seen, self.inbound_undecodable
+                    total_seen, total_undecodable
                 )));
             }
         };
@@ -971,18 +1036,16 @@ pub fn has_usable_host_candidate(lines: &[String]) -> bool {
         .any(|c| c.kind == CandidateKind::Host)
 }
 
-/// Append `line` to `out` only if not already present. Trickle candidates are
-/// re-sent over BOTH the `mqtt` and `lan` paths (cap4), so the same
-/// `a=candidate:` line arrives twice — dedupe by exact line to avoid a doubled
-/// candidate set.
+/// Append `line` to `out` only if not already present. A carrier/camera may
+/// retransmit a trickle candidate, so dedupe by exact line.
 fn push_unique(out: &mut Vec<String>, line: String) {
     if !out.contains(&line) {
         out.push(line);
     }
 }
 
-/// Sleep only for a non-zero duration. The live path paces its non-blocking polls
-/// (e.g. 20 ms) so it does not busy-spin the rumqttc eventloop; offline tests pass
+/// Sleep only for a non-zero duration. A live carrier may pace its non-blocking
+/// polls here; offline tests pass
 /// [`Duration::ZERO`], for which this is an instant no-op (no scheduler hit).
 fn sleep_nonzero(d: Duration) {
     if !d.is_zero() {
@@ -1106,7 +1169,7 @@ mod tests {
     fn answer_env(sdp: &str) -> SignalingEnvelope {
         let json = format!(
             "{{\"header\":{{\"from\":\"DEV\",\"to\":\"USER\",\"path\":\"mqtt\",\
-             \"sessionid\":\"S\",\"sub_dev_id\":\"\",\"trace_id\":\"t\",\"type\":\"answer\"}},\
+             \"sessionid\":\"SESS\",\"sub_dev_id\":\"\",\"trace_id\":\"trace-1\",\"type\":\"answer\"}},\
              \"msg\":{{\"sdp\":{}}}}}",
             serde_json::Value::String(sdp.to_string())
         );
@@ -1114,7 +1177,7 @@ mod tests {
     }
 
     // The LIVE driver MUST report StreamPending — never a fake stream — but it now
-    // DOES build + publish the offer over both paths (mqtt+lan) before gating.
+    // DOES build + publish one MQTT offer before gating.
     #[test]
     fn run_publishes_offer_then_stream_pending() {
         let creds = synth_credentials();
@@ -1129,10 +1192,10 @@ mod tests {
             );
             assert_eq!(driver.state(), SessionState::Connecting);
         }
-        // The offer WAS published over both paths; each frame parses back to a
+        // The offer WAS published once; the frame parses back to a
         // valid offer envelope under the device localKey (proves the 302 frame
         // build path is real, not stubbed).
-        assert_eq!(t.published.len(), 2, "offer published over mqtt + lan");
+        assert_eq!(t.published.len(), 1, "offer published once over MQTT");
         for frame in &t.published {
             let inner = crate::stream::mqtt_crypto::parse_302_frame(
                 frame,
@@ -1241,8 +1304,8 @@ mod tests {
         ));
     }
 
-    // The SignalingFlow state machine: offer (mqtt+lan) → trickle candidates
-    // (mqtt+lan) → answer → ParsedAnswer, advancing state at each step.
+    // The SignalingFlow state machine: one selected carrier's offer → trickle
+    // candidate → answer → ParsedAnswer, advancing state at each step.
     #[test]
     fn signaling_flow_offer_trickle_answer() {
         use crate::stream::signaling::IceServer;
@@ -1270,19 +1333,19 @@ mod tests {
             None,
             None,
         );
-        let offers = flow.offer_envelopes(&args);
+        let offer = flow.offer_envelope(&args, SignalingPath::Mqtt);
         assert_eq!(flow.state(), SessionState::Connecting);
-        assert_eq!(offers[0].header.path, Some(SignalingPath::Mqtt));
-        assert_eq!(offers[1].header.path, Some(SignalingPath::Lan));
-        assert!(offers[0].msg.sdp.as_deref().unwrap().contains("imm 6001"));
+        assert_eq!(offer.header.path, Some(SignalingPath::Mqtt));
+        assert!(offer.msg.sdp.as_deref().unwrap().contains("imm 6001"));
 
-        let cands =
-            flow.candidate_envelopes("a=candidate:1 1 UDP 2130706431 10.0.2.15 58363 typ host\r\n");
-        assert_eq!(cands.len(), 2);
-        assert_eq!(cands[0].header.r#type, SignalingType::Candidate);
+        let cand = flow.candidate_envelope(
+            "a=candidate:1 1 UDP 2130706431 10.0.2.15 58363 typ host\r\n",
+            SignalingPath::Mqtt,
+        );
+        assert_eq!(cand.header.r#type, SignalingType::Candidate);
 
         // A candidate ingests to None; an answer ingests to ParsedAnswer.
-        assert!(flow.ingest(&cands[0]).unwrap().is_none());
+        assert!(flow.ingest(&cand).unwrap().is_none());
         let answer = answer_env(
             "v=0\r\nm=application 9 tuya 6001\r\na=ice-ufrag:SYN0\r\na=ice-pwd:SYNTHICEPWD0000000000000\r\na=aes-key:00112233445566778899aabbccddeeff\r\n",
         );
@@ -1337,20 +1400,18 @@ mod tests {
     }
 
     fn new_session(t: &mut FakeTransport) -> MqttSignalingSession<'_, FakeTransport> {
+        let carrier = MqttSignalingTransport::new(t, SYNTH_LK.to_vec(), "DEV", "2.2");
         MqttSignalingSession::new(
-            t,
+            carrier,
             SignalingFlow::new("USER", "DEV", "SESS", "trace-1"),
-            SYNTH_LK.to_vec(),
-            "DEV",
-            "2.2",
         )
     }
 
-    // Publish: the offer + a candidate each go out over BOTH paths (mqtt, lan),
+    // Publish: the offer + a candidate each go out exactly once over MQTT,
     // and each published payload decrypts back to the right type/path under the
     // device localKey (proves the framing is real, not stubbed).
     #[test]
-    fn session_publishes_offer_and_candidates_over_both_paths() {
+    fn session_publishes_offer_and_candidates_once_on_selected_path() {
         let mut t = FakeTransport::default();
         let args = synth_offer_args();
         {
@@ -1360,17 +1421,13 @@ mod tests {
                 .unwrap();
             assert_eq!(s.state(), SessionState::Connecting);
         }
-        assert_eq!(
-            t.published.len(),
-            4,
-            "offer(2) + candidate(2) over both paths"
-        );
+        assert_eq!(t.published.len(), 2, "offer + candidate are each sent once");
         let mut got = Vec::new();
         for (i, frame) in t.published.iter().enumerate() {
             let inner =
                 crate::stream::mqtt_crypto::parse_302_frame(frame, SYNTH_LK, "2.2").unwrap();
             let env = SignalingEnvelope::from_json(&inner).unwrap();
-            let want = if i < 2 {
+            let want = if i == 0 {
                 SignalingType::Offer
             } else {
                 SignalingType::Candidate
@@ -1378,15 +1435,7 @@ mod tests {
             assert_eq!(env.header.r#type, want);
             got.push(env.header.path.unwrap());
         }
-        assert_eq!(
-            got,
-            vec![
-                SignalingPath::Mqtt,
-                SignalingPath::Lan,
-                SignalingPath::Mqtt,
-                SignalingPath::Lan
-            ]
-        );
+        assert_eq!(got, vec![SignalingPath::Mqtt, SignalingPath::Mqtt]);
     }
 
     // Poll: an inbound answer frame decrypts + parses into an Answer signal that
@@ -1410,6 +1459,33 @@ mod tests {
         assert_eq!(s.state(), SessionState::Answered);
         // Inbound drained → next poll is None.
         assert!(s.poll_inbound().unwrap().is_none());
+    }
+
+    #[test]
+    fn session_ignores_wrong_trace_and_session_before_current_answer() {
+        let sdp = "v=0\r\nm=application 9 tuya 6001\r\na=ice-ufrag:SYN0\r\na=ice-pwd:SYNTHICEPWD0000000000000\r\na=aes-key:00112233445566778899aabbccddeeff\r\n";
+        let mut wrong_trace = answer_env(sdp);
+        wrong_trace.header.trace_id = Some("stale-trace".to_string());
+        let mut wrong_session = answer_env(sdp);
+        wrong_session.header.sessionid = Some("STALE-SESSION".to_string());
+        let mut uncorrelated = answer_env(sdp);
+        uncorrelated.header.trace_id = None;
+        uncorrelated.header.sessionid = None;
+        let current = answer_env(sdp);
+
+        let mut t = FakeTransport::default();
+        t.inbound.push_back(frame_for(&wrong_trace));
+        t.inbound.push_back(frame_for(&wrong_session));
+        t.inbound.push_back(frame_for(&uncorrelated));
+        t.inbound.push_back(frame_for(&current));
+        let mut session = new_session(&mut t);
+        assert!(session.poll_inbound().unwrap().is_none());
+        assert!(session.poll_inbound().unwrap().is_none());
+        assert!(session.poll_inbound().unwrap().is_none());
+        assert!(matches!(
+            session.poll_inbound().unwrap(),
+            Some(InboundSignal::Answer(_))
+        ));
     }
 
     // Poll: a non-empty inbound candidate surfaces as RemoteCandidate; the empty
@@ -1472,18 +1548,19 @@ mod tests {
             "v=0\r\nm=application 9 tuya 6001\r\na=ice-ufrag:x\r\na=ice-pwd:y\r\na=aes-key:00112233445566778899aabbccddeeff\r\n",
         );
         t.inbound.push_back(frame_for(&answer)); // built with SYNTH_LK
-        let mut s = MqttSignalingSession::new(
+        let carrier = MqttSignalingTransport::new(
             &mut t,
-            SignalingFlow::new("USER", "DEV", "SESS", "t"),
             b"fedcba9876543210".to_vec(), // secret-scan:allow (synthetic wrong key)
             "DEV",
             "2.2",
         );
+        let mut s =
+            MqttSignalingSession::new(carrier, SignalingFlow::new("USER", "DEV", "SESS", "t"));
         // Wrong key ⇒ the frame is undecodable ⇒ skipped (Ok(None)), not an error.
         assert!(s.poll_inbound().unwrap().is_none());
     }
 
-    // negotiate(): publish offer + candidate + sentinel over both paths, then poll
+    // negotiate(): publish offer + candidate + sentinel once each, then poll
     // for the pre-loaded answer and return the ParsedAnswer. Full exchange offline.
     #[test]
     fn session_negotiate_full_exchange_returns_answer() {
@@ -1500,8 +1577,8 @@ mod tests {
         };
         assert_eq!(parsed.remote_ufrag, "SYN0");
         assert_eq!(parsed.media_key.len(), 16);
-        // offer(2) + 1 candidate(2) + end-of-candidates sentinel(2) = 6 frames.
-        assert_eq!(t.published.len(), 6);
+        // offer + one candidate + end-of-candidates sentinel = 3 frames.
+        assert_eq!(t.published.len(), 3);
     }
 
     // A wrong localKey must NOT be reported as "camera silent": frames arrive on
@@ -1520,13 +1597,14 @@ mod tests {
         let args = synth_offer_args();
         let cands: Vec<String> = Vec::new();
         let err = {
-            let mut s = MqttSignalingSession::new(
+            let carrier = MqttSignalingTransport::new(
                 &mut t,
-                SignalingFlow::new("USER", "DEV", "SESS", "t"),
                 b"fedcba9876543210".to_vec(), // secret-scan:allow (synthetic wrong key)
                 "DEV",
                 "2.2",
             );
+            let mut s =
+                MqttSignalingSession::new(carrier, SignalingFlow::new("USER", "DEV", "SESS", "t"));
             s.negotiate(&args, &cands, 8)
                 .expect_err("wrong localKey must not negotiate an answer")
         };
@@ -1539,7 +1617,7 @@ mod tests {
 
     // negotiate_with_trickle(): the camera's host candidate arrives as TRICKLED
     // 302 `candidate` messages (the answer SDP carries none — cap3/cap4). Phase 2
-    // must collect the post-answer candidates; duplicates over mqtt+lan are
+    // must collect the post-answer candidates; retransmitted duplicates are
     // deduped, the empty end-of-candidates sentinel is filtered, and a candidate
     // interleaved BEFORE the answer is collected too.
     #[test]
@@ -1556,9 +1634,9 @@ mod tests {
         let answer = answer_env(
             "v=0\r\nm=application 9 tuya 6001\r\na=ice-ufrag:SYN0\r\na=ice-pwd:SYNTHICEPWD0000000000000\r\na=aes-key:00112233445566778899aabbccddeeff\r\n",
         );
-        // Same host candidate line trickled over BOTH paths after the answer.
+        // Same host candidate line retransmitted after the answer.
         let host_line = "a=candidate:2 1 UDP 2130706431 10.0.2.15 58363 typ host\r\n";
-        let host_mqtt = SignalingEnvelope::candidate(
+        let host = SignalingEnvelope::candidate(
             "DEV",
             "USER",
             "SESS",
@@ -1566,17 +1644,17 @@ mod tests {
             host_line,
             SignalingPath::Mqtt,
         );
-        let host_lan = SignalingEnvelope::candidate(
+        let host_retransmit = SignalingEnvelope::candidate(
             "DEV",
             "USER",
             "SESS",
             "trace-1",
             host_line,
-            SignalingPath::Lan,
+            SignalingPath::Mqtt,
         );
         let sentinel =
             SignalingEnvelope::candidate("DEV", "USER", "SESS", "trace-1", "", SignalingPath::Mqtt);
-        for f in [&cand_pre, &answer, &host_mqtt, &host_lan, &sentinel] {
+        for f in [&cand_pre, &answer, &host, &host_retransmit, &sentinel] {
             t.inbound.push_back(frame_for(f));
         }
         let args = synth_offer_args();
@@ -1589,11 +1667,11 @@ mod tests {
         };
         assert_eq!(outcome.answer.remote_ufrag, "SYN0");
         assert_eq!(outcome.answer.media_key.len(), 16);
-        // srflx (pre-answer) + host (post-answer, deduped across mqtt+lan) = 2.
+        // srflx (pre-answer) + host (post-answer, deduped) = 2.
         assert_eq!(
             outcome.remote_candidates.len(),
             2,
-            "srflx + host, the host deduped across mqtt+lan"
+            "srflx + host, the retransmitted host deduped"
         );
         assert!(outcome
             .remote_candidates
@@ -1634,7 +1712,7 @@ mod tests {
             "v=0\r\nm=application 9 tuya 6001\r\na=ice-ufrag:SYN0\r\na=ice-pwd:SYNTHICEPWD0000000000000\r\na=aes-key:00112233445566778899aabbccddeeff\r\n",
         );
         t.inbound.push_back(frame_for(&answer));
-        // One post-answer host candidate (over mqtt+lan = 2 frames), then nothing.
+        // One post-answer host candidate retransmitted twice, then nothing.
         let host = SignalingEnvelope::candidate(
             "DEV",
             "USER",

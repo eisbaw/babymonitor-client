@@ -1,79 +1,30 @@
-//! Tuya WebRTC-over-MQTT live A/V session client (the RE-derived Tuya-custom
-//! protocol layer).
+//! RE-derived Tuya live A/V protocol implementation.
 //!
-//! This module implements the **Tuya-custom delta** of the live-stream session —
-//! the part that standard WebRTC (webrtc-rs) does NOT cover and that the reverse
-//! engineering of `libThingP2PSDK.so` + the Java `P2PMQTTServiceManager` actually
-//! recovered (`re/webrtc_session.md`, the implementable spec). Concretely:
+//! Signaling uses the shared `{header,msg}` offer/answer/candidate codec in
+//! [`signaling`] over exactly one selected carrier:
 //!
-//! - [`signaling`] — the MQTT **302** inner-envelope `{header, msg}` serde codec
-//!   (offer/answer/candidate), matching the cap3 capture: `msg` is an OBJECT
-//!   (`{sdp|candidate, token:[ices], tcp_token, log}`), not a string
-//!   (`re/webrtc_session.md` §2 + `emulator_captures/cap3/signaling_plaintext.jsonl`).
-//! - [`mqtt_crypto`] — the SDP `a=aes-key:<hex>` media-key hex codec (byte-exact,
-//!   `re/webrtc_session.md` §3c) + the 302 localKey-AES (AES-128/ECB/PKCS5,
-//!   key=localKey, no IV) wrapped in the **binary Tuya message-2.2 frame**
-//!   (`pv ++ crc32 ++ s ++ o ++ AES`, cap5-pinned — `re/mqtt_2_2_frame.md`).
-//! - [`connect`] — the `connect_v2` control-JSON builder (byte-exact template,
-//!   `re/webrtc_session.md` §1).
-//! - [`sdp`] — parse/emit the Tuya-custom `m=application` + `a=aes-key` section
-//!   (`re/webrtc_session.md` §3c).
-//! - [`frame`] — the `imm_p2p_rtc_frame_t` → typed [`frame::Frame`] model + codec
-//!   ids (`re/webrtc_session.md` §4).
-//! - [`media`] — the cap3 **PATH A** media receive→decode engine
-//!   ([`media::MediaEngine`]): UDP → (suite-3) HMAC verify+strip → hand-rolled
-//!   ikcp RX with a per-segment AES-128-CBC/GCM decrypt hook → `frg` reassembly →
-//!   12-byte RTP parse → [`media::MediaUnit`], plus H.264 STAP-A/FU-A depacketize
-//!   and ICE candidate parse/select (`re/media_decode_spec.md`). This is the
-//!   AES/KCP transport the cap3 `a=rtpmap:6001 AES/KCP` codec negotiates — fully
-//!   offline-unit-tested against synthetic vectors; live UDP/ICE connectivity is
-//!   gated (no camera in-sandbox).
-//! - [`session`] — the session **state machine** + a [`session::WebRtcEngine`]
-//!   trait seam + an [`session::MqttTransport`] seam + the **#[ignore]d live
-//!   driver** that is honestly gated on auth + a live device.
+//! - cloud MQTT uses [`mqtt_crypto`] message-2.2 framing and the live
+//!   [`transport`] adapter;
+//! - local mode uses authenticated Tuya 3.4/3.5 commands 3/4/5 plus
+//!   `IPC_LAN_302` frame type 32 in [`tuya_lan`] and [`lan_transport`].
 //!
-//! # The webrtc-rs decision (stated, with rationale)
+//! [`session`] owns the transport-neutral negotiation and strict trace/session
+//! correlation. [`sdp`] carries the ICE credentials and media AES key. The media
+//! path is Tuya's custom host-direct UDP + ICE/STUN + KCP + authenticated
+//! AES-CBC/GCM framing, implemented by [`media`]; it is not DTLS-SRTP and does
+//! not require webrtc-rs.
 //!
-//! The actual standard-WebRTC engine (PeerConnection / DTLS-SRTP / SRTP /
-//! RTP-depacketize) is **webrtc-rs's** job, NOT this module's. We deliberately do
-//! **NOT** vendor webrtc-rs into the offline build here, for two reasons:
-//!
-//! 1. **Offline gate.** webrtc-rs drags in hundreds of transitive crates (tokio,
-//!    rustls, ring, sctp, dtls, …). The project's `just assert-offline` gate
-//!    requires the test suite to build+enumerate with `--offline`; bloating the
-//!    tree risks that discipline. The *valuable, RE-recovered* protocol surface
-//!    is the Tuya-custom delta above, which is fully unit-testable with no media
-//!    stack at all.
-//! 2. **Honest scope.** The live media path cannot run until an authenticated
-//!    device session and a real SCD921 returning `p2pType=4` are present. The
-//!    device-list / `CameraInfoBean` creds the session needs come from the cloud
-//!    auth path or an injected session, while this core module deliberately stays
-//!    offline-testable. Wiring webrtc-rs now would be a large dependency that
-//!    cannot be exercised end-to-end in the current harness, i.e. an unflagged
-//!    half-add. Instead we define the [`session::WebRtcEngine`] trait seam so the
-//!    media engine plugs in WITHOUT touching the protocol layer, and FILE the
-//!    webrtc-rs wiring as a follow-up (TASK-0037).
-//!
-//! The MQTT transport (`rumqttc`) IS wired, but behind the
-//! [`session::MqttTransport`] seam so the offline tests feed 302 messages through
-//! a fake transport with no live broker.
-//!
-//! # Honest status
-//!
-//! This layer **builds + unit-tests pass static-only**, and the signaling is now
-//! byte-validated against the cap3 capture (offer SDP structure + inner 302
-//! plaintext). It still **cannot stream**: the live driver returns
-//! [`crate::Error::StreamPending`] because (1) the live MQTT broker needs CONNECT
-//! creds whose password is **native-derived** (`doCommandNative(2, ecode)`) and
-//! not statically recoverable (`re/mqtt_signaling.md`), (2) the WebRTC media
-//! engine (webrtc-rs) is a follow-up, and (3) every runtime input (token, p2pId,
-//! p2pKey, ices, session, localKey, pv) rides an authenticated device session this
-//! core module does not establish. The 302 envelope framing is **no longer**
-//! pending — it is implemented + round-trip-tested. Exactly the signer's
-//! TOKEN-PENDING discipline: never a fake stream, never `todo!()`.
+//! The production CLI wires signaling through media and output under its `live`
+//! feature. Cloud mode needs an authorized session/runtime record; LAN mode needs
+//! an already paired camera's owner-provisioned IP, device ID, sender ID,
+//! localKey, and Hgw version. Offline tests exercise both carrier state machines
+//! and the media codecs without fabricating an owner-camera result. A real
+//! WAN-blocked LAN frame remains the explicit TASK-0126 live proof.
 
 pub mod connect;
 pub mod frame;
+pub mod lan_config;
+pub mod lan_transport;
 pub mod media;
 pub mod mqtt_auth;
 pub mod mqtt_crypto;
@@ -86,6 +37,7 @@ pub mod transport;
 pub mod tuya_lan;
 
 use crate::Error;
+use zeroize::Zeroize;
 
 /// Render an `Option<String>`-shaped secret for `Debug` without leaking its
 /// value. Mirrors the redaction helpers in `sign.rs` / `device.rs`.
@@ -93,58 +45,59 @@ fn dbg_secret(s: &str) -> String {
     format!("<redacted len={}>", s.len())
 }
 
-/// All runtime/auth-gated inputs the live session needs, **injected** as one
-/// struct (the key discipline — mirrors [`crate::sign::SigningKeyMaterial`]).
+/// Carrier-neutral credential container injected into offer/media assembly.
 ///
-/// NONE of these are in the APK; every value comes from ONE authed device-list /
-/// `CameraInfoBean` call on the user's own account (`re/webrtc_session.md` §1a,
-/// §9). They are injected (not read from `secrets/` inside this module) so the
-/// caller owns the secret lifetimes, and the secret-bearing fields are
-/// **redacted** from `Debug` so a session never leaks via `{:?}`.
+/// Cloud mode populates the full record from the owner's authorized device and
+/// `rtc.config` responses. LAN mode populates the shared device/sender/localKey
+/// and optional media-password fields from its secure pre-provisioned cache;
+/// cloud-only token/relay/session fields are empty and never validated or used.
+/// Secret-bearing fields are redacted from `Debug` and zeroized on drop.
 ///
 /// Tests construct this with SYNTHETIC values only (CLAUDE.md).
 #[derive(Clone)]
 pub struct StreamCredentials {
-    /// Per-session signaling token (`connect_v2` `token`; echoed in 302
-    /// `token`). Issued per-session by the cloud — NOT a static constant.
-    /// **SECRET**.
+    /// Cloud-only per-session signaling token. Empty and unused in LAN mode.
+    /// **SECRET** when present.
     pub token: String,
-    /// The P2P device handle = `CameraInfoBean.p2pId` (IOTC UID) → `connect_v2`
-    /// `remote_id`. Per-device, account-linked. Sensitive.
+    /// Sender/account routing ID used as `header.from` and SDP cname. In cloud
+    /// mode the runtime assembler supplies the account UID; LAN mode loads the
+    /// same pre-provisioned value from its secure cache. Sensitive.
     pub p2p_id: String,
-    /// The Tuya cloud device id (`devId`) → `connect_v2` `dev_id`; also the MQTT
-    /// publish target. Account-linked PII.
+    /// Tuya device ID: signaling `header.to` on both carriers and the MQTT
+    /// publish target in cloud mode. Account-linked PII.
     pub dev_id: String,
-    /// Capability JSON (`CameraInfoBean.skill`) → `connect_v2` `skill` (emitted
-    /// UNQUOTED — must be a valid JSON object/value).
+    /// Cloud capability JSON. LAN offer assembly uses `{}` and does not consume
+    /// cloud capability/session control.
     pub skill: String,
-    /// `P2pConfig.p2pKey` — the P2P session key. **SECRET**.
+    /// Cloud `P2pConfig.p2pKey`. Empty and unused in LAN mode. **SECRET**.
     pub p2p_key: String,
-    /// `P2pConfig.ices` — the STUN/TURN server list (NOT static). Carried as the
-    /// raw JSON string the cloud returns; fed to the WebRTC ICE engine.
+    /// Cloud STUN/TURN server JSON. LAN mode uses `[]` and host-direct ICE.
     pub ices: String,
-    /// `P2pConfig.session` — the session descriptor. **SECRET**.
+    /// Cloud session descriptor. Empty/unused in LAN mode. **SECRET**.
     pub session: String,
-    /// `P2pConfig.tcpRelay` as a compact JSON string — echoed (with a re-minted
+    /// Cloud `P2pConfig.tcpRelay` as a compact JSON string — echoed (with a re-minted
     /// `sessionId`) as the offer `msg.tcp_token` (cap3). `""` if the cloud returned
     /// none, in which case the offer omits it. **SECRET-adjacent** (relay HMAC).
     pub tcp_relay: String,
-    /// `P2pConfig.log` as a compact JSON string — passed through verbatim as the
+    /// Cloud `P2pConfig.log` as a compact JSON string — passed through verbatim as the
     /// offer `msg.log` (cap3). `""` if absent. **SECRET-adjacent** (log auth key).
     pub log: String,
-    /// The device `localKey` — the AES key for the 302 MQTT payload. **SECRET**.
+    /// Device `localKey`: MQTT inner-payload AES key in cloud mode and the root
+    /// authentication/session key for Tuya LAN 3.4/3.5. **SECRET**.
     pub local_key: String,
-    /// Protocol version (`DeviceBean.pv`) — the `pv` arg of the MQTT publish.
+    /// Carrier protocol label: cloud `DeviceBean.pv` for MQTT; LAN retains the
+    /// Hgw version here for diagnostics while `Lan302ConnectConfig` carries the
+    /// parsed version used on the wire.
     pub pv: String,
-    /// The camera-info `password` (`rtc.config result.password`) — the password
-    /// field of the conv=0 media-start AUTH PDU (`SendAuthorizationInfo`, username
-    /// `"admin"`). `""` if the cloud returned none (then no auth PDU is sent).
-    /// **SECRET** — never logged.
+    /// Camera-info password used to derive the conv=0 media-start AUTH value.
+    /// Cloud mode receives it from `rtc.config`; LAN may use a cached
+    /// owner-provisioned value whose reset/refresh stability is unproven. Empty
+    /// means no AUTH PDU. **SECRET** — never logged.
     pub media_auth_password: String,
 }
 
 impl StreamCredentials {
-    /// Validate that no load-bearing handle is empty. A live session with an
+    /// Validate cloud-mode load-bearing handles. A cloud live session with an
     /// empty `token`/`p2p_id`/`dev_id`/`local_key` cannot succeed, so we reject
     /// it loudly up front rather than emitting a malformed `connect_v2` / a
     /// broken AES key.
@@ -165,6 +118,26 @@ impl StreamCredentials {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for StreamCredentials {
+    fn drop(&mut self) {
+        // The struct is shared by cloud and LAN setup, so clear every owned
+        // account/device/session string rather than trying to maintain a second,
+        // inevitably drifting list of which fields are sensitive.
+        self.token.zeroize();
+        self.p2p_id.zeroize();
+        self.dev_id.zeroize();
+        self.skill.zeroize();
+        self.p2p_key.zeroize();
+        self.ices.zeroize();
+        self.session.zeroize();
+        self.tcp_relay.zeroize();
+        self.log.zeroize();
+        self.local_key.zeroize();
+        self.pv.zeroize();
+        self.media_auth_password.zeroize();
     }
 }
 

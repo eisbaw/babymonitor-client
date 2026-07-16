@@ -133,16 +133,14 @@ pub enum Error {
     #[error("webrtc engine error: {0}")]
     WebRtcEngine(String),
 
-    /// The honest **not-yet-live** state of *this offline core driver*: it builds
-    /// and publishes the offer but does not open a real broker socket, so it cannot
-    /// complete the negotiation. (The 302 framing is fully resolved and byte-pinned
-    /// by cap5 — see [`stream::mqtt_crypto::build_302_frame`]; the self-contained
-    /// live path lives in [`stream::transport::connect_and_negotiate`] under the
-    /// `live-tls` feature.) The offline driver returns THIS rather than a
-    /// fabricated stream or `todo!()` — exactly the signer's TOKEN-PENDING discipline.
+    /// The honest unavailable state for a deliberately gated execution path.
+    /// The caller prints the concrete prerequisite first (for example, a missing
+    /// owner session or a binary built without live socket support). This variant
+    /// avoids fabricating a stream while not making stale claims about which
+    /// already-implemented subsystem is missing.
     #[error(
-        "live A/V stream is pending: cannot stream until authenticated device \
-         creds, 302 framing, and the WebRTC media engine land (TASK-0037)"
+        "live A/V stream cannot proceed in this execution path; see the preceding \
+         diagnostic for the concrete prerequisite"
     )]
     StreamPending,
 }

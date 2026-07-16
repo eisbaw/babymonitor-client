@@ -155,6 +155,7 @@ dependencies = [
  "flate2",
  "hex",
  "hmac",
+ "libc",
  "md5",
  "rumqttc",
  "serde",

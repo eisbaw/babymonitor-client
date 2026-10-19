@@ -1,8 +1,13 @@
 # Philips Avent Baby Monitor+ — reverse-engineered Rust client
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Baby Monitor Client: a Rust viewer for Tuya-based baby monitors](docs/assets/banner.svg)
 
-A from-scratch **Rust** client for the Philips Avent "Baby Monitor+" (hardware
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/language-Rust-b7410e.svg)](babymonitor/Cargo.toml)
+[![Nix shell](https://img.shields.io/badge/build-Nix%20shell-5277c3.svg)](shell.nix)
+[![LAN and cloud signaling](https://img.shields.io/badge/signaling-LAN%20%2B%20cloud-187f77.svg)](babymonitor/README.md)
+
+A from-scratch **Rust** client for the Philips Avent "Baby Monitor+" (target hardware
 **SCD921 / SCD923**) — reverse-engineered from the Android app
 `com.philips.ph.babymonitorplus` so the camera can be watched without the official app.
 
@@ -31,11 +36,20 @@ Watching a **real** camera — `just gui-stream` (in-app window, LAN by default)
 LAN mode uses a private, owner-provisioned local config. See [`babymonitor/README.md`](babymonitor/README.md)
 for the `stream` command and its options.
 
+## Checked devices
+
+| Device | Evidence |
+|---|---|
+| Philips Avent SCD921 | Tested by the project owner with live cloud and LAN streaming. |
+| Momcozy BM04 | Reported working ([issue #1](https://github.com/eisbaw/babymonitor-client/issues/1)). |
+
+The Philips Avent SCD923 is target hardware, but has not been separately tested.
+
 ## Scope / authorized use
 
-A **benign, authorized personal project**: it targets **only the owner's own Tuya account
-and their own SCD921/SCD923 device**. Do not point it at any account or device you do not
-own. No Philips/Tuya credentials are redistributed — recovered keys live in a gitignored
+A **benign, authorized personal project**: its live tests use the owner's own Tuya
+account and SCD921. Use it only with accounts and devices you own or are authorized
+to access. No Philips/Tuya credentials are redistributed — recovered keys live in a gitignored
 `secrets/` store, referenced by location only, never committed. See [`re/prd.md`](re/prd.md).
 
 ## How it works

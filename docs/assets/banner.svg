@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" role="img" aria-labelledby="title description">
+  <title id="title">Baby Monitor Client</title>
+  <desc id="description">A camera sends a live feed to a Rust client, with LAN and cloud signaling options.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#102b36"/>
+      <stop offset="1" stop-color="#174d59"/>
+    </linearGradient>
+    <linearGradient id="lens" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8ed9ce"/>
+      <stop offset="1" stop-color="#3ea99f"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="300" rx="28" fill="url(#background)"/>
+  <circle cx="1115" cy="-18" r="170" fill="#ffffff" opacity=".035"/>
+  <circle cx="1165" cy="280" r="170" fill="#ffffff" opacity=".025"/>
+
+  <g transform="translate(54 43)">
+    <rect x="0" y="0" width="226" height="214" rx="26" fill="#ffffff" opacity=".08"/>
+    <path d="M43 107c0-39 32-71 71-71s71 32 71 71" fill="none" stroke="#9bd6d2" stroke-width="5" opacity=".55"/>
+    <rect x="38" y="88" width="150" height="90" rx="27" fill="#e5f5f1"/>
+    <circle cx="113" cy="133" r="37" fill="#133c4b"/>
+    <circle cx="113" cy="133" r="26" fill="url(#lens)"/>
+    <circle cx="105" cy="124" r="8" fill="#eafff9" opacity=".8"/>
+    <path d="M113 178v17m-36 0h72" fill="none" stroke="#e5f5f1" stroke-width="11" stroke-linecap="round"/>
+    <circle cx="67" cy="108" r="5" fill="#f0ac6b"/>
+  </g>
+
+  <text x="333" y="112" fill="#ffffff" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="54" font-weight="750" letter-spacing="-1.5">Baby Monitor Client</text>
+  <text x="336" y="158" fill="#cce9e6" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="23">A Rust viewer for Tuya-based baby monitors</text>
+
+  <g font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="16" font-weight="650">
+    <rect x="334" y="193" width="146" height="42" rx="21" fill="#2c7c79"/>
+    <text x="407" y="220" text-anchor="middle" fill="#f0fffb">LAN stream</text>
+    <rect x="494" y="193" width="189" height="42" rx="21" fill="#2b6170"/>
+    <text x="588" y="220" text-anchor="middle" fill="#f0fffb">Cloud signaling</text>
+  </g>
+</svg>

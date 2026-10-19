@@ -25,10 +25,10 @@ nix-shell --run 'just e2e'              # build + the full offline test suite (n
 nix-shell --run 'just stream-validate'  # offline demo: a synthetic H.264 sample → a playable MPEG-TS
 ```
 
-Watching a **real** camera — `just gui-stream` (in-app window) or `just live-stream`
-(HTTP → VLC) — needs the **owner's own device** and the gated `--features live`
-build. Cloud mode needs an authenticated session; LAN mode uses a private,
-owner-provisioned local config. See [`babymonitor/README.md`](babymonitor/README.md)
+Watching a **real** camera — `just gui-stream` (in-app window, LAN by default) or
+`just live-stream` (HTTP → VLC) — needs the **owner's own device** and the gated
+`--features live` build. `just gui-stream cloud` uses an authenticated cloud session;
+LAN mode uses a private, owner-provisioned local config. See [`babymonitor/README.md`](babymonitor/README.md)
 for the `stream` command and its options.
 
 ## Scope / authorized use

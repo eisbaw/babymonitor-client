@@ -173,23 +173,29 @@ live-stream port="8556":
 
 # Live camera in an in-app SDL2 window (no external player / HTTP): the
 # `--features live,gui` pipeline with `--output window` (in-process libavcodec decode
-# -> SDL window). Needs the owner's gitignored secrets/ + a valid session (run
-# `auth live-login` first if it has expired). The binary is run directly (not via
+# -> SDL window). Defaults to the owner-provisioned LAN config; pass `cloud` to
+# use a valid cloud session instead. The binary is run directly (not via
 # `cargo run`) so signals reach it, not an orphaned grandchild. The window has a
 # working close button, and Ctrl-C / SIGTERM also stop it (gui::close_requested); the
 # foreground shell ALSO traps Ctrl-C/TERM/HUP as a SIGKILL backstop. Stop it by
 # closing the window or pressing Ctrl-C in this terminal.
+# Watch the camera in an SDL2 window over LAN, or pass `cloud`.
 [group('run')]
-gui-stream:
+gui-stream signaling="lan":
     #!/usr/bin/env bash
-    set -uo pipefail
+    set -euo pipefail
+    SIGNALING={{quote(signaling)}}
+    case "$SIGNALING" in
+        lan|cloud|auto) ;;
+        *) echo "gui-stream: signaling must be lan, cloud, or auto" >&2; exit 2 ;;
+    esac
     echo "gui-stream: building the live GUI window pipeline (first build can take ~30-60s)…"
     cargo build --quiet --manifest-path babymonitor/babymonitor-cli/Cargo.toml \
         --features live,gui --bin babymonitor-cli
     BIN=babymonitor/target/debug/babymonitor-cli
     echo "gui-stream: starting — a window opens once the camera answers (stages 1-6)."
     echo "gui-stream: press Ctrl-C HERE (or close this terminal) to stop."
-    "$BIN" stream --output window &
+    "$BIN" stream --signaling "$SIGNALING" --output window &
     SPID=$!
     # The binary now stops itself on close / Ctrl-C / SIGTERM (gui::close_requested);
     # this trap is a belt-and-suspenders SIGKILL backstop (terminal close/HUP, or a

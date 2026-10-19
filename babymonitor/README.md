@@ -162,9 +162,10 @@ signaling → ICE → media) and renders the decoded feed. Three output modes:
 # stops the pipeline when VLC closes):
 nix-shell --run 'just live-stream'
 
-# In-app GUI window (renders in our own SDL2 window — no external player):
-nix-shell --run 'cargo run --manifest-path babymonitor/babymonitor-cli/Cargo.toml \
-    --features live,gui --bin babymonitor-cli -- stream --output window'
+# In-app GUI window (LAN by default; no external player):
+nix-shell --run 'just gui-stream'
+# To use a current cloud session instead:
+nix-shell --run 'just gui-stream cloud'
 ```
 
 For an already paired camera, provision once from the owner's private cached
